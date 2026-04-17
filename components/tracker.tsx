@@ -266,6 +266,25 @@ export function Tracker() {
   const [retryToken, setRetryToken] = useState(0);
   const rejectionTimerRef = useRef<number | null>(null);
 
+  // --- Push-to-talk state -----------------------------------------------
+  // Held-down mic recording. `isRecording` drives the visual state;
+  // `talkLevel` is a 0..1 envelope from the mic's frequency analyser so the
+  // button ring can pulse with the user's voice. `recordedBlobRef` holds the
+  // most recent utterance for wiring into the per-object pipeline later.
+  const [isRecording, setIsRecording] = useState(false);
+  const [micError, setMicError] = useState<string | null>(null);
+  const [talkLevel, setTalkLevel] = useState(0);
+  const [talkFlash, setTalkFlash] = useState(false);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<BlobPart[]>([]);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const recordedBlobRef = useRef<Blob | null>(null);
+  const talkAnalyserRef = useRef<AnalyserNode | null>(null);
+  const talkFreqDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
+  const talkSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const talkLevelRafRef = useRef<number | null>(null);
+  const talkFlashTimerRef = useRef<number | null>(null);
+
   // Detections the continuous loop has published. Used both to paint
   // breathing boxes (ready state) and to resolve taps without a fresh
   // inference.
@@ -357,6 +376,33 @@ export function Tracker() {
           // already stopped
         }
       }
+      // Tear down push-to-talk plumbing.
+      if (recorderRef.current && recorderRef.current.state === "recording") {
+        try {
+          recorderRef.current.stop();
+        } catch {
+          // ignore
+        }
+      }
+      recorderRef.current = null;
+      if (talkLevelRafRef.current != null) {
+        cancelAnimationFrame(talkLevelRafRef.current);
+        talkLevelRafRef.current = null;
+      }
+      if (talkFlashTimerRef.current != null) {
+        clearTimeout(talkFlashTimerRef.current);
+        talkFlashTimerRef.current = null;
+      }
+      if (talkSourceRef.current) {
+        try {
+          talkSourceRef.current.disconnect();
+        } catch {
+          // already disconnected
+        }
+        talkSourceRef.current = null;
+      }
+      micStreamRef.current?.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
       audioCtxRef.current?.close().catch(() => {});
     };
   }, []);
@@ -729,6 +775,151 @@ export function Tracker() {
     setSpeaking(false);
   }, []);
 
+  // --- Hold-to-talk recording -------------------------------------------
+  //
+  // Pointer-down starts recording, pointer-up/leave/cancel stops. Mic stream
+  // is lazy-opened on the first press so we respect the user-gesture rule
+  // on iOS Safari. The analyser feeds the button's pulse-ring level meter.
+  const stopTalkLevelLoop = useCallback(() => {
+    if (talkLevelRafRef.current != null) {
+      cancelAnimationFrame(talkLevelRafRef.current);
+      talkLevelRafRef.current = null;
+    }
+    setTalkLevel(0);
+  }, []);
+
+  const openMicStream = useCallback(async (): Promise<MediaStream | null> => {
+    if (micStreamRef.current) return micStreamRef.current;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      micStreamRef.current = stream;
+      return stream;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "mic unavailable";
+      // eslint-disable-next-line no-console
+      console.log("[tracker] mic denied:", e);
+      setMicError(msg);
+      return null;
+    }
+  }, []);
+
+  const startRecording = useCallback(async () => {
+    if (recorderRef.current && recorderRef.current.state === "recording") return;
+    // Audio ctx must exist to drive the TTS playback path; also gets us the
+    // analyser for the voice-level ring.
+    const ctx = ensureAudioCtx();
+    const stream = await openMicStream();
+    if (!stream) return;
+
+    // Hook the mic into a dedicated analyser for the pulse-ring. We never
+    // connect it to destination — it's read-only level sensing.
+    if (ctx && !talkAnalyserRef.current) {
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.55;
+      talkAnalyserRef.current = analyser;
+      talkFreqDataRef.current = new Uint8Array(
+        new ArrayBuffer(analyser.frequencyBinCount)
+      );
+    }
+    if (ctx && talkAnalyserRef.current && !talkSourceRef.current) {
+      try {
+        talkSourceRef.current = ctx.createMediaStreamSource(stream);
+        talkSourceRef.current.connect(talkAnalyserRef.current);
+      } catch {
+        // Some browsers throw if the stream's already consumed — fine to skip
+      }
+    }
+
+    // MIME negotiation: prefer opus, fall back to whatever the browser offers.
+    const mime =
+      ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", ""].find(
+        (t) => !t || MediaRecorder.isTypeSupported(t)
+      ) ?? "";
+    const mr = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    recordedChunksRef.current = [];
+    mr.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data);
+    };
+    mr.onstop = () => {
+      const blob = new Blob(recordedChunksRef.current, {
+        type: mr.mimeType || "audio/webm",
+      });
+      recordedBlobRef.current = blob;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[tracker] captured ${Math.round(blob.size / 1024)} KB of audio (${blob.type})`
+      );
+      // Brief "sent" flash on the button so the user sees the handoff.
+      setTalkFlash(true);
+      if (talkFlashTimerRef.current != null) clearTimeout(talkFlashTimerRef.current);
+      talkFlashTimerRef.current = window.setTimeout(() => {
+        setTalkFlash(false);
+        talkFlashTimerRef.current = null;
+      }, 650);
+    };
+    recorderRef.current = mr;
+    mr.start(100);
+    setIsRecording(true);
+    setMicError(null);
+
+    // Tiny haptic nudge on mobile where supported. Not a UX load-bearer —
+    // just a courtesy hint that recording started.
+    if (typeof navigator.vibrate === "function") {
+      try {
+        navigator.vibrate(8);
+      } catch {
+        // some browsers disable vibrate without interaction — ignore
+      }
+    }
+
+    // Kick off the level-meter RAF. We read sigmoid-ish loudness from the
+    // analyser's byte-frequency data and feed it to talkLevel state; the
+    // button pulse ring width tracks it.
+    const readLevel = () => {
+      const an = talkAnalyserRef.current;
+      const buf = talkFreqDataRef.current;
+      if (!an || !buf) {
+        talkLevelRafRef.current = requestAnimationFrame(readLevel);
+        return;
+      }
+      an.getByteFrequencyData(buf);
+      // Speech energy lives mostly in the first ~40 bins (sub-4 kHz).
+      let sum = 0;
+      const end = Math.min(40, buf.length);
+      for (let i = 2; i < end; i++) sum += buf[i];
+      const avg = sum / Math.max(1, end - 2) / 255;
+      // Shape: push low values down, compress high values so the ring doesn't
+      // pin. Threshold at 0.04 to hide ambient noise.
+      const shaped = Math.max(0, Math.min(1, (avg - 0.04) * 2.5));
+      setTalkLevel((prev) => prev + (shaped - prev) * 0.4);
+      talkLevelRafRef.current = requestAnimationFrame(readLevel);
+    };
+    if (talkLevelRafRef.current == null) {
+      talkLevelRafRef.current = requestAnimationFrame(readLevel);
+    }
+  }, [ensureAudioCtx, openMicStream]);
+
+  const stopRecording = useCallback(() => {
+    const mr = recorderRef.current;
+    if (mr && mr.state === "recording") {
+      try {
+        mr.stop();
+      } catch {
+        // no-op
+      }
+    }
+    recorderRef.current = null;
+    setIsRecording(false);
+    stopTalkLevelLoop();
+  }, [stopTalkLevelLoop]);
+
   const speak = useCallback(
     async (cropDataUrl: string, callGen: number) => {
       const ctx = ensureAudioCtx();
@@ -770,12 +961,25 @@ export function Tracker() {
         source.start();
       } catch (e) {
         if (callGen !== generationRef.current) return;
-        setErrorMsg(e instanceof Error ? e.message : "line failed");
+        const msg = e instanceof Error ? e.message : "line failed";
+        setErrorMsg(msg);
+        setDiagError(msg);
+        // Failure is otherwise invisible once locked — no caption, no audio,
+        // just a silent face. Surface it via the rejection toast too, and
+        // with a human-friendly hint when the cause is a missing key.
+        showRejection(
+          /zhipu|glm|api key|api_key|401|403/i.test(msg)
+            ? "voice model unconfigured — check .env.local"
+            : `couldn't speak: ${msg.slice(0, 80)}`,
+          3200
+        );
+        // eslint-disable-next-line no-console
+        console.error("[tracker] speak failed:", e);
       } finally {
         if (callGen === generationRef.current) setThinking(false);
       }
     },
-    [ensureAudioCtx, stopCurrentAudio]
+    [ensureAudioCtx, showRejection, stopCurrentAudio]
   );
 
   // --- Capture a source-space rectangle as a jpeg data URL --------------
@@ -1322,7 +1526,7 @@ export function Tracker() {
       )}
 
       {caption && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 px-5 pb-[max(env(safe-area-inset-bottom),28px)] pt-10">
+        <div className="pointer-events-none absolute inset-x-0 bottom-[max(env(safe-area-inset-bottom),22px)] px-5 pb-[148px] pt-10">
           <div
             className="mx-auto max-w-md rounded-[26px] bg-white/95 px-6 py-4 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.55)] ring-1 ring-white/80 backdrop-blur-xl"
             style={{ animation: "bubble-in 480ms cubic-bezier(0.16,1,0.3,1) both" }}
@@ -1349,6 +1553,139 @@ export function Tracker() {
           </div>
         </div>
       )}
+
+      {/* Hold-to-talk button. Bottom-center, safe-area-aware. Pointer-down
+          starts recording, pointer-up/leave/cancel stops. Layers, outside-in:
+          voice-level ring, soft glow halo, primary pill, mic glyph, sent flash. */}
+      <div
+        className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 px-5 pb-[max(env(safe-area-inset-bottom),22px)] pt-3"
+        style={{
+          opacity: phase === "starting" || phase === "error" ? 0.35 : 1,
+          transition: "opacity 220ms ease",
+          pointerEvents: phase === "starting" || phase === "error" ? "none" : "auto",
+        }}
+      >
+        <div className="relative grid h-[96px] w-[96px] place-items-center">
+          {/* Voice-level ring — scale + opacity track mic amplitude. */}
+          <span
+            aria-hidden
+            className="pointer-events-none absolute inset-0 rounded-full"
+            style={{
+              transform: `scale(${isRecording ? 1 + talkLevel * 0.9 : 1})`,
+              opacity: isRecording ? 0.35 + talkLevel * 0.5 : 0,
+              boxShadow:
+                "0 0 0 10px rgba(255,137,190,0.35), 0 0 60px rgba(255,137,190,0.45)",
+              transition: isRecording
+                ? "transform 90ms ease-out, opacity 120ms ease-out"
+                : "opacity 220ms ease, transform 220ms ease",
+            }}
+          />
+          {/* Ambient glow halo — when idle, gently pulses. */}
+          <span
+            aria-hidden
+            className="pointer-events-none absolute -inset-2 rounded-full"
+            style={{
+              background:
+                "radial-gradient(circle, rgba(255,137,190,0.28) 0%, rgba(255,137,190,0) 70%)",
+              animation: isRecording ? undefined : "soft-pulse 2.4s ease-in-out infinite",
+            }}
+          />
+          <button
+            type="button"
+            aria-label={isRecording ? "recording — release to send" : "hold to speak"}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              try {
+                (e.currentTarget as Element).setPointerCapture(e.pointerId);
+              } catch {
+                // old browsers or bad pointer id — fine to skip
+              }
+              void startRecording();
+            }}
+            onPointerUp={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              stopRecording();
+            }}
+            onPointerCancel={() => stopRecording()}
+            onPointerLeave={() => {
+              if (isRecording) stopRecording();
+            }}
+            onContextMenu={(e) => e.preventDefault()}
+            className="relative grid h-[80px] w-[80px] place-items-center rounded-full shadow-[0_18px_50px_-18px_rgba(236,72,153,0.65)] ring-1 ring-white/35 backdrop-blur-xl transition-transform"
+            style={{
+              background: isRecording
+                ? "radial-gradient(circle at 35% 30%, #ffc2dc 0%, #ff89be 60%, #ec4899 100%)"
+                : "radial-gradient(circle at 35% 30%, rgba(255,255,255,0.85) 0%, rgba(255,194,220,0.65) 55%, rgba(236,72,153,0.55) 100%)",
+              transform: isRecording
+                ? `scale(${1.06 + talkLevel * 0.05})`
+                : talkFlash
+                  ? "scale(1.04)"
+                  : "scale(1)",
+              WebkitTouchCallout: "none",
+              WebkitUserSelect: "none",
+              userSelect: "none",
+              touchAction: "none",
+            }}
+          >
+            {/* Mic glyph — pure SVG, no icon lib. */}
+            <svg
+              width="28"
+              height="28"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke={isRecording ? "#fff" : "var(--ink)"}
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 2.5c1.7 0 3 1.35 3 3v6c0 1.65-1.3 3-3 3s-3-1.35-3-3v-6c0-1.65 1.3-3 3-3z" />
+              <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0" />
+              <path d="M12 17.5V21.5" />
+              <path d="M8.5 21.5h7" />
+            </svg>
+            {/* Brief "sent" check flash on release. */}
+            {talkFlash && (
+              <span
+                className="pointer-events-none absolute inset-0 grid place-items-center rounded-full"
+                style={{ animation: "fade-in 180ms ease-out both" }}
+              >
+                <svg
+                  width="30"
+                  height="30"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#fff"
+                  strokeWidth="3"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M5 12l5 5L20 7" />
+                </svg>
+              </span>
+            )}
+          </button>
+        </div>
+        <span
+          className={
+            "serif-italic rounded-full px-3 py-1 text-[12px] font-medium tracking-wide transition-colors " +
+            (isRecording
+              ? "bg-[color:var(--accent)] text-white shadow-[0_8px_24px_-12px_rgba(236,72,153,0.7)]"
+              : micError
+                ? "bg-rose-500/25 text-white ring-1 ring-rose-200/40"
+                : "bg-black/30 text-white/90 ring-1 ring-white/15 backdrop-blur-md")
+          }
+        >
+          {isRecording
+            ? "listening…"
+            : micError
+              ? "tap to enable mic"
+              : talkFlash
+                ? "got it"
+                : "hold to speak"}
+        </span>
+      </div>
     </div>
   );
 }
