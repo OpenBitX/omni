@@ -34,6 +34,20 @@ body {
   -moz-osx-font-smoothing: grayscale;
   overscroll-behavior: none;
   font-feature-settings: "ss01", "cv11";
+  touch-action: manipulation;
+  -webkit-text-size-adjust: 100%;
+}
+
+html {
+  /* iOS Safari: avoid layout jump when URL bar shows/hides */
+  height: -webkit-fill-available;
+}
+
+@media (pointer: coarse) {
+  body {
+    /* Prevent rubber-band scroll inside the viewfinder */
+    overscroll-behavior-y: contain;
+  }
 }
 
 * {

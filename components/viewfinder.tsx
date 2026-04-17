@@ -146,6 +146,7 @@ export default function Viewfinder() {
         isHoldingRef.current = true;
         setIsHolding(true);
         startAudioRecording();
+        navigator.vibrate?.(12);
       }, HOLD_THRESHOLD_MS);
     },
     [phase, cameraReady, startAudioRecording]
@@ -168,6 +169,7 @@ export default function Viewfinder() {
         return;
       }
       setPhotoDataUrl(photo);
+      navigator.vibrate?.(wasHolding ? [6, 40, 6] : 6);
 
       const audio = wasHolding ? await stopAudioRecording() : null;
       await submit(photo, audio);
@@ -208,7 +210,7 @@ export default function Viewfinder() {
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(120%_80%_at_50%_0%,rgba(0,0,0,0.35)_0%,transparent_45%),radial-gradient(120%_80%_at_50%_100%,rgba(0,0,0,0.55)_0%,transparent_55%)]" />
 
       {/* Top chrome */}
-      <header className="absolute inset-x-0 top-0 flex items-center justify-between px-5 pt-[calc(env(safe-area-inset-top,0px)+14px)]">
+      <header className="absolute inset-x-0 top-0 flex items-center justify-between px-5 pt-[max(env(safe-area-inset-top),14px)]">
         <div className="flex items-center gap-2">
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-white" />
           <span className="font-mono text-[11px] tracking-[0.18em] text-white/85">
@@ -227,7 +229,7 @@ export default function Viewfinder() {
       </header>
 
       {/* Bottom controls */}
-      <div className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-5 pb-[calc(env(safe-area-inset-bottom,0px)+28px)]">
+      <div className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-5 pb-[max(env(safe-area-inset-bottom),24px)]">
         <Hint phase={phase} isHolding={isHolding} />
         <ShutterButton
           onPointerDown={onPressStart}
@@ -331,7 +333,7 @@ function ShutterButton({
       onContextMenu={(e) => e.preventDefault()}
       disabled={disabled}
       aria-label="Snap or hold to vent"
-      className="relative grid h-[86px] w-[86px] place-items-center touch-none outline-none disabled:opacity-50"
+      className="relative grid h-[96px] w-[96px] place-items-center touch-none outline-none disabled:opacity-50 md:h-[86px] md:w-[86px]"
     >
       {/* outer ring */}
       <span
@@ -351,10 +353,10 @@ function ShutterButton({
       <span
         className={`relative rounded-full transition-all duration-200 ease-[var(--ease-out-expo)] ${
           isHolding
-            ? "h-9 w-9 bg-red-500 breathe"
+            ? "h-10 w-10 bg-red-500 breathe md:h-9 md:w-9"
             : phase === "armed"
-              ? "h-[58px] w-[58px] bg-white"
-              : "h-[70px] w-[70px] bg-white"
+              ? "h-[66px] w-[66px] bg-white md:h-[58px] md:w-[58px]"
+              : "h-[80px] w-[80px] bg-white md:h-[70px] md:w-[70px]"
         }`}
       />
     </button>
