@@ -6,7 +6,7 @@ Point at a mug, a sofa, a traffic cone — tap it, and a cartoon face locks on
 and starts chatting in character. Talk back with the mic and it'll reply.
 Works with up to three objects at once.
 
-![Uploading Screenshot 2026-04-18 at 4.23.22 am.png…]()
+<img width="1512" height="792" alt="Screenshot 2026-04-18 at 4 24 04 am" src="https://github.com/user-attachments/assets/2bba0281-e93a-4192-9a17-18d03743e509" />
 
 ---
 
