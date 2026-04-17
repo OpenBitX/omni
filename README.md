@@ -32,10 +32,17 @@ FISH_REFERENCE_ID=your-fish-voice-id
 OPENAI_API_KEY=your-openai-key
 ```
 
-Then:
+Then start the web app:
 
 ```bash
-npm run dev
+npm run dev          # → http://localhost:3000
+```
+
+And — only if you want to use `/mirror` — start the Python backend in a
+second terminal:
+
+```bash
+npm run server       # → http://localhost:8000
 ```
 
 Open <http://localhost:3000>, let it use your camera, tap something. 🎉
@@ -44,13 +51,30 @@ Open <http://localhost:3000>, let it use your camera, tap something. 🎉
 
 ## Commands
 
-| What | Command |
-| --- | --- |
-| Run the app locally | `npm run dev` |
-| Run the Python backend (only for `/mirror`) | `npm run server` |
-| Production build | `npm run build` |
-| Start production server | `npm run start` |
-| Typecheck | `npm run typecheck` |
+| What | Command | Port |
+| --- | --- | --- |
+| Run the web app (Tracker + Mirror UI) | `npm run dev` | `3000` |
+| Run the Python backend (only for `/mirror`) | `npm run server` | `8000` |
+| Production build | `npm run build` | — |
+| Start production server | `npm run start` | `3000` |
+| Typecheck | `npm run typecheck` | — |
+
+---
+
+## How it runs
+
+**Everything happens in your browser** except the API calls.
+
+The YOLO object detector, the tracking loop, the face rendering, the mouth
+animation — all client-side, no server process required for Tracker. The only
+things that leave your machine are three server-action round-trips:
+
+1. **Assess** — GLM-5V looks at the tapped crop and decides where the face goes
+2. **Speak** — GLM-4v-flash writes the line, Fish/OpenAI synthesizes the voice
+3. **Converse** — your mic audio → Whisper → GLM reply → TTS (when you talk back)
+
+`/mirror` is the exception — it streams frames over WebSocket to the Python
+backend on `:8000` for dlib landmark detection + OpenCV compositing.
 
 ---
 
