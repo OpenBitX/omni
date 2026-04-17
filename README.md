@@ -2,136 +2,120 @@
 
 **Tap anything through your camera. It grows a face. It talks back.**
 
-Point your phone at a mug, a sofa, a traffic cone. Tap it. The app detects the
-object on-device, locks a cartoon face onto it, writes a line in character, and
-speaks it out loud. Talk back with the mic button — it'll reply. Objects stay
-tracked as the camera moves; up to three can be alive at once, chattering over
-each other.
-
-Two apps live here:
-
-- **Tracker** (`/`) — the main app. Browser-only tracking (YOLO26n-seg via
-  onnxruntime-web), GLM-5V for vision + writing, Fish.audio / OpenAI for TTS.
-  No backend required beyond Next server actions.
-- **Mirror** (`/mirror`) — the original demo. Streams webcam frames to a local
-  Python server that uses dlib + OpenCV `seamlessClone` to paste your face
-  onto a base image (an orange, your upload, etc.). Optional.
+Point at a mug, a sofa, a traffic cone — tap it, and a cartoon face locks on
+and starts chatting in character. Talk back with the mic and it'll reply.
+Works with up to three objects at once.
 
 ---
 
-## Quick start (Tracker only)
+## Get started
+
+You need **Node 20+** and a **[Zhipu GLM API key](https://open.bigmodel.cn/)**.
+That's it for the main app.
 
 ```bash
 git clone https://github.com/OpenBitX/duidui.git
 cd duidui
 npm install
-cp .env.example .env.local        # fill in keys — see below
+cp .env.example .env.local
+```
+
+Open `.env.local` and paste your key:
+
+```ini
+ZHIPU_API_KEY=your-key-here
+```
+
+Then:
+
+```bash
 npm run dev
 ```
 
-Open <http://localhost:3000>, grant camera access, tap something.
+Open <http://localhost:3000>, let it use your camera, tap something. 🎉
 
-### Minimum keys
+---
 
-Edit `.env.local`:
+## Commands
 
-```ini
-ZHIPU_API_KEY=...        # required — GLM vision + writing
-OPENAI_API_KEY=...       # optional — Whisper (for talk-back) + TTS fallback
-FISH_API_KEY=...         # optional — primary TTS (better voice)
-FISH_REFERENCE_ID=...    # optional — voice to clone
-```
-
-| Key | What breaks without it |
+| What | Command |
 | --- | --- |
-| `ZHIPU_API_KEY` | Everything. Required. |
-| `OPENAI_API_KEY` | Mic button (Whisper). TTS still works if Fish is set. |
-| `FISH_API_KEY` + `FISH_REFERENCE_ID` | Falls back to OpenAI `tts-1` (`nova`). |
-| Neither TTS key | Caption-only mode — face still animates, no audio. |
+| Run the app locally | `npm run dev` |
+| Run the Python backend (only for `/mirror`) | `npm run server` |
+| Production build | `npm run build` |
+| Start production server | `npm run start` |
+| Typecheck | `npm run typecheck` |
 
-GLM endpoint is auto-picked from key shape (`<hex>.<secret>` → bigmodel.cn,
-`sk-…` → api.z.ai). Override via `ZHIPU_BASE_URL` if needed.
+---
+
+## API keys
+
+Only `ZHIPU_API_KEY` is required. The others unlock extra features:
+
+| Key | What it does | Required? |
+| --- | --- | --- |
+| `ZHIPU_API_KEY` | GLM vision + in-character writing | ✅ yes |
+| `FISH_API_KEY` + `FISH_REFERENCE_ID` | Higher-quality cloned voices (Fish.audio) | optional |
+| `OPENAI_API_KEY` | Mic talk-back (Whisper) and TTS fallback | optional |
+
+No TTS keys? The app runs caption-only — face still animates, just silent.
 
 ---
 
 ## Running on your phone
 
-Tracker needs the rear camera and HTTPS (or `localhost`). On the same Wi-Fi:
+The main use-case is your phone's rear camera. Browsers require HTTPS to
+access the camera on a non-localhost address, so the easiest path is a tunnel:
 
 ```bash
-npm run dev -- -H 0.0.0.0
+npm run dev
+# in another terminal:
+npx ngrok http 3000
 ```
 
-Then open `https://<your-mac's-ip>:3000` on your phone. Most browsers will
-refuse the camera over plain HTTP from a LAN IP — use a tunnel
-(`ngrok http 3000`, `cloudflared`, etc.) or Chrome's "Insecure origins treated
-as secure" flag for quick testing.
+Open the `https://…ngrok.app` URL on your phone. Done.
 
-First tap downloads the YOLO model (~9.4 MB). WebGPU is tried first, WASM is
-the fallback. On mobile CPU you'll see ~3–8 fps inference; the face
-extrapolates between frames so it stays smooth.
+First tap downloads the on-device YOLO model (~9.4 MB); cached after that.
 
 ---
 
-## Scripts
+## The two apps
+
+### 🎯 Tracker — `/` (the main one)
+
+Tap an object, face appears on it. Everything runs in your browser
+(onnxruntime-web for detection, GLM for writing, Fish/OpenAI for voice). No
+backend process needed.
+
+### 🪞 Mirror — `/mirror` (optional)
+
+Paste your own eyes and mouth onto a base image (an orange, something you
+upload, etc.) in real time. This one needs the Python backend running.
 
 ```bash
-npm run dev          # dev server on :3000
-npm run build        # production build
-npm run start        # run the production build
-npm run typecheck    # tsc --noEmit — the only automated gate
-npm run server       # FastAPI + WebSocket server for /mirror (see below)
-```
-
-`npm install` also runs `scripts/setup-ort.mjs` (postinstall), which copies
-onnxruntime-web's WASM runtime into `public/ort/` so the browser can load it
-same-origin. Re-run manually if the browser 404s on `/ort/*.wasm`.
-
-There's no lint and no test suite. Typecheck is the gate.
-
----
-
-## Mirror (optional Python backend)
-
-Only needed if you want `/mirror`.
-
-```bash
-# from repo root
+# one-time setup
 python3 -m venv server/.venv
 server/.venv/bin/pip install \
   opencv-python dlib imutils numpy openai fastapi "uvicorn[standard]" \
   python-multipart websockets python-dotenv
 
-# dlib landmarks model (~100 MB, gitignored)
+# grab the landmarks model (~100 MB, not in git)
 curl -L http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 \
   -o server/shape_predictor_68_face_landmarks.dat.bz2
 bunzip2 server/shape_predictor_68_face_landmarks.dat.bz2
 
-npm run server       # starts :8000
+# then, any time you want Mirror:
+npm run server
 ```
 
-On macOS, dlib builds from source and needs `cmake` via Homebrew:
+On macOS, dlib builds from source — you need `cmake`:
 
 ```bash
 brew install cmake
 ```
 
-Mirror uses the same `ZHIPU_API_KEY` (for base-image coordinate detection) and
-reads `.env.local` via python-dotenv. The Next app talks to the Python server
-over WebSocket; start both (`npm run dev` + `npm run server`) and visit
+Start both `npm run dev` and `npm run server`, then visit
 <http://localhost:3000/mirror>.
-
----
-
-## Stack
-
-- **Next.js 15** (App Router), **React 19**, **TypeScript**, **Tailwind v4**
-- **onnxruntime-web** for browser-side YOLO26n-seg (WebGPU → WASM fallback)
-- **GLM-5V-Turbo** (deep, reasoning) for tap assessment
-- **GLM-4v-flash** (fast) for in-character lines + voice replies
-- **Fish.audio `s1`** → **OpenAI `tts-1`** TTS ladder
-- **OpenAI Whisper** for talk-back transcription
-- Python side: **FastAPI**, **dlib**, **OpenCV** (Mirror only)
 
 ---
 
@@ -139,47 +123,51 @@ over WebSocket; start both (`npm run dev` + `npm run server`) and visit
 
 ```
 app/
-  page.tsx              Tracker (main)
+  page.tsx              Tracker (main app)
   mirror/page.tsx       Mirror
-  landing/page.tsx      Static marketing page
   actions.ts            Server actions — assess, speak, converse
 components/
   tracker.tsx           Tracker UI + tracking loop
-  mirror.tsx            Mirror WS client
-  face-voice.tsx        Talking face (eyes video + mouth PNGs)
+  mirror.tsx            Mirror client
+  face-voice.tsx        Talking-face renderer
 lib/
-  yolo.ts               onnxruntime-web detector
-  iou.ts                Identity tracker + anchor math
+  yolo.ts               Browser YOLO detector
+  iou.ts                Identity tracking + anchor math
 public/
-  models/yolo26n-seg.onnx
-  ort/                  ORT WASM runtime (populated by postinstall)
-  facevoice/            eyes.webm, shape-A.png … shape-X.png
+  models/               YOLO .onnx weights
+  ort/                  ORT WASM runtime (auto-populated)
+  facevoice/            Eyes video + mouth shape PNGs
 server/
-  server.py             FastAPI + dlib + seamlessClone (Mirror)
+  server.py             FastAPI + dlib + OpenCV (Mirror only)
   bases/                Base images + coord cache
-scripts/
-  setup-ort.mjs         Postinstall — copies ORT runtime
-  test-*.mjs            Ad-hoc probes (not part of any test suite)
 ```
 
-See [`CLAUDE.md`](./CLAUDE.md) for the deep architecture notes — tracking loop
-internals, prompt design, reseed triggers, the two-transform keyframe scheme,
-etc.
+Deeper architecture notes live in [`CLAUDE.md`](./CLAUDE.md).
+
+---
+
+## Stack
+
+Next.js 15 · React 19 · TypeScript · Tailwind v4 · onnxruntime-web · GLM-5V /
+GLM-4v-flash · Fish.audio · OpenAI Whisper + TTS · FastAPI · dlib · OpenCV
 
 ---
 
 ## Troubleshooting
 
-- **Camera doesn't start on phone** — needs HTTPS on non-localhost. Use a
-  tunnel or install a dev cert.
-- **`/ort/*.wasm` 404** — run `node scripts/setup-ort.mjs` (or `npm install`).
-- **Tracker says "caption only"** — no TTS keys configured. Add `FISH_API_KEY`
-  or `OPENAI_API_KEY`.
-- **Mic button does nothing** — `OPENAI_API_KEY` is required for Whisper.
-- **Mirror shows "server offline"** — `npm run server` in another terminal.
-  The chip strip polls `/bases` every 5s and self-heals on reconnect.
-- **dlib install fails** — `brew install cmake` then retry the pip install.
-- **First tap is slow** — YOLO model downloads (~9.4 MB). Cached after that.
+**Camera won't start on my phone** — you need HTTPS. Use `ngrok` or similar.
+
+**`/ort/*.wasm` 404 in the console** — run `npm install` again (the
+`postinstall` script copies ORT files into `public/ort/`).
+
+**"Caption only" mode** — add `FISH_API_KEY` or `OPENAI_API_KEY` for audio.
+
+**Mic button does nothing** — `OPENAI_API_KEY` is required (Whisper).
+
+**Mirror says "server offline"** — run `npm run server` in another terminal.
+It'll reconnect automatically.
+
+**dlib install fails** — `brew install cmake` on macOS, then retry.
 
 ---
 
