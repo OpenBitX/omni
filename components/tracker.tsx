@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { generateLine } from "@/app/actions";
+import { converseWithObject, generateLine } from "@/app/actions";
 import {
   FACE_VOICE_WIDTH,
   FaceVoice,
@@ -44,14 +44,23 @@ const MAX_INFERENCE_FPS = 30;
 // consecutive misses (see WIDEN_MATCH_AFTER_MISSES).
 const IDENTITY_IOU_MIN = 0.3;
 
-// EMA alphas. 0.4 on position+size = snappy but not jittery.
-const BOX_EMA_ALPHA = 0.4;
-const OPACITY_EMA_ALPHA = 0.55;
+// EMA alphas. Position alpha is high enough that the face stays glued to
+// the latest detection without visible lag, but not so high that YOLO box
+// jitter shows through as wobble. Size is slower again — bbox edges
+// breathe more than centers do. Opacity fades fast so reacquisition and
+// disappearance both feel instant.
+const BOX_POS_ALPHA = 0.7;
+const BOX_SIZE_ALPHA = 0.25;
+const OPACITY_EMA_ALPHA = 0.4;
 
-// Reacquisition threshold. After this many missed frames, a fresh match
-// SNAPS the smoothed pose instead of EMA-sliding — avoids a visible glide
-// across the screen when an object reappears after an occlusion.
-const REACQUIRE_SNAP_FRAMES = 5;
+// "Lost" threshold. One concept, two consequences: (a) the face fades
+// out — the object has actually left the frame, not just blinked for one
+// inference; (b) the next match SNAPS the smoothed pose instead of EMA
+// sliding — avoids a visible glide across the screen as the face fades
+// back in at the new location. These MUST be the same number, otherwise
+// there's a window where we fade out without snap-on-return (or vice
+// versa) and the face visibly slides through the wrong path.
+const LOST_AFTER_MISSES = 4;
 
 // After this many misses, widen matching to same-class + closest-center.
 // Camera pans, fast motion, and brief full occlusions can blow IoU to zero
@@ -66,13 +75,23 @@ const WIDEN_MATCH_AFTER_MISSES = 3;
 // gives a clean match.
 const SUSPECT_SIZE_RATIO = 1.75;
 
-// Velocity extrapolation. Between YOLO inferences (which run at 3–15 fps
-// on mobile) we glide the face at 60 fps using per-track velocity. Capped
-// so a lost target doesn't fly across the screen, and the velocity itself
-// decays during misses.
-const EXTRAP_MAX_MS = 160;
-const VELOCITY_EMA = 0.5;
+// Velocity extrapolation. Between YOLO inferences (3–15 fps on mobile) we
+// glide the face at 60 fps using per-track velocity, so the face stays
+// pasted on a moving object instead of stuttering at the inference rate.
+//
+// EXTRAP_MAX_MS is sized to bridge a full inference gap at ~5 fps with a
+// little headroom — at 10 fps it's well clear, at 5 fps it just covers
+// the gap so the face doesn't visibly freeze. VELOCITY_EMA is high
+// because the position EMA already filters YOLO box noise upstream;
+// being responsive here is what actually keeps the face in front of the
+// bottle as it moves. We also keep gliding through the first couple of
+// misses (EXTRAP_MISS_LIMIT) — losing a single inference frame is the
+// common case and freezing on it shows as jank.
+const EXTRAP_MAX_MS = 220;
+const EXTRAP_MISS_LIMIT = 2;
+const VELOCITY_EMA = 0.75;
 const VELOCITY_DECAY_PER_MISS = 0.6;
+
 
 // Tap confidence is lower than continuous — the user's intent is a strong
 // prior that something tappable sits under their finger. Continuous runs
@@ -83,7 +102,7 @@ const CONTINUOUS_MAX_DET = 25;
 
 // Face size = FACE_BBOX_FRACTION × min(box.w, box.h). <FaceVoice /> ships
 // at FACE_VOICE_WIDTH CSS px at scale=1; the multiplier is target_px / that.
-const FACE_BBOX_FRACTION = 0.62;
+const FACE_BBOX_FRACTION = 0.92;
 const FACE_NATIVE_PX = FACE_VOICE_WIDTH;
 
 // Hard clamp on face scale — tiny boxes don't birth a grain-of-sand face,
@@ -298,7 +317,10 @@ type TrackRefs = {
   // it, so an in-flight generateLine/TTS from the previous tap drops silent.
   speakGen: number;
   // Audio — each track has its own analyser so mouths sync to their own voice.
+  // The gain node sits between analyser and destination and is driven from the
+  // per-track opacity each RAF, so the voice fades with the face.
   analyser: AnalyserNode | null;
+  gain: GainNode | null;
   freqData: Uint8Array<ArrayBuffer> | null;
   timeData: Uint8Array<ArrayBuffer> | null;
   source: AudioBufferSourceNode | null;
@@ -341,6 +363,12 @@ export function Tracker() {
   const [cameraReady, setCameraReady] = useState(false);
   const [yoloStatus, setYoloStatusState] = useState<YoloStatus>(() => getYoloStatus());
   const [lastInferMs, setLastInferMs] = useState<number | null>(null);
+  // Which TTS backend rendered the most recent voice line. Shown in the
+  // diag panel so you can confirm Fish (vs. OpenAI fallback / caption-only)
+  // is actually in play without having to listen carefully.
+  const [lastTtsBackend, setLastTtsBackend] = useState<
+    "fish" | "openai" | "none" | null
+  >(null);
   const [diagOpen, setDiagOpen] = useState(false);
   const [diagError, setDiagError] = useState<string | null>(null);
   const [retryToken, setRetryToken] = useState(0);
@@ -350,6 +378,10 @@ export function Tracker() {
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
   const [talkFlash, setTalkFlash] = useState(false);
+  // "you said: …" toast that briefly echoes the Whisper transcript so the
+  // user has a clear signal their voice message landed.
+  const [heardText, setHeardText] = useState<string | null>(null);
+  const heardClearTimerRef = useRef<number | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<BlobPart[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -456,6 +488,18 @@ export function Tracker() {
           }
           t.analyser = null;
         }
+        if (t.gain) {
+          try {
+            t.gain.disconnect();
+          } catch {
+            // already disconnected
+          }
+          t.gain = null;
+        }
+        if (t.captionClearTimer != null) {
+          clearTimeout(t.captionClearTimer);
+          t.captionClearTimer = null;
+        }
       }
       tracksRef.current = [];
       // Push-to-talk cleanup.
@@ -474,6 +518,10 @@ export function Tracker() {
       if (talkFlashTimerRef.current != null) {
         clearTimeout(talkFlashTimerRef.current);
         talkFlashTimerRef.current = null;
+      }
+      if (heardClearTimerRef.current != null) {
+        clearTimeout(heardClearTimerRef.current);
+        heardClearTimerRef.current = null;
       }
       if (talkSourceRef.current) {
         try {
@@ -541,6 +589,58 @@ export function Tracker() {
     resetYolo();
     setRetryToken((t) => t + 1);
   }, []);
+
+  // Nuke every track. Used by the × button and Esc key — the "demo reset"
+  // the app was missing. Stops all audio, clears all timers, goes back to
+  // the ready phase (via the phase useEffect watching tracksUI.length).
+  const clearAllTracks = useCallback(() => {
+    for (const t of tracksRef.current) {
+      if (t.source) {
+        try {
+          t.source.stop();
+        } catch {
+          // already stopped
+        }
+        t.source = null;
+      }
+      if (t.analyser) {
+        try {
+          t.analyser.disconnect();
+        } catch {
+          // already disconnected
+        }
+        t.analyser = null;
+      }
+      if (t.gain) {
+        try {
+          t.gain.disconnect();
+        } catch {
+          // already disconnected
+        }
+        t.gain = null;
+      }
+      if (t.captionClearTimer != null) {
+        clearTimeout(t.captionClearTimer);
+        t.captionClearTimer = null;
+      }
+    }
+    tracksRef.current = [];
+    setTracksUI([]);
+    // Bump generation so any in-flight tap's generateLine/TTS drops silent.
+    generationRef.current++;
+  }, []);
+
+  // Esc key wipes the scene — handy for live demos where you want to reset
+  // between "oh look" moments without reloading the page.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && tracksRef.current.length > 0) {
+        clearAllTracks();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [clearAllTracks]);
 
   // --- Audio plumbing ----------------------------------------------------
   const ensureAudioCtx = useCallback(() => {
@@ -625,8 +725,9 @@ export function Tracker() {
       );
 
       try {
-        const { line, audioDataUrl } = await generateLine(cropDataUrl);
+        const { line, audioDataUrl, backend } = await generateLine(cropDataUrl);
         if (callGen !== track.speakGen) return;
+        setLastTtsBackend(backend);
 
         setTracksUI((prev) =>
           prev.map((t) =>
@@ -642,13 +743,19 @@ export function Tracker() {
         const audioBuf = await ctx.decodeAudioData(buf);
         if (callGen !== track.speakGen) return;
 
-        // Lazy-init this track's analyser on first speak.
+        // Lazy-init this track's analyser + gain on first speak.
+        // Chain: source → analyser → gain → destination. Gain is driven by
+        // the RAF loop from t.opacity so audio fades with the face.
         if (!track.analyser) {
           const analyser = ctx.createAnalyser();
           analyser.fftSize = 1024;
           analyser.smoothingTimeConstant = 0.4;
-          analyser.connect(ctx.destination);
+          const gain = ctx.createGain();
+          gain.gain.value = track.opacity;
+          analyser.connect(gain);
+          gain.connect(ctx.destination);
           track.analyser = analyser;
+          track.gain = gain;
           track.freqData = new Uint8Array(
             new ArrayBuffer(analyser.frequencyBinCount)
           );
@@ -668,6 +775,19 @@ export function Tracker() {
                 t.id === trackId ? { ...t, speaking: false } : t
               )
             );
+            // Schedule the caption to fade off-screen so stacked bubbles
+            // don't linger indefinitely. A retap will cancel this.
+            if (track.captionClearTimer != null) {
+              clearTimeout(track.captionClearTimer);
+            }
+            track.captionClearTimer = window.setTimeout(() => {
+              track.captionClearTimer = null;
+              setTracksUI((prev) =>
+                prev.map((t) =>
+                  t.id === trackId ? { ...t, caption: null } : t
+                )
+              );
+            }, CAPTION_LINGER_MS);
           }
         };
         track.source = source;
@@ -783,10 +903,18 @@ export function Tracker() {
           });
       }
 
-      // (2) Per-track opacity fade-in (opacity stays at 1 once up — face
-      // never hides on occlusion, that's by design).
+      // (2) Per-track opacity. Fade in while present, fade out once the
+      // object is "lost" (LOST_AFTER_MISSES). Same threshold the matcher
+      // uses to decide a snap-on-return, so the face fades out and snaps
+      // back in cleanly at the new location instead of gliding through
+      // wrong space.
       for (const t of tracksRef.current) {
-        t.opacity = lerp(t.opacity, 1, OPACITY_EMA_ALPHA);
+        const target = t.missedFrames >= LOST_AFTER_MISSES ? 0 : 1;
+        t.opacity = lerp(t.opacity, target, OPACITY_EMA_ALPHA);
+        // Voice rides with the face — disembodied audio when the face has
+        // faded out feels haunted. Direct .value assignment is fine at 60Hz
+        // for the small per-frame steps the lerp produces.
+        if (t.gain) t.gain.gain.value = t.opacity;
       }
 
       // (3) Per-track mouth-shape classification.
@@ -820,8 +948,12 @@ export function Tracker() {
             EXTRAP_MAX_MS,
             renderNow - t.lastUpdatedAt
           );
+          // Glide through the first few misses too — losing one inference
+          // frame is common and freezing on it reads as jank. Velocity has
+          // already decayed by VELOCITY_DECAY_PER_MISS each miss, so the
+          // glide naturally tapers as confidence drops.
           const renderBox: Box =
-            t.missedFrames === 0
+            t.missedFrames <= EXTRAP_MISS_LIMIT
               ? makeBox(
                   t.smoothedBox.cx + t.vx * sinceUpdate,
                   t.smoothedBox.cy + t.vy * sinceUpdate,
@@ -900,7 +1032,7 @@ export function Tracker() {
           const idx = dets.indexOf(match);
           if (idx >= 0) claimed.add(idx);
 
-          const wasLost = t.missedFrames >= REACQUIRE_SNAP_FRAMES;
+          const wasLost = t.missedFrames >= LOST_AFTER_MISSES;
           const prevBox = t.smoothedBox;
           const now = performance.now();
 
@@ -997,6 +1129,178 @@ export function Tracker() {
       return canvas.toDataURL("image/jpeg", 0.82);
     },
     []
+  );
+
+  // Pick the track the mic should talk to. Most-recent-tap wins; returns
+  // null when the scene has no faces. No UI for focus-switching yet; the
+  // LRU-by-tap heuristic matches "the thing you just tapped is the thing
+  // you want to speak to."
+  const pickTalkTarget = useCallback((): TrackRefs | null => {
+    if (tracksRef.current.length === 0) return null;
+    let best = tracksRef.current[0];
+    for (const t of tracksRef.current) {
+      if (t.lastTapAt > best.lastTapAt) best = t;
+    }
+    return best;
+  }, []);
+
+  // Voice-in → voice-out conversation on a specific track. Mirrors the
+  // structure of speakOnTrack (per-track speakGen guard, per-track analyser
+  // so lips sync) but routes through the converseWithObject server action
+  // instead of the one-shot generateLine.
+  const sendTalkToTrack = useCallback(
+    async (trackId: string, blob: Blob) => {
+      const ctx = ensureAudioCtx();
+      const track = tracksRef.current.find((t) => t.id === trackId);
+      if (!ctx || !track) return;
+
+      const callGen = ++track.speakGen;
+
+      // Retap cancels any pending caption auto-dismiss — a fresh reply
+      // deserves its full linger.
+      if (track.captionClearTimer != null) {
+        clearTimeout(track.captionClearTimer);
+        track.captionClearTimer = null;
+      }
+
+      // Stop whatever this track was saying so the reply owns the airwaves.
+      if (track.source) {
+        try {
+          track.source.stop();
+        } catch {
+          // already stopped
+        }
+        track.source = null;
+      }
+
+      setTracksUI((prev) =>
+        prev.map((t) =>
+          t.id === trackId
+            ? { ...t, thinking: true, speaking: false, caption: null }
+            : t
+        )
+      );
+
+      // Fresh crop of the current smoothed box so the model sees WHERE the
+      // object is right now (for spatial/context reasoning in the reply).
+      const cropDataUrl = captureBoxFrame(track.smoothedBox);
+
+      try {
+        const formData = new FormData();
+        // Match the file extension to the recorder's MIME type so Whisper's
+        // backend picks the right decoder.
+        const filename =
+          blob.type.includes("mp4")
+            ? "talk.mp4"
+            : blob.type.includes("ogg")
+              ? "talk.ogg"
+              : "talk.webm";
+        formData.append("audio", blob, filename);
+        formData.append("className", track.className);
+        if (cropDataUrl) formData.append("imageDataUrl", cropDataUrl);
+
+        const { transcript, reply, audioDataUrl, backend } =
+          await converseWithObject(formData);
+        setLastTtsBackend(backend);
+        if (callGen !== track.speakGen) return;
+
+        // Echo what Whisper heard so the user has an instant signal that
+        // their voice message landed — even before the reply starts playing.
+        if (transcript) {
+          setHeardText(transcript);
+          if (heardClearTimerRef.current != null) {
+            clearTimeout(heardClearTimerRef.current);
+          }
+          heardClearTimerRef.current = window.setTimeout(() => {
+            setHeardText(null);
+            heardClearTimerRef.current = null;
+          }, 3600);
+        }
+
+        setTracksUI((prev) =>
+          prev.map((t) =>
+            t.id === trackId ? { ...t, caption: reply, thinking: false } : t
+          )
+        );
+
+        if (!audioDataUrl) return;
+
+        const resp = await fetch(audioDataUrl);
+        const buf = await resp.arrayBuffer();
+        const audioBuf = await ctx.decodeAudioData(buf);
+        if (callGen !== track.speakGen) return;
+
+        // Lazy-init this track's analyser on first speak/talk.
+        if (!track.analyser) {
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 1024;
+          analyser.smoothingTimeConstant = 0.4;
+          analyser.connect(ctx.destination);
+          track.analyser = analyser;
+          track.freqData = new Uint8Array(
+            new ArrayBuffer(analyser.frequencyBinCount)
+          );
+          track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+        }
+
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuf;
+        source.connect(track.analyser);
+        source.onended = () => {
+          if (track.source === source) {
+            track.source = null;
+            setTracksUI((prev) =>
+              prev.map((t) =>
+                t.id === trackId ? { ...t, speaking: false } : t
+              )
+            );
+            if (track.captionClearTimer != null) {
+              clearTimeout(track.captionClearTimer);
+            }
+            track.captionClearTimer = window.setTimeout(() => {
+              track.captionClearTimer = null;
+              setTracksUI((prev) =>
+                prev.map((t) =>
+                  t.id === trackId ? { ...t, caption: null } : t
+                )
+              );
+            }, CAPTION_LINGER_MS);
+          }
+        };
+        track.source = source;
+        setTracksUI((prev) =>
+          prev.map((t) => (t.id === trackId ? { ...t, speaking: true } : t))
+        );
+        source.start();
+      } catch (e) {
+        if (callGen !== track.speakGen) return;
+        const msg = e instanceof Error ? e.message : "talk failed";
+        setErrorMsg(msg);
+        setDiagError(msg);
+        setTracksUI((prev) =>
+          prev.map((t) =>
+            t.id === trackId
+              ? { ...t, thinking: false, speaking: false }
+              : t
+          )
+        );
+        showRejection(
+          /zhipu|glm|whisper|openai|api key|api_key|401|403/i.test(msg)
+            ? "voice backend unconfigured — check .env.local"
+            : `couldn't reply: ${msg.slice(0, 80)}`,
+          3200
+        );
+        // eslint-disable-next-line no-console
+        console.log("[tracker] talk failed:", e);
+      } finally {
+        if (callGen === track.speakGen) {
+          setTracksUI((prev) =>
+            prev.map((t) => (t.id === trackId ? { ...t, thinking: false } : t))
+          );
+        }
+      }
+    },
+    [captureBoxFrame, ensureAudioCtx, showRejection]
   );
 
   // Hit-test a tap against existing tracks' smoothed boxes. Returns the
@@ -1163,7 +1467,7 @@ export function Tracker() {
         tapped.y2 - tapped.y1
       );
       // Split EMA — position responsive, size slow (kills bbox-edge breathing).
-      const boxEma = newBoxEMA();
+      const boxEma = newBoxEMA(BOX_POS_ALPHA, BOX_SIZE_ALPHA);
       seedBoxEMA(boxEma, lockBox);
       const newId = `t${nextTrackIdRef.current++}`;
       const nowTs = performance.now();
@@ -1182,10 +1486,12 @@ export function Tracker() {
         lastUpdatedAt: nowTs,
         speakGen: 0,
         analyser: null,
+        gain: null,
         freqData: null,
         timeData: null,
         source: null,
         shape: "X",
+        captionClearTimer: null,
       };
 
       // LRU eviction when the slots are full.
@@ -1207,6 +1513,17 @@ export function Tracker() {
           } catch {
             // already disconnected
           }
+        }
+        if (oldest.gain) {
+          try {
+            oldest.gain.disconnect();
+          } catch {
+            // already disconnected
+          }
+        }
+        if (oldest.captionClearTimer != null) {
+          clearTimeout(oldest.captionClearTimer);
+          oldest.captionClearTimer = null;
         }
         tracksRef.current = tracksRef.current.filter((t) => t.id !== oldest.id);
         setTracksUI((prev) => prev.filter((t) => t.id !== oldest.id));
@@ -1321,12 +1638,29 @@ export function Tracker() {
       console.log(
         `[tracker] captured ${Math.round(blob.size / 1024)} KB of audio (${blob.type})`
       );
+
+      // The voice-in, voice-out loop — send the blob to whichever face is
+      // currently in focus (most-recently-tapped). If nothing is locked
+      // yet or the clip is too short to be real speech, bail with a toast.
+      const target = pickTalkTarget();
+      if (!target) {
+        showRejection("tap something first — then talk to it");
+        return;
+      }
+      if (blob.size < 1024) {
+        showRejection("too short — hold the button longer");
+        return;
+      }
+
+      // Visual "sent" flash on the button so the release feels decisive.
       setTalkFlash(true);
       if (talkFlashTimerRef.current != null) clearTimeout(talkFlashTimerRef.current);
       talkFlashTimerRef.current = window.setTimeout(() => {
         setTalkFlash(false);
         talkFlashTimerRef.current = null;
       }, 650);
+
+      void sendTalkToTrack(target.id, blob);
     };
     recorderRef.current = mr;
     mr.start(100);
@@ -1376,7 +1710,7 @@ export function Tracker() {
     if (talkLevelRafRef.current == null) {
       talkLevelRafRef.current = requestAnimationFrame(readLevel);
     }
-  }, [ensureAudioCtx, openMicStream]);
+  }, [ensureAudioCtx, openMicStream, pickTalkTarget, sendTalkToTrack, showRejection]);
 
   const stopRecording = useCallback(() => {
     const mr = recorderRef.current;
@@ -1395,10 +1729,21 @@ export function Tracker() {
   // --- Derived UI --------------------------------------------------------
   const anyThinking = tracksUI.some((t) => t.thinking);
   const anySpeaking = tracksUI.some((t) => t.speaking);
-  const latestSpeakingCaption =
-    tracksUI.find((t) => t.speaking)?.caption ??
-    tracksUI.find((t) => t.caption)?.caption ??
-    null;
+
+  // Which face the mic is aimed at — the most-recently-tapped one. Drives
+  // the button label so the user sees "talk to the cup" before they press.
+  const talkTargetClass: string | null = useMemo(() => {
+    if (tracksUI.length === 0) return null;
+    let best: TrackRefs | null = null;
+    for (const t of tracksRef.current) {
+      if (!best || t.lastTapAt > best.lastTapAt) best = t;
+    }
+    return best?.className ?? null;
+    // Invalidate on track add/remove. lastTapAt churn within tracksRef
+    // is intentionally not a dep — it'd trigger every tap without changing
+    // the target, since the last-tap-wins order is already stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tracksUI]);
 
   const dotClass =
     phase === "error"
@@ -1468,7 +1813,6 @@ export function Tracker() {
             transformOrigin: "0 0",
             transform: `translate(${t.left}px, ${t.top}px) translate(-50%, -50%) scale(${t.scale})`,
             opacity: t.opacity,
-            transition: "opacity 120ms linear",
           }}
         >
           <FaceVoice shape={t.shape} />
@@ -1568,6 +1912,30 @@ export function Tracker() {
           >
             i
           </button>
+          {tracksUI.length > 0 && (
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                clearAllTracks();
+              }}
+              className="grid h-7 w-7 place-items-center rounded-full bg-white/15 text-white/90 ring-1 ring-white/25 backdrop-blur-xl transition hover:bg-rose-500/40 hover:ring-rose-200/50"
+              aria-label="clear all faces"
+              title="clear all (Esc)"
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.6"
+                strokeLinecap="round"
+              >
+                <path d="M6 6l12 12M18 6L6 18" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
 
@@ -1677,6 +2045,20 @@ export function Tracker() {
               {tracksUI.length > 0 &&
                 ` · ${tracksUI.map((t) => t.className).join(", ")}`}
             </dd>
+            <dt className="text-white/50">tts</dt>
+            <dd
+              className={
+                lastTtsBackend === "fish"
+                  ? "text-emerald-200"
+                  : lastTtsBackend === "openai"
+                    ? "text-amber-200"
+                    : lastTtsBackend === "none"
+                      ? "text-rose-200"
+                      : ""
+              }
+            >
+              {lastTtsBackend ?? "—"}
+            </dd>
             {diagError && (
               <>
                 <dt className="text-white/50">err</dt>
@@ -1720,6 +2102,25 @@ export function Tracker() {
           <div className="rounded-full bg-white/90 px-4 py-2 shadow-[0_12px_28px_-14px_rgba(0,0,0,0.5)] ring-1 ring-white/80 backdrop-blur-xl">
             <span className="serif-italic text-[13.5px] font-medium text-[color:var(--ink)]">
               {rejection}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* "You said …" transcript echo — instant signal that Whisper heard
+          the voice message. Rendered just below the status pill so it
+          overlaps the thinking + reply caption without fighting either. */}
+      {heardText && (
+        <div
+          className="pointer-events-none absolute inset-x-0 top-[132px] flex justify-center px-6"
+          style={{ animation: "bubble-in 320ms cubic-bezier(0.16,1,0.3,1) both" }}
+        >
+          <div className="flex max-w-md items-center gap-2 rounded-full bg-black/55 px-4 py-1.5 ring-1 ring-white/15 backdrop-blur-xl">
+            <span className="text-[10px] uppercase tracking-[0.18em] text-white/55">
+              you said
+            </span>
+            <span className="serif-italic truncate text-[13px] font-medium text-white/95">
+              {heardText}
             </span>
           </div>
         </div>
@@ -1792,10 +2193,6 @@ export function Tracker() {
           </div>
         </div>
       )}
-      {/* Suppress unused: latestSpeakingCaption kept as a hook for future
-          overlay that wants the most-recent line only. */}
-      {latestSpeakingCaption === "__never__" && <span />}
-
       {/* Hold-to-talk button (unchanged). */}
       <div
         className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 px-5 pb-[max(env(safe-area-inset-bottom),22px)] pt-3"
@@ -1980,7 +2377,9 @@ export function Tracker() {
               ? "tap to enable mic"
               : talkFlash
                 ? "got it"
-                : "hold to speak"}
+                : talkTargetClass
+                  ? `hold to talk to the ${talkTargetClass}`
+                  : "tap an object first"}
         </span>
       </div>
     </div>
