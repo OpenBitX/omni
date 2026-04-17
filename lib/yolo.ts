@@ -43,15 +43,23 @@ export type Detection = {
   score: number;
   classId: number;
   className: string;
+  // Populated only by the seg head. Centroid is in source (video) pixels;
+  // maskArea is in 160×160 prototype pixels — useful as an occlusion signal
+  // (sudden drop ⇒ something covered the object).
+  maskCentroid?: { x: number; y: number };
+  maskArea?: number;
 };
 
 // Head type selects the post-processing branch.
 //   - "yolo-detr": outputs logits [1,N,C] + pred_boxes [1,N,4] normalized
 //     cxcywh. YOLO26n + RF-DETR Nano use this.
-//   - "yolov8-head": outputs a single [1, 4+C, N] tensor where rows 0..3 are
-//     cxcywh in input-pixel space and rows 4..3+C are class scores. Used by
-//     raw Ultralytics YOLOv8/v11 exports.
-export type ModelHead = "yolo-detr" | "yolov8-head";
+//   - "yolov8-head": legacy anchor-grid output ([1, 4+C, N]). Used by raw
+//     Ultralytics YOLOv8/v11 exports.
+//   - "yolo-seg-detr": DETR-style seg. Output0 [1, N, 6+32] rows of
+//     (x1, y1, x2, y2, score, classId, 32 mask coefs). Output1 [1, 32, H, W]
+//     prototype masks. Per detection we compute the binary mask and its
+//     centroid for anchor stability.
+export type ModelHead = "yolo-detr" | "yolov8-head" | "yolo-seg-detr";
 
 // Per-model native input sizes, confirmed empirically on each ONNX.
 //
@@ -64,6 +72,7 @@ export type ModelHead = "yolo-detr" | "yolov8-head";
 // 2026-04-18.)
 export const MODEL_PRESETS = {
   "yolo26n": { head: "yolo-detr" as ModelHead, inputSize: 640, classIdMap: null as Int32Array | null },
+  "yolo26n-seg": { head: "yolo-seg-detr" as ModelHead, inputSize: 640, classIdMap: null as Int32Array | null },
   // RF-DETR Nano's exported ONNX only accepts 384×384 — the detection nano's
   // NAS-native size. We also let anyone explicitly pass a larger RF-DETR
   // variant + matching inputSize if they want more accuracy.
@@ -75,6 +84,7 @@ export const MODEL_PRESETS = {
 // letting callers pass explicit head/inputSize for anything custom.
 function presetForUrl(url: string): (typeof MODEL_PRESETS)[keyof typeof MODEL_PRESETS] | null {
   const basename = url.split("/").pop()?.toLowerCase() ?? "";
+  if (basename.startsWith("yolo26n-seg")) return MODEL_PRESETS["yolo26n-seg"];
   if (basename.startsWith("yolo26n")) return MODEL_PRESETS["yolo26n"];
   if (basename.startsWith("rf-detr-nano")) return MODEL_PRESETS["rf-detr-nano"];
   if (basename.startsWith("yolov8n") || basename.startsWith("yolov11n")) return MODEL_PRESETS["yolov8n"];
@@ -152,12 +162,18 @@ export function subscribeYoloStatus(cb: (s: YoloStatus) => void): () => void {
 // Build the runtime config. Explicit opts win; the rest are auto-picked from
 // a URL-based preset so nobody accidentally runs a NAS-tuned model at the
 // wrong resolution (see MODEL_PRESETS comment).
+//
+// Default is the seg model — it gives us the mask-centroid anchor which is
+// meaningfully more stable than bbox-center for asymmetric objects (the
+// mug-handle problem). Seg inference is ~2× the work of plain detection but
+// stays well inside real-time on WebGPU, and the centroid drops the
+// visible jitter enough to be worth it.
 function defaultConfig(opts: YoloInitOptions): Config {
-  const modelUrl = opts.modelUrl ?? "/models/yolo26n.onnx";
+  const modelUrl = opts.modelUrl ?? "/models/yolo26n-seg.onnx";
   const preset = presetForUrl(modelUrl);
   return {
     modelUrl,
-    head: opts.head ?? preset?.head ?? "yolo-detr",
+    head: opts.head ?? preset?.head ?? "yolo-seg-detr",
     inputSize: opts.inputSize ?? preset?.inputSize ?? 640,
     classIdMap: opts.classIdMap ?? preset?.classIdMap ?? null,
   };
@@ -577,6 +593,166 @@ function postprocessYoloV8(
   return nms(candidates, iouT);
 }
 
+// DETR-style seg post-processing.
+// Output0 rows: [x1, y1, x2, y2, score, classId, 32 mask coefficients] in
+// input-pixel space (not normalized). Output1 is [1, 32, H, W] prototype
+// masks at a quarter of the input resolution.
+//
+// Per kept detection we do `sigmoid(coefs @ protos)` to recover a dense
+// mask, crop it to the box, threshold at 0.5, and compute a centroid. That
+// centroid is what the tracker uses as the stable face anchor — a mug's
+// mask centroid lives inside the mug body, not sheared by the handle the
+// way the bbox center is.
+//
+// Cost: 32 × H × W multiply-adds per detection (≈820k for 160×160), plus
+// sigmoid. Under 3 ms per detection on modern CPUs; we cap the number of
+// detections we bother decoding so cost stays bounded on mobile.
+function postprocessYoloSegDetr(
+  outputs: Record<string, ort.Tensor>,
+  pre: LetterboxResult,
+  vw: number,
+  vh: number,
+  conf: number,
+  classIdMap: Int32Array | null,
+  classFilter?: (id: number) => boolean,
+  maxMaskDetections = 8
+): Detection[] {
+  const keys = Object.keys(outputs);
+  // Output order isn't guaranteed — pick by rank.
+  let out0: ort.Tensor | null = null;
+  let out1: ort.Tensor | null = null;
+  for (const k of keys) {
+    const t = outputs[k];
+    if (t.dims.length === 3 && t.dims[2] > 6) out0 = t;
+    else if (t.dims.length === 4) out1 = t;
+  }
+  if (!out0 || !out1) return [];
+
+  const [, nQ, nFeat] = out0.dims as [number, number, number];
+  const [, nMasks, mh, mw] = out1.dims as [number, number, number, number];
+  if (nFeat < 6 + nMasks) return [];
+
+  const d0 = out0.data as Float32Array;
+  const d1 = out1.data as Float32Array;
+
+  // First pass: cheaply collect qualifying detections WITHOUT mask decode.
+  type Pending = { q: number; x1: number; y1: number; x2: number; y2: number; score: number; classRaw: number; coefOff: number };
+  const pending: Pending[] = [];
+  for (let i = 0; i < nQ; i++) {
+    const base = i * nFeat;
+    const score = d0[base + 4];
+    if (score < conf) continue;
+    const classRaw = Math.round(d0[base + 5]);
+    const coco80 = classIdMap
+      ? (classRaw >= 0 && classRaw < classIdMap.length ? classIdMap[classRaw] : -1)
+      : classRaw;
+    if (coco80 < 0 || coco80 >= COCO_CLASSES.length) continue;
+    if (classFilter && !classFilter(coco80)) continue;
+    pending.push({
+      q: i,
+      x1: d0[base + 0],
+      y1: d0[base + 1],
+      x2: d0[base + 2],
+      y2: d0[base + 3],
+      score,
+      classRaw: coco80,
+      coefOff: base + 6,
+    });
+  }
+
+  // Keep the top-K by score for full mask decode. More than 8 masks per
+  // frame gets costly on mobile and our UI only ever uses the tight
+  // top-of-list for tapping/locking.
+  pending.sort((a, b) => b.score - a.score);
+  const keep = pending.slice(0, maxMaskDetections);
+
+  const protoArea = mh * mw;
+  const out: Detection[] = [];
+
+  for (const p of keep) {
+    // Input-space box → source space (letterbox inverse).
+    const cx640 = (p.x1 + p.x2) * 0.5;
+    const cy640 = (p.y1 + p.y2) * 0.5;
+    const w640 = p.x2 - p.x1;
+    const h640 = p.y2 - p.y1;
+    const cx = (cx640 - pre.padX) / pre.scale;
+    const cy = (cy640 - pre.padY) / pre.scale;
+    const w = w640 / pre.scale;
+    const h = h640 / pre.scale;
+    const sx1 = Math.max(0, cx - w / 2);
+    const sy1 = Math.max(0, cy - h / 2);
+    const sx2 = Math.min(vw, cx + w / 2);
+    const sy2 = Math.min(vh, cy + h / 2);
+    if (sx2 - sx1 < 4 || sy2 - sy1 < 4) continue;
+
+    // Mask decode over the intersection of the box with the 160×160 proto
+    // grid — huge perf win over decoding the full 160×160 per detection.
+    // Proto grid covers the same 640×640 letterbox as the input, at mh×mw
+    // resolution. So a mask pixel (mx, my) corresponds to input (mx * 640/mw, my * 640/mh).
+    const inputToProtoX = mw / pre.size;
+    const inputToProtoY = mh / pre.size;
+    const px1 = Math.max(0, Math.floor(p.x1 * inputToProtoX));
+    const py1 = Math.max(0, Math.floor(p.y1 * inputToProtoY));
+    const px2 = Math.min(mw, Math.ceil(p.x2 * inputToProtoX));
+    const py2 = Math.min(mh, Math.ceil(p.y2 * inputToProtoY));
+    if (px2 <= px1 || py2 <= py1) continue;
+
+    let centroidX = 0;
+    let centroidY = 0;
+    let totalMass = 0;
+    let abovePixels = 0;
+    for (let y = py1; y < py2; y++) {
+      const rowOff = y * mw;
+      for (let x = px1; x < px2; x++) {
+        // Dot product across the 32 coefs × 32 protos at this pixel.
+        let s = 0;
+        for (let c = 0; c < nMasks; c++) {
+          s += d0[p.coefOff + c] * d1[c * protoArea + rowOff + x];
+        }
+        // Sigmoid + threshold 0.5. Since sigmoid(0) = 0.5, we just check s > 0.
+        if (s > 0) {
+          const v = 1 / (1 + Math.exp(-s));
+          if (v > 0.5) {
+            centroidX += x * v;
+            centroidY += y * v;
+            totalMass += v;
+            abovePixels++;
+          }
+        }
+      }
+    }
+
+    let maskCentroid: { x: number; y: number } | undefined;
+    if (totalMass > 0) {
+      // Centroid lives in proto coords; scale back to source pixels.
+      const protoCx = centroidX / totalMass;
+      const protoCy = centroidY / totalMass;
+      const centroid640X = protoCx / inputToProtoX;
+      const centroid640Y = protoCy / inputToProtoY;
+      const centroidSrcX = (centroid640X - pre.padX) / pre.scale;
+      const centroidSrcY = (centroid640Y - pre.padY) / pre.scale;
+      // Clamp to the box — guards against rare degenerate masks that leak
+      // outside the box (mostly from low-confidence prototype artifacts).
+      maskCentroid = {
+        x: Math.max(sx1, Math.min(sx2, centroidSrcX)),
+        y: Math.max(sy1, Math.min(sy2, centroidSrcY)),
+      };
+    }
+
+    out.push({
+      x1: sx1, y1: sy1, x2: sx2, y2: sy2,
+      cx, cy, w, h,
+      score: p.score,
+      classId: p.classRaw,
+      className: COCO_CLASSES[p.classRaw] ?? "?",
+      maskCentroid,
+      maskArea: abovePixels,
+    });
+  }
+
+  return out;
+}
+
 export async function detect(
   video: HTMLVideoElement,
   scratch: HTMLCanvasElement,
@@ -606,7 +782,9 @@ export async function detect(
   const results =
     cfg.head === "yolo-detr"
       ? postprocessDetr(outputs, pre, vw, vh, conf, cfg.classIdMap, opts.classFilter)
-      : postprocessYoloV8(outputs, pre, vw, vh, conf, iouT, opts.classFilter);
+      : cfg.head === "yolo-seg-detr"
+        ? postprocessYoloSegDetr(outputs, pre, vw, vh, conf, cfg.classIdMap, opts.classFilter, opts.maxDetections ?? 10)
+        : postprocessYoloV8(outputs, pre, vw, vh, conf, iouT, opts.classFilter);
 
   return results.length > maxDet
     ? results.sort((a, b) => b.score - a.score).slice(0, maxDet)

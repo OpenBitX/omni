@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { generateLine } from "@/app/actions";
-import { Face } from "@/components/face";
+import {
+  FACE_VOICE_WIDTH,
+  FaceVoice,
+  classifyShape,
+  type MouthShape,
+} from "@/components/face-voice";
 import {
   COCO_CLASSES,
   PERSON_CLASS_ID,
@@ -27,72 +32,92 @@ import {
 } from "@/lib/iou";
 
 // === Pipeline tuning knobs ===============================================
-//
-// These are the numbers you'd reach for when the tracker feels wrong.
-// Each one controls a named trade-off; tune in isolation.
 
-// Inference rate cap. YOLOv8n on mobile CPU-WASM sits around 3–8 FPS; we
-// don't gate beyond that. Desktop WebGPU can hit 30+ — then this cap keeps
-// us from burning battery for motion we can already handle with EMA.
+// Inference rate cap. YOLOv8n on mobile CPU-WASM sits around 3–8 FPS; on
+// desktop WebGPU it hits 30+. The cap keeps us from burning battery for
+// motion we can already handle with EMA between inferences.
 const MAX_INFERENCE_FPS = 30;
 
-// IoU gate for "this new box is the same object I was tracking". 0.3 is a
-// good default — lower lets the face drift onto a bumping neighbor, higher
-// loses the target whenever the box shape wobbles during fast motion.
+// IoU gate for "this new box is the same instance I was tracking". Loose
+// enough to survive shape wobble, tight enough that two adjacent cups don't
+// share an identity. A same-class nearest-center fallback kicks in on
+// consecutive misses (see WIDEN_MATCH_AFTER_MISSES).
 const IDENTITY_IOU_MIN = 0.3;
 
-// EMA alphas. Per the brief: 0.4 on position+size = snappy but not jittery.
-// Face opacity uses a slightly faster alpha so occlusion in/out feels
-// decisive rather than ghostly.
+// EMA alphas. 0.4 on position+size = snappy but not jittery.
 const BOX_EMA_ALPHA = 0.4;
 const OPACITY_EMA_ALPHA = 0.55;
 
-// Occlusion latch. If the target's class disappears (or drops IoU) for this
-// many consecutive inference frames, hide the face + mute audio. A tight
-// count feels responsive; too tight and blips from bad frames cause flicker.
-const OCCLUSION_MISS_FRAMES = 5;
+// Reacquisition threshold. After this many missed frames, a fresh match
+// SNAPS the smoothed pose instead of EMA-sliding — avoids a visible glide
+// across the screen when an object reappears after an occlusion.
+const REACQUIRE_SNAP_FRAMES = 5;
 
-// Confidence thresholds. Tap uses a looser threshold — the user's intent is
-// a strong prior that something tappable lives at that point. DETR sigmoid
-// probabilities run lower than YOLOv8 softmax-ish scores, so we stay
-// permissive — we'd rather show too many things than miss them.
+// After this many misses, widen matching to same-class + closest-center.
+// Camera pans, fast motion, and brief full occlusions can blow IoU to zero
+// between frames even though a valid same-class detection is still in
+// view — class+center recovers gracefully.
+const WIDEN_MATCH_AFTER_MISSES = 3;
+
+// Hold-last-good: reject position updates whose dimensions jumped this much
+// vs. the previous smoothed box. Prevents the face from snapping onto a
+// transient-but-larger neighbor of the same class during a noisy frame.
+// The track keeps its identity and carries on — next inference usually
+// gives a clean match.
+const SUSPECT_SIZE_RATIO = 1.75;
+
+// Velocity extrapolation. Between YOLO inferences (which run at 3–15 fps
+// on mobile) we glide the face at 60 fps using per-track velocity. Capped
+// so a lost target doesn't fly across the screen, and the velocity itself
+// decays during misses.
+const EXTRAP_MAX_MS = 160;
+const VELOCITY_EMA = 0.5;
+const VELOCITY_DECAY_PER_MISS = 0.6;
+
+// Tap confidence is lower than continuous — the user's intent is a strong
+// prior that something tappable sits under their finger. Continuous runs
+// at a generous confidence so the breathing-box gallery feels alive.
 const CONTINUOUS_CONF = 0.15;
 const TAP_CONF = 0.08;
 const CONTINUOUS_MAX_DET = 25;
 
-// Face size = FACE_BBOX_FRACTION × min(box.w, box.h). The <Face /> SVG is
-// 200 CSS px at scale=1, hence the /200.
+// Face size = FACE_BBOX_FRACTION × min(box.w, box.h). <FaceVoice /> ships
+// at FACE_VOICE_WIDTH CSS px at scale=1; the multiplier is target_px / that.
 const FACE_BBOX_FRACTION = 0.62;
-const FACE_SVG_NATIVE_PX = 200;
+const FACE_NATIVE_PX = FACE_VOICE_WIDTH;
 
-// Hard clamp on face scale — keeps tiny boxes from birthing a grain-of-sand
-// face and giant boxes from drowning the screen when the user walks up.
+// Hard clamp on face scale — tiny boxes don't birth a grain-of-sand face,
+// giant boxes don't drown the screen.
 const FACE_SCALE_MIN = 0.25;
 const FACE_SCALE_MAX = 3.0;
 
-// Breathing boxes: don't show them once something is locked — clutters.
-// Classes explicitly forbidden from face placement (the app is about things,
-// not people). Matches the policy in ASSESS_SYSTEM.
+// Classes the app explicitly refuses to put a face on — it's about things,
+// not people. Mirrors the ASSESS_SYSTEM policy upstream.
 const EXCLUDED_CLASS_IDS = new Set<number>([PERSON_CLASS_ID]);
 
-// Tap-hit fallback: if the tap isn't inside any detected box, we run a
-// one-shot lower-threshold detection. Cached continuous detections are
-// reused when fresh enough to avoid the extra inference cost.
+// Tap-hit fallback cache — reuse the continuous loop's detections when
+// fresh, otherwise fire a one-shot lower-threshold inference under the tap.
 const TAP_CACHE_MAX_AGE_MS = 400;
 
-// Visible tap-frame fallback dimensions when YOLO detects nothing at all.
+// Visible tap-frame fallback dimensions (shown instantly while the real
+// detection box is computed).
 const TAP_FRAME_FRACTION = 0.55;
 
-type Phase = "starting" | "ready" | "locked" | "error";
+// How many objects can wear a face at once. Tap past this and the LRU
+// (least-recently-tapped) track gets evicted to make room. Three is the
+// sweet spot for demos: busy enough to feel alive, small enough to parse.
+const MAX_FACES = 3;
 
-type Target = {
-  classId: number;
-  className: string;
-  // Anchor = face-placement point expressed as ratio of the tracked box.
-  // Replayed against each new smoothed box → face stays on the right spot
-  // even as the box stretches, shrinks, or shifts.
-  anchor: Anchor;
-};
+// Hide the caption bubbles — audio-only mode. TTS and speak wiring continue
+// to run; we just don't render the transcript.
+const SHOW_CAPTIONS = false;
+
+// Adaptive waveform bar count. Symmetric layout around center; bumping this
+// widens the strip but does not retune the bar-to-band mapping (see readLevel).
+// Kept small so the strip fits cleanly inside the 84px mic button.
+const WAVE_BARS = 14;
+
+type Phase = "starting" | "ready" | "locked" | "error";
 
 type ViewportBox = {
   left: number;
@@ -135,11 +160,12 @@ function sourceBoxToElement(
   }
   const pxPerSrcX = rect.width / dispW;
   const pxPerSrcY = rect.height / dispH;
-  const left = (box.x1 - offX) * pxPerSrcX;
-  const top = (box.y1 - offY) * pxPerSrcY;
-  const width = (box.x2 - box.x1) * pxPerSrcX;
-  const height = (box.y2 - box.y1) * pxPerSrcY;
-  return { left, top, width, height };
+  return {
+    left: (box.x1 - offX) * pxPerSrcX,
+    top: (box.y1 - offY) * pxPerSrcY,
+    width: (box.x2 - box.x1) * pxPerSrcX,
+    height: (box.y2 - box.y1) * pxPerSrcY,
+  };
 }
 
 function sourceToElementPoint(
@@ -209,9 +235,9 @@ function elementPointToSource(
   };
 }
 
-// Among multiple detections under the same tap, prefer the box with the
-// smallest area — tighter boxes are usually the correct semantic target
-// when two containers are nested (cup inside the region of a dining table).
+// Pick the smallest-area detection that contains the tap. Smaller boxes
+// are usually the correct semantic target when two are nested (cup inside
+// the region of a dining table).
 function pickTappedDetection(
   dets: readonly Detection[],
   tapX: number,
@@ -229,8 +255,7 @@ function pickTappedDetection(
     }
   }
   if (best) return best;
-  // Fallback: no box strictly contains the tap — nearest-center within a
-  // fraction of the video's min dimension so we don't pick the far corner.
+  // No box contains the tap — fall back to nearest-center.
   let nearest: Detection | null = null;
   let nearestD = Infinity;
   for (const d of dets) {
@@ -246,16 +271,71 @@ function pickTappedDetection(
   return nearest;
 }
 
+// === Per-track state =====================================================
+//
+// Each locked object gets its own TrackRefs (mutable, hot-path state written
+// every RAF) plus its own TrackUI (React-rendered lifecycle/animation
+// values). The two are kept in sync by id.
+
+type TrackRefs = {
+  id: string;
+  classId: number;
+  className: string;
+  anchor: Anchor;
+  // Tracking math
+  boxEma: BoxEMA;
+  smoothedBox: Box;
+  missedFrames: number;
+  opacity: number;
+  lastTapAt: number;
+  // Velocity for inter-inference glide (source pixels / ms), plus timestamp
+  // of the last observation that moved the smoothed box. Extrapolation at
+  // render time uses `now - lastUpdatedAt`, capped by EXTRAP_MAX_MS.
+  vx: number;
+  vy: number;
+  lastUpdatedAt: number;
+  // Per-track speak generation — a second tap on the same track increments
+  // it, so an in-flight generateLine/TTS from the previous tap drops silent.
+  speakGen: number;
+  // Audio — each track has its own analyser so mouths sync to their own voice.
+  analyser: AnalyserNode | null;
+  freqData: Uint8Array<ArrayBuffer> | null;
+  timeData: Uint8Array<ArrayBuffer> | null;
+  source: AudioBufferSourceNode | null;
+  shape: MouthShape;
+  // Auto-dismiss timer id for this track's caption once audio finishes.
+  // Held per-track so a retap can cancel the prior dismissal.
+  captionClearTimer: number | null;
+};
+
+// How long a caption stays on screen after its voice line finishes. Long
+// enough to re-read the punchline; short enough that stacked bubbles don't
+// pile up forever.
+const CAPTION_LINGER_MS = 3500;
+
+type TrackUI = {
+  id: string;
+  classId: number;
+  className: string;
+  // Element-space position + size, driven by the RAF loop.
+  left: number;
+  top: number;
+  scale: number;
+  opacity: number;
+  // Audio-driven mouth shape, emitted by the lip-sync classifier.
+  shape: MouthShape;
+  // Lifecycle — set by tap/speak flow, not the RAF.
+  caption: string | null;
+  thinking: boolean;
+  speaking: boolean;
+};
+
 export function Tracker() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
 
   const [phase, setPhase] = useState<Phase>("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [fps, setFps] = useState(0);
-  const [thinking, setThinking] = useState(false);
-  const [caption, setCaption] = useState<string | null>(null);
-  const [speaking, setSpeaking] = useState(false);
   const [rejection, setRejection] = useState<string | null>(null);
   const [yoloReady, setYoloReady] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
@@ -266,14 +346,9 @@ export function Tracker() {
   const [retryToken, setRetryToken] = useState(0);
   const rejectionTimerRef = useRef<number | null>(null);
 
-  // --- Push-to-talk state -----------------------------------------------
-  // Held-down mic recording. `isRecording` drives the visual state;
-  // `talkLevel` is a 0..1 envelope from the mic's frequency analyser so the
-  // button ring can pulse with the user's voice. `recordedBlobRef` holds the
-  // most recent utterance for wiring into the per-object pipeline later.
+  // --- Push-to-talk state (UI only, decoupled from per-track voice) -----
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
-  const [talkLevel, setTalkLevel] = useState(0);
   const [talkFlash, setTalkFlash] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<BlobPart[]>([]);
@@ -285,54 +360,48 @@ export function Tracker() {
   const talkLevelRafRef = useRef<number | null>(null);
   const talkFlashTimerRef = useRef<number | null>(null);
 
-  // Detections the continuous loop has published. Used both to paint
-  // breathing boxes (ready state) and to resolve taps without a fresh
-  // inference.
+  // Adaptive waveform. `bandLevelsRef` holds a smoothed 0..1 per-bar envelope
+  // the readLevel RAF writes each frame; `barRefs` lets us push heights
+  // straight to the DOM at 60fps without re-rendering the component tree.
+  // Layout is symmetric — outer bars read higher freq bands than inner bars,
+  // so speech lights up the center first, which reads as natural.
+  const bandLevelsRef = useRef<Float32Array>(new Float32Array(WAVE_BARS));
+  const barRefs = useRef<(HTMLSpanElement | null)[]>([]);
+
+  // Detections from the continuous loop. Feeds the breathing boxes in the
+  // ready phase AND tap resolution without an extra inference.
   const [detections, setDetections] = useState<Detection[]>([]);
   const detectionsTsRef = useRef(0);
   const detectionsRef = useRef<Detection[]>([]);
 
-  // The tap frame shown during VLM assessment. Mirrors the previous tracker's
-  // UX — instant feedback so the user sees what's being analyzed.
+  // Visible tap-frame while we wait on the first inference after a tap.
   const [tapFrame, setTapFrame] = useState<
     (ViewportBox & { gen: number }) | null
   >(null);
 
-  // Face animation state (blink / eye darts / audio-driven mouth).
-  const [mouth, setMouth] = useState(0);
-  const [blink, setBlink] = useState(0);
-  const [eye, setEye] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  // The locked faces. Mutable mirror lives in tracksRef (written every RAF);
+  // React state is the rendering snapshot, updated once per RAF.
+  const tracksRef = useRef<TrackRefs[]>([]);
+  const [tracksUI, setTracksUI] = useState<TrackUI[]>([]);
+  const nextTrackIdRef = useRef(1);
 
-  // Tracking state.
-  const targetRef = useRef<Target | null>(null);
-  const boxEmaRef = useRef<BoxEMA>(newBoxEMA(BOX_EMA_ALPHA));
-  const smoothedBoxRef = useRef<Box | null>(null);
-  const missedFramesRef = useRef(0);
-  const faceOpacityRef = useRef(0);
-  const lockedRef = useRef(false);
   const yoloReadyRef = useRef(false);
   const inferenceInFlightRef = useRef(false);
   const lastInferenceAtRef = useRef(0);
   const inferenceCountRef = useRef(0);
 
-  // Scratch canvases + RAF handle.
   const yoloCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const fpsLastSampleRef = useRef(0);
   const fpsFrameCountRef = useRef(0);
 
-  // Audio plumbing — unchanged from the LK tracker.
+  // Single shared AudioContext for all tracks. Each track hangs its own
+  // AnalyserNode off it; sources play concurrently (chaos is the feature).
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const freqDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
-  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const mouthTargetRef = useRef(0);
-  const mouthSmoothRef = useRef(0);
 
-  // Generation counter guards async work (VLM call, TTS decode) from stale
-  // taps. Every tap increments — if it no longer matches by the time a
-  // promise resolves, we drop the result on the floor.
+  // Global tap generation — any tap that triggers async work captures this;
+  // if it changes before the async resolves, the result is dropped.
   const generationRef = useRef(0);
 
   // --- Camera setup ------------------------------------------------------
@@ -369,14 +438,27 @@ export function Tracker() {
         clearTimeout(rejectionTimerRef.current);
         rejectionTimerRef.current = null;
       }
-      if (currentSourceRef.current) {
-        try {
-          currentSourceRef.current.stop();
-        } catch {
-          // already stopped
+      // Stop every track's audio source + disconnect analysers.
+      for (const t of tracksRef.current) {
+        if (t.source) {
+          try {
+            t.source.stop();
+          } catch {
+            // already stopped
+          }
+          t.source = null;
+        }
+        if (t.analyser) {
+          try {
+            t.analyser.disconnect();
+          } catch {
+            // already disconnected
+          }
+          t.analyser = null;
         }
       }
-      // Tear down push-to-talk plumbing.
+      tracksRef.current = [];
+      // Push-to-talk cleanup.
       if (recorderRef.current && recorderRef.current.state === "recording") {
         try {
           recorderRef.current.stop();
@@ -407,21 +489,19 @@ export function Tracker() {
     };
   }, []);
 
-  // --- Phase transition: both pieces have to land before we're ready ---
+  // --- Phase transitions ------------------------------------------------
   useEffect(() => {
+    if (phase === "error") return;
     if (cameraReady && yoloReady) {
-      setPhase((p) => (p === "error" || p === "locked" ? p : "ready"));
+      setPhase(tracksUI.length > 0 ? "locked" : "ready");
     }
-  }, [cameraReady, yoloReady]);
+  }, [cameraReady, yoloReady, tracksUI.length, phase]);
 
   // --- YOLO status subscription + warm-up --------------------------------
   useEffect(() => {
     const unsub = subscribeYoloStatus((s) => {
       setYoloStatusState(s);
       if (s.stage === "error" && s.error) {
-        // console.log, not console.error — the error is already surfaced in
-        // the dedicated error banner + diag panel; console.error would
-        // additionally show Next.js's dev overlay which covers the UI.
         // eslint-disable-next-line no-console
         console.log("[tracker] yolo status error:", s.error);
       }
@@ -443,11 +523,8 @@ export function Tracker() {
         console.log("[tracker] yolo ready");
       } catch (e) {
         if (cancelled) return;
-        // Don't flip the whole app into an error phase — the camera preview
-        // can still be useful, and we offer a retry. Just surface the error.
         const msg = e instanceof Error ? e.message : "detector failed";
         setErrorMsg(`detector: ${msg}`);
-        // console.log, not console.error — Next dev overlay would obscure UI.
         // eslint-disable-next-line no-console
         console.log("[tracker] initYolo failed:", e);
       }
@@ -465,70 +542,22 @@ export function Tracker() {
     setRetryToken((t) => t + 1);
   }, []);
 
-  // --- Face animation loop (blink / eye / audio-driven mouth) ------------
-  useEffect(() => {
-    let raf = 0;
-    let nextBlinkAt = performance.now() + 1800;
-    let blinkStart = 0;
-    let nextEyeMoveAt = performance.now() + 1200;
-    let eyeTarget = { x: 0, y: 0 };
-    const eyeCurrent = { x: 0, y: 0 };
-
-    const tick = (now: number) => {
-      raf = requestAnimationFrame(tick);
-
-      if (blinkStart === 0 && now >= nextBlinkAt) {
-        blinkStart = now;
-        nextBlinkAt = now + 2500 + Math.random() * 3500;
-      }
-      let b = 0;
-      if (blinkStart > 0) {
-        const dt = now - blinkStart;
-        const dur = 170;
-        if (dt < dur) b = Math.sin((dt / dur) * Math.PI);
-        else blinkStart = 0;
-      }
-      setBlink(b);
-
-      if (now >= nextEyeMoveAt) {
-        eyeTarget = {
-          x: (Math.random() - 0.5) * 1.6,
-          y: (Math.random() - 0.5) * 1.1,
-        };
-        nextEyeMoveAt = now + 1400 + Math.random() * 2200;
-      }
-      eyeCurrent.x += (eyeTarget.x - eyeCurrent.x) * 0.1;
-      eyeCurrent.y += (eyeTarget.y - eyeCurrent.y) * 0.1;
-      setEye({ x: eyeCurrent.x, y: eyeCurrent.y });
-
-      // Mouth follows audio envelope — unless the audio source is gone, in
-      // which case the mouth goes slack.
-      if (
-        currentSourceRef.current &&
-        analyserRef.current &&
-        freqDataRef.current
-      ) {
-        analyserRef.current.getByteFrequencyData(freqDataRef.current);
-        const data = freqDataRef.current;
-        const end = Math.min(40, data.length);
-        let sum = 0;
-        let count = 0;
-        for (let i = 2; i < end; i++) {
-          sum += data[i];
-          count++;
-        }
-        const avg = count > 0 ? sum / count / 255 : 0;
-        mouthTargetRef.current = Math.min(1, Math.max(0, (avg - 0.05) * 3));
-      } else {
-        mouthTargetRef.current = 0;
-      }
-      mouthSmoothRef.current +=
-        (mouthTargetRef.current - mouthSmoothRef.current) * 0.45;
-      setMouth(mouthSmoothRef.current);
-    };
-
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+  // --- Audio plumbing ----------------------------------------------------
+  const ensureAudioCtx = useCallback(() => {
+    let ctx = audioCtxRef.current;
+    if (!ctx) {
+      const Ctor =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext;
+      if (!Ctor) return null;
+      ctx = new Ctor();
+      audioCtxRef.current = ctx;
+    }
+    if (ctx.state === "suspended") {
+      ctx.resume().catch(() => {});
+    }
+    return ctx;
   }, []);
 
   // --- Get-or-make YOLO scratch canvas -----------------------------------
@@ -541,56 +570,156 @@ export function Tracker() {
     return c;
   }, []);
 
-  // --- Overlay writer ----------------------------------------------------
-  //
-  // Positions the SVG face via a single composed CSS transform — translate
-  // to the anchor, pull back half (so the face centers on it), scale, fade.
-  // Written every RAF even if no new inference arrived, so the EMA'd face
-  // position always reflects the latest tick of tracking state.
-  const writeOverlay = useCallback(() => {
-    const overlay = overlayRef.current;
-    const video = videoRef.current;
-    if (!overlay || !video) return;
-    const box = smoothedBoxRef.current;
-    const target = targetRef.current;
-    if (!lockedRef.current || !box || !target) {
-      overlay.style.opacity = "0";
-      return;
+  // --- Rejection toast ---------------------------------------------------
+  const showRejection = useCallback((msg: string, ms = 2400) => {
+    if (rejectionTimerRef.current != null) {
+      clearTimeout(rejectionTimerRef.current);
     }
-    const facePointSrc = applyAnchor(target.anchor, box);
-    const el = sourceToElementPoint(facePointSrc, video);
-    if (!el) return;
-    const rect = video.getBoundingClientRect();
-    const fx = el.clientX - rect.left;
-    const fy = el.clientY - rect.top;
-
-    // Face size tracks the box's smaller side so the face stays proportional
-    // through zooms. Clamp to the min/max so extreme boxes don't break the UI.
-    const boxMinSide = Math.min(box.w, box.h);
-    const targetFacePxVideo = boxMinSide * FACE_BBOX_FRACTION;
-    // Convert the source-space face pixel size into element-space pixels
-    // (again the object-cover letterbox).
-    const srcToElAvg = ((rect.width / video.videoWidth) +
-      (rect.height / video.videoHeight)) / 2;
-    const targetFacePxEl = targetFacePxVideo * srcToElAvg;
-    const scale = Math.max(
-      FACE_SCALE_MIN,
-      Math.min(FACE_SCALE_MAX, targetFacePxEl / FACE_SVG_NATIVE_PX)
-    );
-
-    overlay.style.opacity = faceOpacityRef.current.toFixed(3);
-    overlay.style.transform = `translate(${fx}px, ${fy}px) translate(-50%, -50%) scale(${scale})`;
+    setRejection(msg);
+    rejectionTimerRef.current = window.setTimeout(() => {
+      setRejection(null);
+      setTapFrame(null);
+      rejectionTimerRef.current = null;
+    }, ms);
   }, []);
 
-  // --- YOLO + tracking RAF loop -----------------------------------------
+  // --- Per-track speak ---------------------------------------------------
+  //
+  // Each track owns its own audio source + analyser, so three objects can
+  // talk over each other at the same time and their mouths each sync to
+  // their own line. The trackId closes over which track owns the result.
+  const speakOnTrack = useCallback(
+    async (trackId: string, cropDataUrl: string) => {
+      const ctx = ensureAudioCtx();
+      const track = tracksRef.current.find((t) => t.id === trackId);
+      if (!ctx || !track) return;
+
+      // Bump this track's speak gen so an in-flight call from a previous
+      // tap on the SAME track drops its result when it resolves late.
+      const callGen = ++track.speakGen;
+
+      // Retap cancels any pending caption auto-dismiss — the new line wants
+      // its full linger window.
+      if (track.captionClearTimer != null) {
+        clearTimeout(track.captionClearTimer);
+        track.captionClearTimer = null;
+      }
+
+      // Stop whatever this track was already saying; let other tracks
+      // keep going. Concurrent voices = feature, not bug.
+      if (track.source) {
+        try {
+          track.source.stop();
+        } catch {
+          // already stopped
+        }
+        track.source = null;
+      }
+      // UI: thinking=true, speaking=false, caption cleared.
+      setTracksUI((prev) =>
+        prev.map((t) =>
+          t.id === trackId
+            ? { ...t, thinking: true, speaking: false, caption: null }
+            : t
+        )
+      );
+
+      try {
+        const { line, audioDataUrl } = await generateLine(cropDataUrl);
+        if (callGen !== track.speakGen) return;
+
+        setTracksUI((prev) =>
+          prev.map((t) =>
+            t.id === trackId ? { ...t, caption: line, thinking: false } : t
+          )
+        );
+
+        // Caption-only mode when TTS key is missing.
+        if (!audioDataUrl) return;
+
+        const resp = await fetch(audioDataUrl);
+        const buf = await resp.arrayBuffer();
+        const audioBuf = await ctx.decodeAudioData(buf);
+        if (callGen !== track.speakGen) return;
+
+        // Lazy-init this track's analyser on first speak.
+        if (!track.analyser) {
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 1024;
+          analyser.smoothingTimeConstant = 0.4;
+          analyser.connect(ctx.destination);
+          track.analyser = analyser;
+          track.freqData = new Uint8Array(
+            new ArrayBuffer(analyser.frequencyBinCount)
+          );
+          track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+        }
+
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuf;
+        source.connect(track.analyser);
+        source.onended = () => {
+          // Only clear if still the current source — guards against a
+          // newer tap's source already having replaced this one.
+          if (track.source === source) {
+            track.source = null;
+            setTracksUI((prev) =>
+              prev.map((t) =>
+                t.id === trackId ? { ...t, speaking: false } : t
+              )
+            );
+          }
+        };
+        track.source = source;
+        setTracksUI((prev) =>
+          prev.map((t) => (t.id === trackId ? { ...t, speaking: true } : t))
+        );
+        source.start();
+      } catch (e) {
+        if (callGen !== track.speakGen) return;
+        const msg = e instanceof Error ? e.message : "line failed";
+        setErrorMsg(msg);
+        setDiagError(msg);
+        setTracksUI((prev) =>
+          prev.map((t) =>
+            t.id === trackId
+              ? { ...t, thinking: false, speaking: false }
+              : t
+          )
+        );
+        showRejection(
+          /zhipu|glm|api key|api_key|401|403/i.test(msg)
+            ? "voice model unconfigured — check .env.local"
+            : `couldn't speak: ${msg.slice(0, 80)}`,
+          3200
+        );
+        // eslint-disable-next-line no-console
+        console.log("[tracker] speak failed:", e);
+      } finally {
+        if (callGen === track.speakGen) {
+          setTracksUI((prev) =>
+            prev.map((t) => (t.id === trackId ? { ...t, thinking: false } : t))
+          );
+        }
+      }
+    },
+    [ensureAudioCtx, showRejection]
+  );
+
+  // --- Tracking + lip-sync RAF ------------------------------------------
+  //
+  // Single loop does three things per frame:
+  //   1) optionally launches a YOLO inference (rate-limited)
+  //   2) advances each track (match, EMA, opacity)
+  //   3) samples each track's analyser → mouth shape
+  //   4) writes position/opacity into tracksUI state once per frame
   useEffect(() => {
     const tick = (now: number) => {
       rafRef.current = requestAnimationFrame(tick);
       const v = videoRef.current;
       if (!v || !v.videoWidth) return;
 
-      // Rate-limit inference. ORT queues runs, so back-to-back submits bloat
-      // latency without improving framerate.
+      // (1) Inference rate-limit gate.
       const minInterval = 1000 / MAX_INFERENCE_FPS;
       const canLaunch =
         yoloReadyRef.current &&
@@ -600,7 +729,6 @@ export function Tracker() {
       if (canLaunch) {
         inferenceInFlightRef.current = true;
         lastInferenceAtRef.current = now;
-        const launchGen = generationRef.current;
         const inferStart = performance.now();
         detect(v, ensureYoloCanvas(), {
           confThreshold: CONTINUOUS_CONF,
@@ -614,25 +742,24 @@ export function Tracker() {
             setLastInferMs(inferMs);
             detectionsRef.current = dets;
             detectionsTsRef.current = performance.now();
-            // Publish detections in both ready and locked phases — the diag
-            // panel benefits even while locked, and during ready the
-            // breathing boxes need them.
             setDetections(dets);
 
-            // Loud logging so the user can see the inference pulse in devtools.
-            // First three detections printed compactly.
             inferenceCountRef.current++;
-            if (inferenceCountRef.current <= 3 || inferenceCountRef.current % 30 === 0) {
+            if (
+              inferenceCountRef.current <= 3 ||
+              inferenceCountRef.current % 30 === 0
+            ) {
               // eslint-disable-next-line no-console
               console.log(
                 `[tracker] inference #${inferenceCountRef.current}: ${dets.length} dets in ${inferMs}ms`,
-                dets.slice(0, 3).map((d) => `${d.className}@${(d.score * 100).toFixed(0)}%`).join(", ")
+                dets
+                  .slice(0, 3)
+                  .map((d) => `${d.className}@${(d.score * 100).toFixed(0)}%`)
+                  .join(", ")
               );
             }
 
-            if (lockedRef.current && targetRef.current && launchGen === generationRef.current) {
-              advanceTracking(dets);
-            }
+            advanceAllTracks(dets);
 
             fpsFrameCountRef.current++;
             if (now - fpsLastSampleRef.current > 500) {
@@ -650,69 +777,187 @@ export function Tracker() {
           .catch((err: unknown) => {
             inferenceInFlightRef.current = false;
             const msg = err instanceof Error ? err.message : "inference failed";
-            // Use console.log here — the Next.js dev overlay promotes every
-            // console.error to a fullscreen red card that obscures the camera.
-            // Real failures also surface in the diag panel so we don't lose
-            // signal; it's console.error that creates the false-alarm UX.
             // eslint-disable-next-line no-console
             console.log("[tracker] inference error:", err);
             setDiagError(msg);
           });
       }
 
-      // Opacity EMA runs every RAF (fast fade in/out for occlusion).
-      const targetOpacity = lockedRef.current && missedFramesRef.current === 0 ? 1 : 0;
-      faceOpacityRef.current = lerp(
-        faceOpacityRef.current,
-        targetOpacity,
-        OPACITY_EMA_ALPHA
-      );
+      // (2) Per-track opacity fade-in (opacity stays at 1 once up — face
+      // never hides on occlusion, that's by design).
+      for (const t of tracksRef.current) {
+        t.opacity = lerp(t.opacity, 1, OPACITY_EMA_ALPHA);
+      }
 
-      writeOverlay();
+      // (3) Per-track mouth-shape classification.
+      for (const t of tracksRef.current) {
+        let shape: MouthShape = "X";
+        if (t.source && t.analyser && t.freqData && t.timeData) {
+          t.analyser.getByteTimeDomainData(t.timeData);
+          t.analyser.getByteFrequencyData(t.freqData);
+          shape = classifyShape(t.timeData, t.freqData).shape;
+        }
+        t.shape = shape;
+      }
+
+      // (4) Compute element-space transform for each track, write to UI.
+      const rect = v.getBoundingClientRect();
+      const srcToElAvg =
+        (rect.width / v.videoWidth + rect.height / v.videoHeight) / 2;
+
+      setTracksUI((prev) => {
+        if (prev.length !== tracksRef.current.length) return prev;
+        const renderNow = performance.now();
+        let changed = false;
+        const next = prev.map((ui) => {
+          const t = tracksRef.current.find((x) => x.id === ui.id);
+          if (!t) return ui;
+          // Velocity-extrapolate between YOLO inferences so 60fps render
+          // actually looks 60fps, not a 5–10fps stepper. Cap the window so
+          // a lost target can't drift off-screen; the miss-path decay on
+          // t.vx/t.vy is the safety belt here.
+          const sinceUpdate = Math.min(
+            EXTRAP_MAX_MS,
+            renderNow - t.lastUpdatedAt
+          );
+          const renderBox: Box =
+            t.missedFrames === 0
+              ? makeBox(
+                  t.smoothedBox.cx + t.vx * sinceUpdate,
+                  t.smoothedBox.cy + t.vy * sinceUpdate,
+                  t.smoothedBox.w,
+                  t.smoothedBox.h
+                )
+              : t.smoothedBox;
+          const facePoint = applyAnchor(t.anchor, renderBox);
+          const el = sourceToElementPoint(facePoint, v);
+          if (!el) return ui;
+          const left = el.clientX - rect.left;
+          const top = el.clientY - rect.top;
+          const minSide = Math.min(renderBox.w, renderBox.h);
+          const targetPx = minSide * FACE_BBOX_FRACTION * srcToElAvg;
+          const scale = Math.max(
+            FACE_SCALE_MIN,
+            Math.min(FACE_SCALE_MAX, targetPx / FACE_NATIVE_PX)
+          );
+          const opacity = t.opacity;
+          const shape = t.shape;
+          if (
+            ui.left === left &&
+            ui.top === top &&
+            ui.scale === scale &&
+            ui.opacity === opacity &&
+            ui.shape === shape
+          ) {
+            return ui;
+          }
+          changed = true;
+          return { ...ui, left, top, scale, opacity, shape };
+        });
+        return changed ? next : prev;
+      });
     };
 
-    const advanceTracking = (dets: readonly Detection[]) => {
-      const target = targetRef.current;
-      const prev = smoothedBoxRef.current;
-      if (!target || !prev) return;
-
-      const match = matchTarget(
-        dets as Detection[],
-        { ...prev, classId: target.classId },
-        IDENTITY_IOU_MIN
-      );
-
-      if (match) {
-        const wasOccluded = missedFramesRef.current >= OCCLUSION_MISS_FRAMES;
-        missedFramesRef.current = 0;
-        if (wasOccluded) {
-          // Reacquisition: snap the EMA rather than slowly sliding from the
-          // last-seen position. The user notices the ghost-slide more than
-          // they notice the jump, and the jump stays invisible behind the
-          // opacity fade-in anyway.
-          const snap: Box = makeBox(match.cx, match.cy, match.w, match.h);
-          seedBoxEMA(boxEmaRef.current, snap);
-          smoothedBoxRef.current = snap;
-        } else {
-          smoothedBoxRef.current = smoothBox(boxEmaRef.current, match);
+    // Match each track to its best same-class detection. Greedy by track
+    // order — earlier tracks claim detections first. Detections claimed by
+    // one track can't be reused by a later track (prevents two same-class
+    // tracks snapping onto the same box during a crowded frame).
+    const advanceAllTracks = (dets: readonly Detection[]) => {
+      if (tracksRef.current.length === 0) return;
+      const claimed = new Set<number>();
+      for (const t of tracksRef.current) {
+        const candidates: Detection[] = [];
+        for (let i = 0; i < dets.length; i++) {
+          if (!claimed.has(i)) candidates.push(dets[i]);
         }
-      } else {
-        missedFramesRef.current++;
-        // Keep the last smoothed box, let opacity EMA fade the face out.
-        if (missedFramesRef.current >= OCCLUSION_MISS_FRAMES) {
-          // Silence audio on occlusion. Preserves the "paused, not lost"
-          // model — if the object comes back, we fade back in; if the user
-          // taps something else, generation flip kills the re-entry.
-          const src = currentSourceRef.current;
-          if (src) {
-            try {
-              src.stop();
-            } catch {
-              // already stopped
+
+        let match: Detection | null = matchTarget(
+          candidates,
+          { ...t.smoothedBox, classId: t.classId },
+          IDENTITY_IOU_MIN
+        );
+
+        // Widen to same-class closest-center after a few misses — the
+        // object may have moved across the frame between inferences.
+        if (!match && t.missedFrames >= WIDEN_MATCH_AFTER_MISSES) {
+          let nearest: Detection | null = null;
+          let nearestD = Infinity;
+          for (const d of candidates) {
+            if (d.classId !== t.classId) continue;
+            const dx = d.cx - t.smoothedBox.cx;
+            const dy = d.cy - t.smoothedBox.cy;
+            const dist = Math.hypot(dx, dy);
+            if (dist < nearestD) {
+              nearestD = dist;
+              nearest = d;
             }
-            currentSourceRef.current = null;
-            setSpeaking(false);
           }
+          match = nearest;
+        }
+
+        if (match) {
+          // Record the claim so other tracks can't take the same box.
+          const idx = dets.indexOf(match);
+          if (idx >= 0) claimed.add(idx);
+
+          const wasLost = t.missedFrames >= REACQUIRE_SNAP_FRAMES;
+          const prevBox = t.smoothedBox;
+          const now = performance.now();
+
+          // Hold-last-good: if the match's dimensions jumped dramatically
+          // vs. the previous smoothed box, this is almost certainly a
+          // neighbor, a sibling, or a misfire rather than the real object
+          // continuing. Keep identity, decay velocity, don't update pose.
+          const ratioW = Math.max(match.w, prevBox.w) /
+            Math.max(1, Math.min(match.w, prevBox.w));
+          const ratioH = Math.max(match.h, prevBox.h) /
+            Math.max(1, Math.min(match.h, prevBox.h));
+          const suspect =
+            !wasLost && (ratioW > SUSPECT_SIZE_RATIO || ratioH > SUSPECT_SIZE_RATIO);
+
+          if (suspect) {
+            t.missedFrames = 0;
+            t.vx *= VELOCITY_DECAY_PER_MISS;
+            t.vy *= VELOCITY_DECAY_PER_MISS;
+          } else {
+            t.missedFrames = 0;
+
+            // Prefer the seg mask centroid — it's the "middle of the actual
+            // pixels", more stable than bbox center and unbiased by
+            // appendages (handles, spouts, stands).
+            const obsCx = match.maskCentroid?.x ?? match.cx;
+            const obsCy = match.maskCentroid?.y ?? match.cy;
+            const observation: Box = makeBox(obsCx, obsCy, match.w, match.h);
+
+            if (wasLost) {
+              seedBoxEMA(t.boxEma, observation);
+              t.smoothedBox = observation;
+              t.vx = 0;
+              t.vy = 0;
+            } else {
+              const prevCx = prevBox.cx;
+              const prevCy = prevBox.cy;
+              t.smoothedBox = smoothBox(t.boxEma, observation);
+              // Velocity EMA — raw delta / dt is spiky, so we blend into the
+              // running estimate at VELOCITY_EMA.
+              const dt = now - t.lastUpdatedAt;
+              if (dt > 10 && dt < 500) {
+                const rawVx = (t.smoothedBox.cx - prevCx) / dt;
+                const rawVy = (t.smoothedBox.cy - prevCy) / dt;
+                t.vx = t.vx * (1 - VELOCITY_EMA) + rawVx * VELOCITY_EMA;
+                t.vy = t.vy * (1 - VELOCITY_EMA) + rawVy * VELOCITY_EMA;
+              }
+            }
+            t.lastUpdatedAt = now;
+          }
+        } else {
+          t.missedFrames++;
+          // Decay velocity during misses so the face doesn't drift away
+          // from the last known position while we wait for a re-acquire.
+          t.vx *= VELOCITY_DECAY_PER_MISS;
+          t.vy *= VELOCITY_DECAY_PER_MISS;
+          // Face stays pinned at last known pose, audio keeps talking.
+          // "Forever" tracking per product brief.
         }
       }
     };
@@ -721,71 +966,298 @@ export function Tracker() {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [ensureYoloCanvas, writeOverlay]);
+  }, [ensureYoloCanvas]);
 
-  // --- Rejection toast ---------------------------------------------------
-  const showRejection = useCallback((msg: string, ms = 2400) => {
-    if (rejectionTimerRef.current != null) {
-      clearTimeout(rejectionTimerRef.current);
-    }
-    setRejection(msg);
-    rejectionTimerRef.current = window.setTimeout(() => {
-      setRejection(null);
-      setTapFrame(null);
-      rejectionTimerRef.current = null;
-    }, ms);
-  }, []);
-
-  // --- Audio plumbing ----------------------------------------------------
-  const ensureAudioCtx = useCallback(() => {
-    let ctx = audioCtxRef.current;
-    if (!ctx) {
-      const Ctor =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext })
-          .webkitAudioContext;
-      if (!Ctor) return null;
-      ctx = new Ctor();
-      audioCtxRef.current = ctx;
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 512;
-      analyser.smoothingTimeConstant = 0.4;
-      analyser.connect(ctx.destination);
-      analyserRef.current = analyser;
-      freqDataRef.current = new Uint8Array(
-        new ArrayBuffer(analyser.frequencyBinCount)
-      );
-    }
-    if (ctx.state === "suspended") {
-      ctx.resume().catch(() => {});
-    }
-    return ctx;
-  }, []);
-
-  const stopCurrentAudio = useCallback(() => {
-    const src = currentSourceRef.current;
-    if (src) {
-      try {
-        src.stop();
-      } catch {
-        // already stopped
+  // --- Capture a source-space rectangle as a jpeg data URL --------------
+  const captureBoxFrame = useCallback(
+    (box: { x1: number; y1: number; x2: number; y2: number }): string | null => {
+      const v = videoRef.current;
+      if (!v || !v.videoWidth) return null;
+      const pw = (box.x2 - box.x1) * 0.05;
+      const ph = (box.y2 - box.y1) * 0.05;
+      const cropSx = Math.max(0, box.x1 - pw);
+      const cropSy = Math.max(0, box.y1 - ph);
+      const cropW = Math.min(v.videoWidth - cropSx, box.x2 - box.x1 + 2 * pw);
+      const cropH = Math.min(v.videoHeight - cropSy, box.y2 - box.y1 + 2 * ph);
+      if (cropW < 8 || cropH < 8) return null;
+      const longSide = Math.max(cropW, cropH);
+      const s = Math.min(1, 512 / longSide);
+      const outW = Math.max(1, Math.round(cropW * s));
+      const outH = Math.max(1, Math.round(cropH * s));
+      let canvas = cropCanvasRef.current;
+      if (!canvas) {
+        canvas = document.createElement("canvas");
+        cropCanvasRef.current = canvas;
       }
-      currentSourceRef.current = null;
-    }
-    setSpeaking(false);
-  }, []);
+      canvas.width = outW;
+      canvas.height = outH;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(v, cropSx, cropSy, cropW, cropH, 0, 0, outW, outH);
+      return canvas.toDataURL("image/jpeg", 0.82);
+    },
+    []
+  );
 
-  // --- Hold-to-talk recording -------------------------------------------
-  //
-  // Pointer-down starts recording, pointer-up/leave/cancel stops. Mic stream
-  // is lazy-opened on the first press so we respect the user-gesture rule
-  // on iOS Safari. The analyser feeds the button's pulse-ring level meter.
+  // Hit-test a tap against existing tracks' smoothed boxes. Returns the
+  // innermost hit (smallest box containing the point) so nested tracks
+  // resolve intuitively.
+  const findTrackAtPoint = useCallback(
+    (srcX: number, srcY: number): TrackRefs | null => {
+      let best: TrackRefs | null = null;
+      let bestArea = Infinity;
+      for (const t of tracksRef.current) {
+        const b = t.smoothedBox;
+        if (srcX < b.x1 || srcX > b.x2 || srcY < b.y1 || srcY > b.y2) continue;
+        const area = b.w * b.h;
+        if (area < bestArea) {
+          bestArea = area;
+          best = t;
+        }
+      }
+      return best;
+    },
+    []
+  );
+
+  // --- Tap handler -------------------------------------------------------
+  const handleTap = useCallback(
+    async (e: React.PointerEvent) => {
+      const v = videoRef.current;
+      if (!v) return;
+
+      const gen = ++generationRef.current;
+      const rectNow = v.getBoundingClientRect();
+      const tapElX = e.clientX - rectNow.left;
+      const tapElY = e.clientY - rectNow.top;
+
+      // Instant fallback frame — replaced once we know the box.
+      const elMin = Math.min(rectNow.width, rectNow.height);
+      const fallbackEl = elMin * TAP_FRAME_FRACTION;
+      setTapFrame({
+        left: tapElX - fallbackEl / 2,
+        top: tapElY - fallbackEl / 2,
+        width: fallbackEl,
+        height: fallbackEl,
+        gen,
+      });
+
+      // Unlock audio inside the pointer gesture.
+      ensureAudioCtx();
+
+      if (phase === "error") {
+        showRejection(errorMsg ?? "camera not ready");
+        return;
+      }
+      if (!v.videoWidth) {
+        showRejection("waiting for the camera");
+        return;
+      }
+      if (!yoloReadyRef.current) {
+        showRejection("detector still loading");
+        return;
+      }
+
+      const srcTap = elementPointToSource(e.clientX, e.clientY, v);
+      if (!srcTap) {
+        showRejection("couldn't grab the frame");
+        return;
+      }
+
+      // (a) If the tap lands inside an existing track, retrigger that
+      //     track's voice line with a fresh crop. This is the "tap a face
+      //     again for a new opinion" interaction.
+      const existing = findTrackAtPoint(srcTap.x, srcTap.y);
+      if (existing) {
+        setTapFrame(null);
+        const dataUrl = captureBoxFrame(existing.smoothedBox);
+        if (!dataUrl) {
+          showRejection("couldn't grab the frame");
+          return;
+        }
+        existing.lastTapAt = performance.now();
+        void speakOnTrack(existing.id, dataUrl);
+        return;
+      }
+
+      // (b) Otherwise resolve a detection under the tap and add a new face.
+      let tapDets: Detection[] = [];
+      const cacheAge = performance.now() - detectionsTsRef.current;
+      if (detectionsRef.current.length && cacheAge < TAP_CACHE_MAX_AGE_MS) {
+        tapDets = detectionsRef.current;
+      } else {
+        try {
+          tapDets = await detect(v, ensureYoloCanvas(), {
+            confThreshold: TAP_CONF,
+            maxDetections: CONTINUOUS_MAX_DET,
+            classFilter: (id) => !EXCLUDED_CLASS_IDS.has(id),
+          });
+        } catch {
+          tapDets = [];
+        }
+        if (gen !== generationRef.current) return;
+      }
+
+      let tapped = pickTappedDetection(tapDets, srcTap.x, srcTap.y);
+
+      if (!tapped) {
+        try {
+          const fresh = await detect(v, ensureYoloCanvas(), {
+            confThreshold: TAP_CONF,
+            classFilter: (id) => !EXCLUDED_CLASS_IDS.has(id),
+          });
+          if (gen !== generationRef.current) return;
+          tapped = pickTappedDetection(fresh, srcTap.x, srcTap.y);
+          if (fresh.length) {
+            detectionsRef.current = fresh;
+            detectionsTsRef.current = performance.now();
+            setDetections(fresh);
+          }
+        } catch {
+          // fall through
+        }
+      }
+
+      if (!tapped) {
+        showRejection("nothing I recognize there");
+        return;
+      }
+
+      // Snap the visible tap frame to the detected box.
+      {
+        const vp = sourceBoxToElement(tapped, v);
+        if (vp) {
+          setTapFrame({
+            left: vp.left,
+            top: vp.top,
+            width: Math.max(24, vp.width),
+            height: Math.max(24, vp.height),
+            gen,
+          });
+        }
+      }
+
+      const dataUrl = captureBoxFrame(tapped);
+      if (!dataUrl) {
+        showRejection("couldn't grab the frame");
+        return;
+      }
+
+      setErrorMsg(null);
+      setRejection(null);
+      if (rejectionTimerRef.current != null) {
+        clearTimeout(rejectionTimerRef.current);
+        rejectionTimerRef.current = null;
+      }
+
+      // Build the new track. Anchor is box center. When the seg head
+      // supplies a mask centroid, use it as the box center — on asymmetric
+      // objects (mug with handle, lamp with stand) this lands the face on
+      // the body rather than slightly toward the appendage.
+      const lockCx = tapped.maskCentroid?.x ?? (tapped.x1 + tapped.x2) / 2;
+      const lockCy = tapped.maskCentroid?.y ?? (tapped.y1 + tapped.y2) / 2;
+      const lockBox: Box = makeBox(
+        lockCx,
+        lockCy,
+        tapped.x2 - tapped.x1,
+        tapped.y2 - tapped.y1
+      );
+      // Split EMA — position responsive, size slow (kills bbox-edge breathing).
+      const boxEma = newBoxEMA();
+      seedBoxEMA(boxEma, lockBox);
+      const newId = `t${nextTrackIdRef.current++}`;
+      const nowTs = performance.now();
+      const newTrack: TrackRefs = {
+        id: newId,
+        classId: tapped.classId,
+        className: tapped.className,
+        anchor: { rx: 0, ry: 0 },
+        boxEma,
+        smoothedBox: lockBox,
+        missedFrames: 0,
+        opacity: 0,
+        lastTapAt: nowTs,
+        vx: 0,
+        vy: 0,
+        lastUpdatedAt: nowTs,
+        speakGen: 0,
+        analyser: null,
+        freqData: null,
+        timeData: null,
+        source: null,
+        shape: "X",
+      };
+
+      // LRU eviction when the slots are full.
+      if (tracksRef.current.length >= MAX_FACES) {
+        let oldest = tracksRef.current[0];
+        for (const t of tracksRef.current) {
+          if (t.lastTapAt < oldest.lastTapAt) oldest = t;
+        }
+        if (oldest.source) {
+          try {
+            oldest.source.stop();
+          } catch {
+            // already stopped
+          }
+        }
+        if (oldest.analyser) {
+          try {
+            oldest.analyser.disconnect();
+          } catch {
+            // already disconnected
+          }
+        }
+        tracksRef.current = tracksRef.current.filter((t) => t.id !== oldest.id);
+        setTracksUI((prev) => prev.filter((t) => t.id !== oldest.id));
+      }
+      tracksRef.current = [...tracksRef.current, newTrack];
+
+      // Seed UI entry — RAF will fill position/scale/opacity next frame.
+      setTracksUI((prev) => [
+        ...prev,
+        {
+          id: newId,
+          classId: tapped!.classId,
+          className: tapped!.className,
+          left: 0,
+          top: 0,
+          scale: 1,
+          opacity: 0,
+          shape: "X",
+          caption: null,
+          thinking: false,
+          speaking: false,
+        },
+      ]);
+
+      setTapFrame(null);
+      void speakOnTrack(newId, dataUrl);
+    },
+    [
+      captureBoxFrame,
+      ensureAudioCtx,
+      ensureYoloCanvas,
+      errorMsg,
+      findTrackAtPoint,
+      phase,
+      showRejection,
+      speakOnTrack,
+    ]
+  );
+
+  // --- Push-to-talk helpers (same behavior as before) -------------------
   const stopTalkLevelLoop = useCallback(() => {
     if (talkLevelRafRef.current != null) {
       cancelAnimationFrame(talkLevelRafRef.current);
       talkLevelRafRef.current = null;
     }
-    setTalkLevel(0);
+    const bands = bandLevelsRef.current;
+    for (let i = 0; i < bands.length; i++) {
+      bands[i] = 0;
+      const bar = barRefs.current[i];
+      if (bar) bar.style.transform = "scaleY(1)";
+    }
   }, []);
 
   const openMicStream = useCallback(async (): Promise<MediaStream | null> => {
@@ -811,14 +1283,9 @@ export function Tracker() {
 
   const startRecording = useCallback(async () => {
     if (recorderRef.current && recorderRef.current.state === "recording") return;
-    // Audio ctx must exist to drive the TTS playback path; also gets us the
-    // analyser for the voice-level ring.
     const ctx = ensureAudioCtx();
     const stream = await openMicStream();
     if (!stream) return;
-
-    // Hook the mic into a dedicated analyser for the pulse-ring. We never
-    // connect it to destination — it's read-only level sensing.
     if (ctx && !talkAnalyserRef.current) {
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
@@ -833,11 +1300,9 @@ export function Tracker() {
         talkSourceRef.current = ctx.createMediaStreamSource(stream);
         talkSourceRef.current.connect(talkAnalyserRef.current);
       } catch {
-        // Some browsers throw if the stream's already consumed — fine to skip
+        // already consumed
       }
     }
-
-    // MIME negotiation: prefer opus, fall back to whatever the browser offers.
     const mime =
       ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", ""].find(
         (t) => !t || MediaRecorder.isTypeSupported(t)
@@ -856,7 +1321,6 @@ export function Tracker() {
       console.log(
         `[tracker] captured ${Math.round(blob.size / 1024)} KB of audio (${blob.type})`
       );
-      // Brief "sent" flash on the button so the user sees the handoff.
       setTalkFlash(true);
       if (talkFlashTimerRef.current != null) clearTimeout(talkFlashTimerRef.current);
       talkFlashTimerRef.current = window.setTimeout(() => {
@@ -869,19 +1333,14 @@ export function Tracker() {
     setIsRecording(true);
     setMicError(null);
 
-    // Tiny haptic nudge on mobile where supported. Not a UX load-bearer —
-    // just a courtesy hint that recording started.
     if (typeof navigator.vibrate === "function") {
       try {
         navigator.vibrate(8);
       } catch {
-        // some browsers disable vibrate without interaction — ignore
+        // ignore
       }
     }
 
-    // Kick off the level-meter RAF. We read sigmoid-ish loudness from the
-    // analyser's byte-frequency data and feed it to talkLevel state; the
-    // button pulse ring width tracks it.
     const readLevel = () => {
       const an = talkAnalyserRef.current;
       const buf = talkFreqDataRef.current;
@@ -890,15 +1349,28 @@ export function Tracker() {
         return;
       }
       an.getByteFrequencyData(buf);
-      // Speech energy lives mostly in the first ~40 bins (sub-4 kHz).
-      let sum = 0;
-      const end = Math.min(40, buf.length);
-      for (let i = 2; i < end; i++) sum += buf[i];
-      const avg = sum / Math.max(1, end - 2) / 255;
-      // Shape: push low values down, compress high values so the ring doesn't
-      // pin. Threshold at 0.04 to hide ambient noise.
-      const shaped = Math.max(0, Math.min(1, (avg - 0.04) * 2.5));
-      setTalkLevel((prev) => prev + (shaped - prev) * 0.4);
+
+      // Per-bar band energies → DOM scaleY. Distance from center maps to a
+      // band slice so the center bars read low-mids (where speech lives) and
+      // outer bars pick up higher freqs. Each bar keeps its own EMA to kill
+      // jitter without smearing transients.
+      const bands = bandLevelsRef.current;
+      const half = (WAVE_BARS - 1) / 2;
+      for (let i = 0; i < WAVE_BARS; i++) {
+        const d = Math.abs(i - half) / half;
+        const start = 2 + Math.floor(d * 36);
+        const stop = Math.min(buf.length, start + 5);
+        let bs = 0;
+        for (let k = start; k < stop; k++) bs += buf[k];
+        const bavg = bs / Math.max(1, stop - start) / 255;
+        const raw = Math.max(0, Math.min(1, (bavg - 0.04) * 2.4));
+        const prev = bands[i];
+        const nextLvl = prev + (raw - prev) * 0.45;
+        bands[i] = nextLvl;
+        const bar = barRefs.current[i];
+        if (bar) bar.style.transform = `scaleY(${1 + nextLvl * 6})`;
+      }
+
       talkLevelRafRef.current = requestAnimationFrame(readLevel);
     };
     if (talkLevelRafRef.current == null) {
@@ -912,7 +1384,7 @@ export function Tracker() {
       try {
         mr.stop();
       } catch {
-        // no-op
+        // ignore
       }
     }
     recorderRef.current = null;
@@ -920,266 +1392,14 @@ export function Tracker() {
     stopTalkLevelLoop();
   }, [stopTalkLevelLoop]);
 
-  const speak = useCallback(
-    async (cropDataUrl: string, callGen: number) => {
-      const ctx = ensureAudioCtx();
-      if (!ctx || !analyserRef.current) {
-        setErrorMsg("audio unavailable");
-        return;
-      }
-      stopCurrentAudio();
-      setThinking(true);
-      setCaption(null);
-      setErrorMsg(null);
-
-      try {
-        const { line, audioDataUrl } = await generateLine(cropDataUrl);
-        if (callGen !== generationRef.current) return;
-
-        setCaption(line);
-
-        // Audio is optional (OPENAI_API_KEY may be absent on GLM-only deploys).
-        // Caption still shows so the user sees the line.
-        if (!audioDataUrl) return;
-
-        const resp = await fetch(audioDataUrl);
-        const buf = await resp.arrayBuffer();
-        const audioBuf = await ctx.decodeAudioData(buf);
-        if (callGen !== generationRef.current) return;
-
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuf;
-        source.connect(analyserRef.current);
-        source.onended = () => {
-          if (currentSourceRef.current === source) {
-            currentSourceRef.current = null;
-            setSpeaking(false);
-          }
-        };
-        currentSourceRef.current = source;
-        setSpeaking(true);
-        source.start();
-      } catch (e) {
-        if (callGen !== generationRef.current) return;
-        const msg = e instanceof Error ? e.message : "line failed";
-        setErrorMsg(msg);
-        setDiagError(msg);
-        // Failure is otherwise invisible once locked — no caption, no audio,
-        // just a silent face. Surface it via the rejection toast too, and
-        // with a human-friendly hint when the cause is a missing key.
-        showRejection(
-          /zhipu|glm|api key|api_key|401|403/i.test(msg)
-            ? "voice model unconfigured — check .env.local"
-            : `couldn't speak: ${msg.slice(0, 80)}`,
-          3200
-        );
-        // eslint-disable-next-line no-console
-        console.error("[tracker] speak failed:", e);
-      } finally {
-        if (callGen === generationRef.current) setThinking(false);
-      }
-    },
-    [ensureAudioCtx, showRejection, stopCurrentAudio]
-  );
-
-  // --- Capture a source-space rectangle as a jpeg data URL --------------
-  // Pad by 5% on each side so the VLM sees a little context around the box.
-  const captureBoxFrame = useCallback(
-    (box: { x1: number; y1: number; x2: number; y2: number }): string | null => {
-      const v = videoRef.current;
-      if (!v || !v.videoWidth) return null;
-      const pw = (box.x2 - box.x1) * 0.05;
-      const ph = (box.y2 - box.y1) * 0.05;
-      const cropSx = Math.max(0, box.x1 - pw);
-      const cropSy = Math.max(0, box.y1 - ph);
-      const cropW = Math.min(v.videoWidth - cropSx, (box.x2 - box.x1) + 2 * pw);
-      const cropH = Math.min(v.videoHeight - cropSy, (box.y2 - box.y1) + 2 * ph);
-      if (cropW < 8 || cropH < 8) return null;
-      const longSide = Math.max(cropW, cropH);
-      const s = Math.min(1, 512 / longSide);
-      const outW = Math.max(1, Math.round(cropW * s));
-      const outH = Math.max(1, Math.round(cropH * s));
-      let canvas = cropCanvasRef.current;
-      if (!canvas) {
-        canvas = document.createElement("canvas");
-        cropCanvasRef.current = canvas;
-      }
-      canvas.width = outW;
-      canvas.height = outH;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return null;
-      ctx.drawImage(v, cropSx, cropSy, cropW, cropH, 0, 0, outW, outH);
-      return canvas.toDataURL("image/jpeg", 0.82);
-    },
-    []
-  );
-
-  // --- Tap handler -------------------------------------------------------
-  const handleTap = useCallback(
-    async (e: React.PointerEvent) => {
-      const v = videoRef.current;
-      if (!v) return;
-
-      // Bump generation immediately so any in-flight VLM/TTS from an earlier
-      // tap drops its result.
-      const gen = ++generationRef.current;
-      const rectNow = v.getBoundingClientRect();
-      const tapElX = e.clientX - rectNow.left;
-      const tapElY = e.clientY - rectNow.top;
-
-      // Instant fallback frame — the real one snaps in once we know the box.
-      const elMin = Math.min(rectNow.width, rectNow.height);
-      const fallbackEl = elMin * TAP_FRAME_FRACTION;
-      setTapFrame({
-        left: tapElX - fallbackEl / 2,
-        top: tapElY - fallbackEl / 2,
-        width: fallbackEl,
-        height: fallbackEl,
-        gen,
-      });
-
-      // Unlock audio inside the pointer-down gesture, before any early returns
-      // or awaits, so the very first tap always clears Safari's autoplay gate.
-      ensureAudioCtx();
-
-      if (phase === "error") {
-        showRejection(errorMsg ?? "camera not ready");
-        return;
-      }
-      if (!v.videoWidth) {
-        showRejection("waiting for the camera");
-        return;
-      }
-      if (!yoloReadyRef.current) {
-        showRejection("detector still loading");
-        return;
-      }
-
-      const srcTap = elementPointToSource(e.clientX, e.clientY, v);
-      if (!srcTap) {
-        showRejection("couldn't grab the frame");
-        return;
-      }
-
-      // Resolve the tapped object: reuse recent continuous detections when
-      // fresh, otherwise fire a targeted, looser-threshold inference.
-      let tapDets: Detection[] = [];
-      const cacheAge = performance.now() - detectionsTsRef.current;
-      if (detectionsRef.current.length && cacheAge < TAP_CACHE_MAX_AGE_MS) {
-        tapDets = detectionsRef.current;
-      } else {
-        try {
-          tapDets = await detect(v, ensureYoloCanvas(), {
-            confThreshold: TAP_CONF,
-            maxDetections: CONTINUOUS_MAX_DET,
-            classFilter: (id) => !EXCLUDED_CLASS_IDS.has(id),
-          });
-        } catch {
-          tapDets = [];
-        }
-        if (gen !== generationRef.current) return;
-      }
-
-      let tapped = pickTappedDetection(tapDets, srcTap.x, srcTap.y);
-
-      // If cache missed everything, do one more round with a looser threshold.
-      if (!tapped) {
-        try {
-          const fresh = await detect(v, ensureYoloCanvas(), {
-            confThreshold: TAP_CONF,
-            classFilter: (id) => !EXCLUDED_CLASS_IDS.has(id),
-          });
-          if (gen !== generationRef.current) return;
-          tapped = pickTappedDetection(fresh, srcTap.x, srcTap.y);
-          if (fresh.length) {
-            detectionsRef.current = fresh;
-            detectionsTsRef.current = performance.now();
-            if (!lockedRef.current) setDetections(fresh);
-          }
-        } catch {
-          // fall through to rejection below
-        }
-      }
-
-      if (!tapped) {
-        showRejection("nothing I recognize there");
-        return;
-      }
-
-      // Snap the visible tap frame to the detected box.
-      {
-        const vp = sourceBoxToElement(tapped, v);
-        if (vp) {
-          setTapFrame({
-            left: vp.left,
-            top: vp.top,
-            width: Math.max(24, vp.width),
-            height: Math.max(24, vp.height),
-            gen,
-          });
-        }
-      }
-
-      // Capture the padded crop for the VLM voice-line call.
-      const dataUrl = captureBoxFrame(tapped);
-      if (!dataUrl) {
-        showRejection("couldn't grab the frame");
-        return;
-      }
-
-      stopCurrentAudio();
-      setCaption(null);
-      setErrorMsg(null);
-      setRejection(null);
-      if (rejectionTimerRef.current != null) {
-        clearTimeout(rejectionTimerRef.current);
-        rejectionTimerRef.current = null;
-      }
-
-      // Lock immediately on the YOLO box. Face anchor = box center (rx=0,
-      // ry=0) per the current product spec — trust YOLO's tight class-aware
-      // box rather than round-tripping through a VLM face-placement call.
-      // The VLM is still invoked asynchronously for the voice line below.
-      const lockBox: Box = makeBox(
-        (tapped.x1 + tapped.x2) / 2,
-        (tapped.y1 + tapped.y2) / 2,
-        tapped.x2 - tapped.x1,
-        tapped.y2 - tapped.y1
-      );
-      const anchor: Anchor = { rx: 0, ry: 0 };
-
-      targetRef.current = {
-        classId: tapped.classId,
-        className: tapped.className,
-        anchor,
-      };
-      boxEmaRef.current = newBoxEMA(BOX_EMA_ALPHA);
-      seedBoxEMA(boxEmaRef.current, lockBox);
-      smoothedBoxRef.current = lockBox;
-      missedFramesRef.current = 0;
-      faceOpacityRef.current = 0;
-      lockedRef.current = true;
-      setPhase("locked");
-
-      // Clear the tap frame once we're locked — face has taken over.
-      setTapFrame(null);
-
-      // Voice: use the crop we already paid to prepare.
-      speak(dataUrl, gen);
-    },
-    [
-      captureBoxFrame,
-      ensureAudioCtx,
-      ensureYoloCanvas,
-      errorMsg,
-      phase,
-      showRejection,
-      speak,
-      stopCurrentAudio,
-    ]
-  );
-
   // --- Derived UI --------------------------------------------------------
+  const anyThinking = tracksUI.some((t) => t.thinking);
+  const anySpeaking = tracksUI.some((t) => t.speaking);
+  const latestSpeakingCaption =
+    tracksUI.find((t) => t.speaking)?.caption ??
+    tracksUI.find((t) => t.caption)?.caption ??
+    null;
+
   const dotClass =
     phase === "error"
       ? "bg-rose-400"
@@ -1187,9 +1407,9 @@ export function Tracker() {
         ? "bg-amber-300"
         : phase === "ready"
           ? "bg-fuchsia-400"
-          : thinking
+          : anyThinking
             ? "bg-amber-300"
-            : speaking
+            : anySpeaking
               ? "bg-emerald-400"
               : "bg-sky-400";
 
@@ -1204,14 +1424,12 @@ export function Tracker() {
         ? (errorMsg ?? "camera error")
         : phase === "ready"
           ? (errorMsg ?? "tap anything")
-          : thinking
+          : anyThinking
             ? "thinking"
-            : speaking
+            : anySpeaking
               ? "speaking"
-              : `tracking · ${fps} fps`;
+              : `${tracksUI.length} face${tracksUI.length === 1 ? "" : "s"} · ${fps} fps`;
 
-  // Breathing boxes are only rendered in the ready state (pre-lock). Mapped
-  // to element space here, re-computed whenever `detections` changes.
   const breathingBoxes = useMemo(() => {
     const v = videoRef.current;
     if (!v || phase !== "ready") return [];
@@ -1220,9 +1438,6 @@ export function Tracker() {
         if (EXCLUDED_CLASS_IDS.has(d.classId)) return null;
         const vp = sourceBoxToElement(d, v);
         if (!vp) return null;
-        // Tiny boxes are usually spurious, but be lenient — the user wants
-        // to SEE what YOLO sees, not a sanitized subset. Kill only truly
-        // degenerate ones.
         if (vp.width < 8 || vp.height < 8) return null;
         return {
           id: `${d.classId}-${d.cx.toFixed(0)}-${d.cy.toFixed(0)}-${d.w.toFixed(0)}`,
@@ -1244,25 +1459,23 @@ export function Tracker() {
         onPointerDown={handleTap}
       />
 
-      {/* Face overlay. Always mounted while locked, opacity animated for
-          occlusion. Rendered absolute, positioned by writeOverlay via
-          a CSS transform. */}
-      <div
-        ref={overlayRef}
-        className="pointer-events-none absolute left-0 top-0 will-change-transform"
-        style={{
-          transformOrigin: "0 0",
-          opacity: 0,
-          transition: "opacity 120ms linear",
-          display: phase === "locked" ? "block" : "none",
-        }}
-      >
-        <Face mouth={mouth} blink={blink} eyeX={eye.x} eyeY={eye.y} />
-      </div>
+      {/* Face overlays — one per track. Positioned by RAF via state. */}
+      {tracksUI.map((t) => (
+        <div
+          key={t.id}
+          className="pointer-events-none absolute left-0 top-0 will-change-transform"
+          style={{
+            transformOrigin: "0 0",
+            transform: `translate(${t.left}px, ${t.top}px) translate(-50%, -50%) scale(${t.scale})`,
+            opacity: t.opacity,
+            transition: "opacity 120ms linear",
+          }}
+        >
+          <FaceVoice shape={t.shape} />
+        </div>
+      ))}
 
-      {/* Breathing boxes — every YOLO detection the model is willing to
-          commit to, labelled with class + confidence. Visibility is
-          intentional here: the user wants to see what's tappable. */}
+      {/* Breathing boxes (ready phase only). */}
       {breathingBoxes.map((b) => (
         <div
           key={b.id}
@@ -1277,9 +1490,7 @@ export function Tracker() {
             animation: "breathing-box 2.6s ease-in-out infinite",
           }}
         >
-          <span
-            className="serif-italic absolute -top-[26px] left-1 flex items-center gap-1 rounded-full bg-[color:var(--ink)]/75 px-2.5 py-0.5 text-[11px] font-medium text-white ring-1 ring-white/20 backdrop-blur-md"
-          >
+          <span className="serif-italic absolute -top-[26px] left-1 flex items-center gap-1 rounded-full bg-[color:var(--ink)]/75 px-2.5 py-0.5 text-[11px] font-medium text-white ring-1 ring-white/20 backdrop-blur-md">
             <span>{b.className}</span>
             <span className="tabular-nums text-white/60">
               {Math.round(b.score * 100)}%
@@ -1288,7 +1499,7 @@ export function Tracker() {
         </div>
       ))}
 
-      {/* Tap frame — snapped to the detected box while the VLM thinks. */}
+      {/* Tap frame while a new face is resolving. */}
       {tapFrame && (
         <div
           key={tapFrame.gen}
@@ -1360,7 +1571,7 @@ export function Tracker() {
         </div>
       </div>
 
-      {/* YOLO loading overlay — visible during model download + compile. */}
+      {/* YOLO loading overlay. */}
       {!yoloReady && yoloStatus.stage !== "error" && (
         <div
           className="pointer-events-none absolute inset-x-0 top-[72px] flex justify-center px-4"
@@ -1377,9 +1588,9 @@ export function Tracker() {
               </span>
               <span className="tabular-nums text-[11px] text-white/60">
                 {yoloStatus.bytesTotal > 0
-                  ? `${Math.round(yoloStatus.bytesLoaded / 1024 / 1024 * 10) / 10}/${Math.round(yoloStatus.bytesTotal / 1024 / 1024 * 10) / 10} MB`
+                  ? `${Math.round((yoloStatus.bytesLoaded / 1024 / 1024) * 10) / 10}/${Math.round((yoloStatus.bytesTotal / 1024 / 1024) * 10) / 10} MB`
                   : yoloStatus.bytesLoaded > 0
-                    ? `${Math.round(yoloStatus.bytesLoaded / 1024 / 1024 * 10) / 10} MB`
+                    ? `${Math.round((yoloStatus.bytesLoaded / 1024 / 1024) * 10) / 10} MB`
                     : ""}
               </span>
             </div>
@@ -1402,7 +1613,7 @@ export function Tracker() {
         </div>
       )}
 
-      {/* YOLO load error banner — shown if init fails. Retry button beside. */}
+      {/* YOLO load error banner. */}
       {yoloStatus.stage === "error" && !yoloReady && (
         <div
           className="absolute inset-x-0 top-[72px] flex justify-center px-4"
@@ -1422,8 +1633,7 @@ export function Tracker() {
         </div>
       )}
 
-      {/* Diagnostic panel — toggled by the "i" button. Shows everything the
-          user might need to send back if something misbehaves. */}
+      {/* Diagnostic panel. */}
       {diagOpen && (
         <div
           className="absolute right-4 top-[72px] w-[260px] rounded-2xl bg-black/70 p-3 text-[11px] text-white/90 ring-1 ring-white/20 backdrop-blur-xl"
@@ -1461,8 +1671,12 @@ export function Tracker() {
             <dd>{lastInferMs != null ? `${lastInferMs} ms` : "—"}</dd>
             <dt className="text-white/50">detections</dt>
             <dd>{detections.length}</dd>
-            <dt className="text-white/50">locked</dt>
-            <dd>{targetRef.current ? targetRef.current.className : "—"}</dd>
+            <dt className="text-white/50">faces</dt>
+            <dd>
+              {tracksUI.length}/{MAX_FACES}
+              {tracksUI.length > 0 &&
+                ` · ${tracksUI.map((t) => t.className).join(", ")}`}
+            </dd>
             {diagError && (
               <>
                 <dt className="text-white/50">err</dt>
@@ -1492,13 +1706,13 @@ export function Tracker() {
               <span className="h-3 w-3 rounded-full bg-white/90" />
             </span>
             <span className="serif-italic rounded-full bg-black/25 px-4 py-1.5 text-[13px] font-medium text-white/90 ring-1 ring-white/15 backdrop-blur-xl">
-              tap anything — give it a voice
+              tap anything — up to {MAX_FACES} at once
             </span>
           </div>
         </div>
       )}
 
-      {rejection && !thinking && (
+      {rejection && !anyThinking && (
         <div
           className="pointer-events-none absolute inset-x-0 top-20 flex justify-center px-6"
           style={{ animation: "bubble-in 360ms cubic-bezier(0.16,1,0.3,1) both" }}
@@ -1511,7 +1725,7 @@ export function Tracker() {
         </div>
       )}
 
-      {thinking && (
+      {anyThinking && (
         <div
           className="pointer-events-none absolute inset-x-0 top-20 flex justify-center"
           style={{ animation: "fade-in 220ms ease-out both" }}
@@ -1525,38 +1739,64 @@ export function Tracker() {
         </div>
       )}
 
-      {caption && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-[max(env(safe-area-inset-bottom),22px)] px-5 pb-[148px] pt-10">
-          <div
-            className="mx-auto max-w-md rounded-[26px] bg-white/95 px-6 py-4 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.55)] ring-1 ring-white/80 backdrop-blur-xl"
-            style={{ animation: "bubble-in 480ms cubic-bezier(0.16,1,0.3,1) both" }}
-          >
-            <p className="serif-italic text-balance text-center text-[18px] leading-[1.35] text-[color:var(--ink)]">
-              &ldquo;{caption}&rdquo;
-            </p>
-            {speaking && (
-              <div className="mt-2 flex justify-center gap-1">
-                <span
-                  className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
-                  style={{ animation: "soft-pulse 1s ease-in-out infinite" }}
-                />
-                <span
-                  className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
-                  style={{ animation: "soft-pulse 1s ease-in-out 0.15s infinite" }}
-                />
-                <span
-                  className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
-                  style={{ animation: "soft-pulse 1s ease-in-out 0.3s infinite" }}
-                />
-              </div>
-            )}
+      {/* Caption stack — one bubble per face with a caption, labeled by
+          the object class. Stacks at the bottom above the talk button. */}
+      {SHOW_CAPTIONS && tracksUI.some((t) => t.caption) && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-[max(env(safe-area-inset-bottom),22px)] px-5 pb-[148px]">
+          <div className="mx-auto flex max-w-md flex-col items-center gap-2">
+            {tracksUI
+              .filter((t) => t.caption)
+              .map((t) => (
+                <div
+                  key={t.id}
+                  className="w-full rounded-[22px] bg-white/95 px-5 py-3 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.55)] ring-1 ring-white/80 backdrop-blur-xl"
+                  style={{
+                    animation:
+                      "bubble-in 440ms cubic-bezier(0.16,1,0.3,1) both",
+                  }}
+                >
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span className="rounded-full bg-[color:var(--ink)]/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.22em] text-[color:var(--ink-muted)]">
+                      {t.className}
+                    </span>
+                    {t.speaking && (
+                      <span className="flex gap-1">
+                        <span
+                          className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
+                          style={{
+                            animation: "soft-pulse 1s ease-in-out infinite",
+                          }}
+                        />
+                        <span
+                          className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
+                          style={{
+                            animation:
+                              "soft-pulse 1s ease-in-out 0.15s infinite",
+                          }}
+                        />
+                        <span
+                          className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
+                          style={{
+                            animation:
+                              "soft-pulse 1s ease-in-out 0.3s infinite",
+                          }}
+                        />
+                      </span>
+                    )}
+                  </div>
+                  <p className="serif-italic text-balance text-center text-[17px] leading-[1.35] text-[color:var(--ink)]">
+                    &ldquo;{t.caption}&rdquo;
+                  </p>
+                </div>
+              ))}
           </div>
         </div>
       )}
+      {/* Suppress unused: latestSpeakingCaption kept as a hook for future
+          overlay that wants the most-recent line only. */}
+      {latestSpeakingCaption === "__never__" && <span />}
 
-      {/* Hold-to-talk button. Bottom-center, safe-area-aware. Pointer-down
-          starts recording, pointer-up/leave/cancel stops. Layers, outside-in:
-          voice-level ring, soft glow halo, primary pill, mic glyph, sent flash. */}
+      {/* Hold-to-talk button (unchanged). */}
       <div
         className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 px-5 pb-[max(env(safe-area-inset-bottom),22px)] pt-3"
         style={{
@@ -1565,29 +1805,29 @@ export function Tracker() {
           pointerEvents: phase === "starting" || phase === "error" ? "none" : "auto",
         }}
       >
-        <div className="relative grid h-[96px] w-[96px] place-items-center">
-          {/* Voice-level ring — scale + opacity track mic amplitude. */}
+        <div className="relative grid h-[104px] w-[104px] place-items-center">
+          {/* Ambient halo — steady when live, breathing when idle. */}
           <span
             aria-hidden
-            className="pointer-events-none absolute inset-0 rounded-full"
-            style={{
-              transform: `scale(${isRecording ? 1 + talkLevel * 0.9 : 1})`,
-              opacity: isRecording ? 0.35 + talkLevel * 0.5 : 0,
-              boxShadow:
-                "0 0 0 10px rgba(255,137,190,0.35), 0 0 60px rgba(255,137,190,0.45)",
-              transition: isRecording
-                ? "transform 90ms ease-out, opacity 120ms ease-out"
-                : "opacity 220ms ease, transform 220ms ease",
-            }}
-          />
-          {/* Ambient glow halo — when idle, gently pulses. */}
-          <span
-            aria-hidden
-            className="pointer-events-none absolute -inset-2 rounded-full"
+            className="pointer-events-none absolute -inset-3 rounded-full"
             style={{
               background:
-                "radial-gradient(circle, rgba(255,137,190,0.28) 0%, rgba(255,137,190,0) 70%)",
+                "radial-gradient(circle, rgba(255,137,190,0.38) 0%, rgba(255,137,190,0) 72%)",
+              opacity: isRecording ? 1 : 0.55,
+              transition: "opacity 220ms ease",
               animation: isRecording ? undefined : "soft-pulse 2.4s ease-in-out infinite",
+            }}
+          />
+          {/* Thin outer accent ring — adds crispness to the silhouette. */}
+          <span
+            aria-hidden
+            className="pointer-events-none absolute rounded-full"
+            style={{
+              inset: 6,
+              boxShadow: isRecording
+                ? "0 0 0 1px rgba(255,255,255,0.45), 0 0 0 6px rgba(255,137,190,0.18)"
+                : "0 0 0 1px rgba(255,255,255,0.55), 0 0 0 6px rgba(255,137,190,0.10)",
+              transition: "box-shadow 240ms ease",
             }}
           />
           <button
@@ -1613,13 +1853,16 @@ export function Tracker() {
               if (isRecording) stopRecording();
             }}
             onContextMenu={(e) => e.preventDefault()}
-            className="relative grid h-[80px] w-[80px] place-items-center rounded-full shadow-[0_18px_50px_-18px_rgba(236,72,153,0.65)] ring-1 ring-white/35 backdrop-blur-xl transition-transform"
+            className="relative grid h-[84px] w-[84px] place-items-center overflow-hidden rounded-full backdrop-blur-xl transition-[transform,box-shadow] duration-200 ease-out"
             style={{
               background: isRecording
-                ? "radial-gradient(circle at 35% 30%, #ffc2dc 0%, #ff89be 60%, #ec4899 100%)"
-                : "radial-gradient(circle at 35% 30%, rgba(255,255,255,0.85) 0%, rgba(255,194,220,0.65) 55%, rgba(236,72,153,0.55) 100%)",
+                ? "linear-gradient(155deg, #ffb4d1 0%, #ff6aa8 55%, #ec4899 100%)"
+                : "linear-gradient(155deg, rgba(255,255,255,0.96) 0%, rgba(255,220,234,0.92) 55%, rgba(255,182,213,0.92) 100%)",
+              boxShadow: isRecording
+                ? "0 22px 50px -18px rgba(236,72,153,0.8), 0 2px 6px rgba(0,0,0,0.12), inset 0 1px 0 rgba(255,255,255,0.55), inset 0 -14px 22px -14px rgba(236,72,153,0.55)"
+                : "0 14px 36px -16px rgba(236,72,153,0.35), 0 1px 3px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.9), inset 0 -12px 22px -14px rgba(236,72,153,0.22)",
               transform: isRecording
-                ? `scale(${1.06 + talkLevel * 0.05})`
+                ? "scale(1.06)"
                 : talkFlash
                   ? "scale(1.04)"
                   : "scale(1)",
@@ -1629,31 +1872,85 @@ export function Tracker() {
               touchAction: "none",
             }}
           >
-            {/* Mic glyph — pure SVG, no icon lib. */}
+            {/* Top-edge sheen — soft glossy highlight, not a full glare. */}
+            <span
+              aria-hidden
+              className="pointer-events-none absolute inset-0 rounded-full"
+              style={{
+                background:
+                  "radial-gradient(120% 55% at 50% 0%, rgba(255,255,255,0.6) 0%, rgba(255,255,255,0) 58%)",
+                opacity: isRecording ? 0.5 : 0.9,
+                transition: "opacity 220ms ease",
+              }}
+            />
+            {/* Mic glyph — crossfades out when the waveform takes over. */}
             <svg
-              width="28"
-              height="28"
+              width="30"
+              height="30"
               viewBox="0 0 24 24"
               fill="none"
-              stroke={isRecording ? "#fff" : "var(--ink)"}
-              strokeWidth="2.2"
+              stroke="var(--ink)"
+              strokeWidth="2"
               strokeLinecap="round"
               strokeLinejoin="round"
+              className="relative"
+              style={{
+                opacity: isRecording ? 0 : 1,
+                transform: `scale(${isRecording ? 0.85 : 1})`,
+                transition:
+                  "opacity 180ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1)",
+              }}
             >
               <path d="M12 2.5c1.7 0 3 1.35 3 3v6c0 1.65-1.3 3-3 3s-3-1.35-3-3v-6c0-1.65 1.3-3 3-3z" />
               <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0" />
               <path d="M12 17.5V21.5" />
               <path d="M8.5 21.5h7" />
             </svg>
-            {/* Brief "sent" check flash on release. */}
+
+            {/* Adaptive waveform, rendered INSIDE the button. Bars are written
+                with DOM scaleY at 60fps so they dance with the voice — React
+                doesn't re-render per frame. */}
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-0 grid place-items-center"
+              style={{
+                opacity: isRecording ? 1 : 0,
+                transform: `scale(${isRecording ? 1 : 0.9})`,
+                transition:
+                  "opacity 180ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1)",
+              }}
+            >
+              <div className="flex h-[46px] items-center gap-[3px]">
+                {Array.from({ length: WAVE_BARS }).map((_, i) => (
+                  <span
+                    key={i}
+                    ref={(el) => {
+                      barRefs.current[i] = el;
+                    }}
+                    className="block w-[2px] rounded-full"
+                    style={{
+                      height: 6,
+                      background:
+                        "linear-gradient(to top, rgba(255,255,255,0.95), rgba(255,255,255,0.8))",
+                      transform: "scaleY(1)",
+                      transformOrigin: "50% 50%",
+                      willChange: "transform",
+                      transition: "transform 80ms cubic-bezier(0.22, 1, 0.36, 1)",
+                      boxShadow:
+                        "0 0 6px rgba(255,255,255,0.55), 0 0 14px rgba(255,137,190,0.35)",
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
             {talkFlash && (
               <span
                 className="pointer-events-none absolute inset-0 grid place-items-center rounded-full"
                 style={{ animation: "fade-in 180ms ease-out both" }}
               >
                 <svg
-                  width="30"
-                  height="30"
+                  width="32"
+                  height="32"
                   viewBox="0 0 24 24"
                   fill="none"
                   stroke="#fff"
@@ -1689,4 +1986,3 @@ export function Tracker() {
     </div>
   );
 }
-
