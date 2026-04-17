@@ -31,7 +31,6 @@ export type EchoResult =
     }
   | { ok: false; error: string };
 
-const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const OPENAI_URL = "https://api.openai.com/v1";
 
 export async function interpretScene(formData: FormData): Promise<EchoResult> {
@@ -45,12 +44,11 @@ export async function interpretScene(formData: FormData): Promise<EchoResult> {
       return { ok: false, error: "Missing frame." };
     }
 
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
     const openaiKey = process.env.OPENAI_API_KEY;
-    if (!anthropicKey) return { ok: false, error: "ANTHROPIC_API_KEY not set." };
+    if (!openaiKey) return { ok: false, error: "OPENAI_API_KEY not set." };
 
     const transcript =
-      audio instanceof File && audio.size > 0 && openaiKey
+      audio instanceof File && audio.size > 0
         ? await transcribe(audio, openaiKey).catch(() => "")
         : "";
 
@@ -59,7 +57,7 @@ export async function interpretScene(formData: FormData): Promise<EchoResult> {
       transcript,
       videoTitle,
       videoLocation,
-      anthropicKey
+      openaiKey
     );
 
     const postcards = postcardsForVibe(vibe, 4);
@@ -154,9 +152,6 @@ async function poeticRead(
   videoLocation: string,
   key: string
 ): Promise<{ reply: string; location: string; vibe: Vibe }> {
-  const [meta, b64] = frameDataUrl.split(",");
-  const mediaType = meta?.match(/data:(.*?);base64/)?.[1] ?? "image/jpeg";
-
   const userText =
     (transcript ? `The viewer said: "${transcript}"\n` : "The viewer is silent.\n") +
     (videoTitle || videoLocation
@@ -165,42 +160,39 @@ async function poeticRead(
     `Look at the cropped frame and write the JSON now.`;
 
   const body = {
-    model: "claude-sonnet-4-6",
-    max_tokens: 300,
+    model: "gpt-4o",
     temperature: 0.9,
-    system: POETIC_SYSTEM,
+    max_tokens: 300,
+    response_format: { type: "json_object" },
     messages: [
+      { role: "system", content: POETIC_SYSTEM },
       {
         role: "user",
         content: [
-          {
-            type: "image",
-            source: { type: "base64", media_type: mediaType, data: b64 },
-          },
           { type: "text", text: userText },
+          {
+            type: "image_url",
+            image_url: { url: frameDataUrl, detail: "low" },
+          },
         ],
       },
     ],
   };
 
-  const res = await fetch(ANTHROPIC_URL, {
+  const res = await fetch(`${OPENAI_URL}/chat/completions`, {
     method: "POST",
     headers: {
-      "x-api-key": key,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
   });
 
   const text = await res.text();
-  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${text}`);
+  if (!res.ok) throw new Error(`OpenAI ${res.status}: ${text}`);
 
   const json = JSON.parse(text);
-  const raw =
-    (json.content?.find((b: { type: string }) => b.type === "text") as
-      | { type: string; text: string }
-      | undefined)?.text ?? "{}";
+  const raw = json.choices?.[0]?.message?.content ?? "{}";
 
   const parsed = parseLoose(raw);
   const reply = (parsed.reply ?? "").toString().trim();
@@ -209,7 +201,7 @@ async function poeticRead(
     ? (parsed.vibe as Vibe)
     : "lonely_road";
 
-  if (!reply) throw new Error("Empty reply from Claude.");
+  if (!reply) throw new Error("Empty reply from model.");
   return { reply, location, vibe };
 }
 
