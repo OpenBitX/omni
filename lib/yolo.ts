@@ -53,6 +53,34 @@ export type Detection = {
 //     raw Ultralytics YOLOv8/v11 exports.
 export type ModelHead = "yolo-detr" | "yolov8-head";
 
+// Per-model native input sizes, confirmed empirically on each ONNX.
+//
+// ⚠️ IMPORTANT: RF-DETR is optimized per-variant via Neural Architecture
+// Search. Nano is tuned for a specific resolution and its compute scales
+// with the **4th power of resolution** — running nano at 640 instead of
+// its native ~384 isn't just slower, it's catastrophically slower AND
+// degrades accuracy. If you want higher resolution with RF-DETR, move up
+// the ladder (small → medium → base), don't upscale nano. (Author guidance,
+// 2026-04-18.)
+export const MODEL_PRESETS = {
+  "yolo26n": { head: "yolo-detr" as ModelHead, inputSize: 640, classIdMap: null as Int32Array | null },
+  // RF-DETR Nano's exported ONNX only accepts 384×384 — the detection nano's
+  // NAS-native size. We also let anyone explicitly pass a larger RF-DETR
+  // variant + matching inputSize if they want more accuracy.
+  "rf-detr-nano": { head: "yolo-detr" as ModelHead, inputSize: 384, classIdMap: null as Int32Array | null },
+  "yolov8n": { head: "yolov8-head" as ModelHead, inputSize: 640, classIdMap: null as Int32Array | null },
+} as const;
+
+// Best-effort preset lookup from a model URL. Returns null if unrecognized,
+// letting callers pass explicit head/inputSize for anything custom.
+function presetForUrl(url: string): (typeof MODEL_PRESETS)[keyof typeof MODEL_PRESETS] | null {
+  const basename = url.split("/").pop()?.toLowerCase() ?? "";
+  if (basename.startsWith("yolo26n")) return MODEL_PRESETS["yolo26n"];
+  if (basename.startsWith("rf-detr-nano")) return MODEL_PRESETS["rf-detr-nano"];
+  if (basename.startsWith("yolov8n") || basename.startsWith("yolov11n")) return MODEL_PRESETS["yolov8n"];
+  return null;
+}
+
 export type YoloInitOptions = {
   modelUrl?: string;
   head?: ModelHead;
@@ -121,13 +149,17 @@ export function subscribeYoloStatus(cb: (s: YoloStatus) => void): () => void {
   };
 }
 
+// Build the runtime config. Explicit opts win; the rest are auto-picked from
+// a URL-based preset so nobody accidentally runs a NAS-tuned model at the
+// wrong resolution (see MODEL_PRESETS comment).
 function defaultConfig(opts: YoloInitOptions): Config {
-  const head: ModelHead = opts.head ?? "yolo-detr";
+  const modelUrl = opts.modelUrl ?? "/models/yolo26n.onnx";
+  const preset = presetForUrl(modelUrl);
   return {
-    modelUrl: opts.modelUrl ?? "/models/yolo26n.onnx",
-    head,
-    inputSize: opts.inputSize ?? 640,
-    classIdMap: opts.classIdMap ?? null,
+    modelUrl,
+    head: opts.head ?? preset?.head ?? "yolo-detr",
+    inputSize: opts.inputSize ?? preset?.inputSize ?? 640,
+    classIdMap: opts.classIdMap ?? preset?.classIdMap ?? null,
   };
 }
 
