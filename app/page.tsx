@@ -1,5 +1,5 @@
-import Echoes from "@/components/echoes";
+import { Tracker } from "@/components/tracker";
 
 export default function Home() {
-  return <Echoes />;
+  return <Tracker />;
 }

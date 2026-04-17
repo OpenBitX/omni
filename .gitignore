@@ -4,3 +4,10 @@ node_modules
 .DS_Store
 *.tsbuildinfo
 next-env.d.ts
+
+# Python server (under /server)
+server/.venv/
+server/__pycache__/
+server/*.pyc
+# dlib landmarks model — ~100 MB, not suitable for git
+server/shape_predictor_68_face_landmarks.dat
