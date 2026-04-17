@@ -1,0 +1,23 @@
+{
+  "left_eye": [
+    200,
+    220
+  ],
+  "right_eye": [
+    310,
+    220
+  ],
+  "mouth": [
+    255,
+    360
+  ],
+  "subject_bbox": [
+    70,
+    160,
+    440,
+    430
+  ],
+  "eye_width": 65,
+  "mouth_width": 130,
+  "label": "Orange"
+}

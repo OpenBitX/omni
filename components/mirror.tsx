@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { generateLine } from "@/app/actions";
 
-type Base = { bases: string[]; current: string };
+type BaseItem = { name: string; label: string };
+type Base = { bases: BaseItem[]; current: string; current_label?: string };
 type ServerEvent =
   | { event: "face" }
   | { event: "no_face" }
@@ -34,17 +35,27 @@ export default function Mirror() {
   const reconnectAttemptsRef = useRef(0);
   const wantConnectedRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Non-zero while an optimistic base-swap is in flight — drop incoming WS
+  // frames (which are still composites of the previous base) so they don't
+  // overwrite the static preview we just painted on the <img>.
+  const baseFreezeRef = useRef(0);
 
   const [status, setStatus] = useState<LiveState>("idle");
   const [fps, setFps] = useState(0);
   const [bases, setBases] = useState<Base | null>(null);
-  const [swapping, setSwapping] = useState(false);
+  const [swapTarget, setSwapTarget] = useState<string | null>(null);
+  const swapGenRef = useRef(0);
   const [uploading, setUploading] = useState(false);
+  const [retryingName, setRetryingName] = useState<string | null>(null);
+  const [retryElapsed, setRetryElapsed] = useState(0);
+  const [retryToast, setRetryToast] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [faceDetected, setFaceDetected] = useState<boolean | null>(null);
   const [speaking, setSpeaking] = useState(false);
   const [line, setLine] = useState<string | null>(null);
   const lineTimerRef = useRef<number | null>(null);
+  const retryTickRef = useRef<number | null>(null);
+  const retryToastTimerRef = useRef<number | null>(null);
 
   const loadBases = useCallback(async () => {
     try {
@@ -104,24 +115,115 @@ export default function Mirror() {
   const setBase = useCallback(
     async (name: string) => {
       dismissLine();
-      setSwapping(true);
+      // Gen counter lets a later click supersede an in-flight one: the slow
+      // swap's finally-block won't clear swapTarget if it's been superseded,
+      // and its error (if any) won't flash a stale message over the new swap.
+      const gen = ++swapGenRef.current;
+      setSwapTarget(name);
       setErrorText(null);
+      // Optimistic: flip the top image to the raw base NOW, before the server
+      // has swapped. The lockstep WS still has a composite-of-the-old-base in
+      // flight that would overwrite us, so we also freeze incoming frames
+      // for a moment (see baseFreezeRef in the WS handler).
+      baseFreezeRef.current = gen;
+      const img = outRef.current;
+      if (img) {
+        const prev = lastFrameUrlRef.current;
+        img.src = `${HTTP_URL}/base-image/${encodeURIComponent(name)}?t=${gen}`;
+        lastFrameUrlRef.current = null;
+        if (prev) URL.revokeObjectURL(prev);
+      }
+      // Optimistic: mark the chip active right away so the pink highlight
+      // matches the big preview without waiting for a /bases poll.
+      setBases((b) => (b ? { ...b, current: name } : b));
       try {
         const r = await fetch(`${HTTP_URL}/base/${encodeURIComponent(name)}`, {
           method: "POST",
         });
+        if (gen !== swapGenRef.current) return;
         if (!r.ok) {
           const t = await r.text().catch(() => String(r.status));
           throw new Error(t || `swap failed: ${r.status}`);
         }
-        await loadBases();
+        const payload = (await r.json().catch(() => null)) as
+          | { base?: string; label?: string }
+          | null;
+        setBases((b) => {
+          if (!b) return b;
+          return {
+            ...b,
+            current: payload?.base || name,
+            current_label: payload?.label || b.current_label,
+          };
+        });
       } catch (e) {
+        if (gen !== swapGenRef.current) return;
         setErrorText(e instanceof Error ? e.message : "swap failed");
       } finally {
-        setSwapping(false);
+        if (gen === swapGenRef.current) {
+          setSwapTarget(null);
+          // Release the freeze shortly after the server confirms so the next
+          // composite (now on the new base) can paint.
+          baseFreezeRef.current = 0;
+        }
       }
     },
-    [loadBases]
+    [dismissLine]
+  );
+
+  const flashRetryToast = useCallback((msg: string) => {
+    if (retryToastTimerRef.current != null) {
+      clearTimeout(retryToastTimerRef.current);
+    }
+    setRetryToast(msg);
+    retryToastTimerRef.current = window.setTimeout(() => {
+      setRetryToast(null);
+      retryToastTimerRef.current = null;
+    }, 2600);
+  }, []);
+
+  const retryBase = useCallback(
+    async (name: string, initialLabel: string) => {
+      dismissLine();
+      setRetryingName(name);
+      setRetryElapsed(0);
+      setErrorText(null);
+      const startedAt = performance.now();
+      if (retryTickRef.current != null) clearInterval(retryTickRef.current);
+      retryTickRef.current = window.setInterval(() => {
+        setRetryElapsed(Math.round((performance.now() - startedAt) / 1000));
+      }, 500);
+      try {
+        const r = await fetch(
+          `${HTTP_URL}/base/${encodeURIComponent(name)}/retry`,
+          { method: "POST" }
+        );
+        if (!r.ok) {
+          const t = await r.text().catch(() => String(r.status));
+          throw new Error(t || `retry failed: ${r.status}`);
+        }
+        const payload = (await r.json().catch(() => null)) as
+          | { label?: string; activated?: boolean }
+          | null;
+        const finalLabel = payload?.label || initialLabel;
+        flashRetryToast(
+          payload?.activated
+            ? `${finalLabel} · re-detected`
+            : `${finalLabel} · spot refreshed`
+        );
+        await loadBases();
+      } catch (e) {
+        setErrorText(e instanceof Error ? e.message : "retry failed");
+      } finally {
+        if (retryTickRef.current != null) {
+          clearInterval(retryTickRef.current);
+          retryTickRef.current = null;
+        }
+        setRetryingName(null);
+        setRetryElapsed(0);
+      }
+    },
+    [dismissLine, flashRetryToast, loadBases]
   );
 
   const uploadFile = useCallback(
@@ -320,6 +422,15 @@ export default function Mirror() {
         return;
       }
       lastFrameAtRef.current = performance.now();
+      // While the base-swap is mid-flight, the server is still returning
+      // composites of the previous base for frames that were already in
+      // flight. Drop them so they don't stomp the optimistic static preview
+      // on <img>.
+      if (baseFreezeRef.current !== 0) {
+        inFlightRef.current = false;
+        requestAnimationFrame(sendFrame);
+        return;
+      }
       const blob = new Blob([ev.data as ArrayBuffer], { type: "image/jpeg" });
       const url = URL.createObjectURL(blob);
       const img = outRef.current;
@@ -399,6 +510,8 @@ export default function Mirror() {
       streamRef.current = null;
       if (lastFrameUrlRef.current) URL.revokeObjectURL(lastFrameUrlRef.current);
       if (lineTimerRef.current != null) clearTimeout(lineTimerRef.current);
+      if (retryTickRef.current != null) clearInterval(retryTickRef.current);
+      if (retryToastTimerRef.current != null) clearTimeout(retryToastTimerRef.current);
     };
   }, [clearReconnect, clearWatchdog, teardownWS]);
 
@@ -600,30 +713,75 @@ export default function Mirror() {
             </div>
             <button
               onClick={() => fileInputRef.current?.click()}
-              disabled={uploading || swapping}
+              disabled={uploading}
               className="rounded-full bg-white/80 px-4 py-2 text-[12px] font-medium text-[color:var(--ink-soft)] shadow-[0_2px_10px_-4px_rgba(42,21,64,0.15)] ring-1 ring-white/80 backdrop-blur-md transition hover:bg-white hover:text-[color:var(--ink)] active:scale-95 disabled:opacity-40"
             >
               {uploading ? "analyzing" : "+ upload"}
             </button>
           </div>
           <div className="flex flex-wrap gap-2">
-            {bases?.bases.map((name) => {
-              const active = bases.current === name;
+            {bases?.bases.map((b) => {
+              const active = bases.current === b.name;
+              const retrying = retryingName === b.name;
+              const anotherRetrying = retryingName !== null && !retrying;
+              const swapPending = swapTarget === b.name;
+              // Optimistic-active: light up the target chip the instant you
+              // click, even before the server confirms the swap.
+              const lookActive = active || swapPending;
+              const chipText = retrying
+                ? retryElapsed >= 2
+                  ? `detecting… ${retryElapsed}s`
+                  : "detecting…"
+                : swapPending
+                  ? "swapping…"
+                  : b.label;
               return (
-                <button
-                  key={name}
-                  disabled={swapping || uploading}
-                  onClick={() => setBase(name)}
+                <div
+                  key={b.name}
                   className={
-                    "rounded-full px-4 py-2 text-[13px] font-medium tracking-[0.005em] transition active:scale-95 disabled:opacity-40 " +
-                    (active
+                    "flex items-stretch overflow-hidden rounded-full transition " +
+                    (retrying || swapPending
+                      ? "animate-[soft-pulse_1.4s_ease-in-out_infinite] "
+                      : "") +
+                    (lookActive
                       ? "bg-gradient-to-br from-[#ff89be] via-[#ec4899] to-[#c026d3] text-white shadow-[0_10px_25px_-10px_rgba(236,72,153,0.6)]"
                       : "bg-white/75 text-[color:var(--ink-soft)] ring-1 ring-white/80 backdrop-blur-md hover:bg-white hover:text-[color:var(--ink)]")
                   }
-                  title={name}
                 >
-                  {name.replace(/\.[^.]+$/, "")}
-                </button>
+                  <button
+                    disabled={swapPending || uploading}
+                    onClick={() => setBase(b.name)}
+                    className="min-w-[4.5rem] px-4 py-2 text-[13px] font-medium tracking-[0.005em] tabular-nums transition active:scale-95 disabled:opacity-40"
+                    title={b.name}
+                  >
+                    {chipText}
+                  </button>
+                  <button
+                    disabled={retrying || anotherRetrying || uploading}
+                    onClick={() => retryBase(b.name, b.label)}
+                    className={
+                      "grid place-items-center px-2.5 transition active:scale-95 disabled:opacity-40 " +
+                      (active ? "border-l border-white/40" : "border-l border-black/5")
+                    }
+                    title={retrying ? "re-detecting…" : "re-detect face spots with AI"}
+                    aria-label={`retry face detection for ${b.label}`}
+                  >
+                    <svg
+                      width="13"
+                      height="13"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className={retrying ? "animate-spin" : "transition-transform group-hover:rotate-45"}
+                    >
+                      <path d="M21 12a9 9 0 1 1-3.2-6.9" />
+                      <path d="M21 4v5h-5" />
+                    </svg>
+                  </button>
+                </div>
               );
             })}
             {!bases && (
@@ -632,6 +790,17 @@ export default function Mirror() {
               </span>
             )}
           </div>
+          {retryToast && (
+            <div
+              className="pointer-events-none mt-3 flex justify-center"
+              style={{ animation: "fade-in 260ms ease-out both" }}
+            >
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-white/92 px-3.5 py-1.5 text-[11.5px] font-medium text-[color:var(--ink-soft)] shadow-[0_8px_24px_-14px_rgba(42,21,64,0.4)] ring-1 ring-white/80 backdrop-blur">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                {retryToast}
+              </span>
+            </div>
+          )}
           <input
             ref={fileInputRef}
             type="file"

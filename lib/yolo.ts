@@ -1,0 +1,606 @@
+// Browser-side object detector on top of onnxruntime-web.
+//
+// Default model: YOLO26n (onnx-community/yolo26n-ONNX), 9.4 MB, DETR-style
+// outputs (logits [1,N,80] + pred_boxes [1,N,4] normalized cxcywh). The same
+// post-processing path also handles RF-DETR Nano once the class remap is
+// wired. Legacy YOLOv8-style anchor-grid outputs ([1, 84, 8400]) are
+// supported via the "yolov8-head" mode for fallback.
+//
+// Pipeline: letterbox → CHW float32 [0,1] → inference →
+//   DETR head   : per-query sigmoid(logits) argmax, threshold, done (no NMS)
+//   YOLOv8 head : per-cell class argmax, threshold, NMS
+// Boxes are returned in the ORIGINAL video's pixel space.
+import * as ort from "onnxruntime-web";
+
+export const COCO_CLASSES: readonly string[] = [
+  "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+  "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter",
+  "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear",
+  "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase",
+  "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat",
+  "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+  "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+  "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut",
+  "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet",
+  "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+  "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+  "scissors", "teddy bear", "hair drier", "toothbrush",
+];
+
+// COCO class id for "person" — the one class this app explicitly does not
+// want to talk to. Matches the policy in the ASSESS_SYSTEM prompt.
+export const PERSON_CLASS_ID = 0;
+
+export type Detection = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  cx: number;
+  cy: number;
+  w: number;
+  h: number;
+  score: number;
+  classId: number;
+  className: string;
+};
+
+// Head type selects the post-processing branch.
+//   - "yolo-detr": outputs logits [1,N,C] + pred_boxes [1,N,4] normalized
+//     cxcywh. YOLO26n + RF-DETR Nano use this.
+//   - "yolov8-head": outputs a single [1, 4+C, N] tensor where rows 0..3 are
+//     cxcywh in input-pixel space and rows 4..3+C are class scores. Used by
+//     raw Ultralytics YOLOv8/v11 exports.
+export type ModelHead = "yolo-detr" | "yolov8-head";
+
+export type YoloInitOptions = {
+  modelUrl?: string;
+  head?: ModelHead;
+  inputSize?: number;
+  /** Map raw class id → COCO-80 id, or -1 to drop. Used for RF-DETR which
+   *  emits 91 classes including N/A gaps. Omit for YOLO26n (direct 80-id). */
+  classIdMap?: Int32Array | null;
+  wasmPaths?: string;
+  preferWebGPU?: boolean;
+};
+
+type Config = Required<Pick<YoloInitOptions, "modelUrl" | "head" | "inputSize">> & {
+  classIdMap: Int32Array | null;
+};
+
+let session: ort.InferenceSession | null = null;
+let cfg: Config | null = null;
+let initPromise: Promise<ort.InferenceSession> | null = null;
+
+// Observable status — exposed so the UI can render progress, backend, and
+// any fatal error inline instead of staring at a blank camera when something
+// fails to load.
+export type YoloStatus = {
+  stage: "idle" | "downloading" | "compiling" | "ready" | "error";
+  backend: "webgpu" | "wasm" | null;
+  /** Download progress ratio [0, 1]. -1 while unknown (no content-length). */
+  progress: number;
+  /** Bytes downloaded, for HUD display. */
+  bytesLoaded: number;
+  bytesTotal: number;
+  error: string | null;
+  modelUrl: string | null;
+};
+
+const listeners = new Set<(s: YoloStatus) => void>();
+let status: YoloStatus = {
+  stage: "idle",
+  backend: null,
+  progress: 0,
+  bytesLoaded: 0,
+  bytesTotal: 0,
+  error: null,
+  modelUrl: null,
+};
+
+function setStatus(patch: Partial<YoloStatus>) {
+  status = { ...status, ...patch };
+  for (const l of listeners) {
+    try {
+      l(status);
+    } catch {
+      // subscriber blew up — not our problem, don't take down the pipeline
+    }
+  }
+}
+
+export function getYoloStatus(): YoloStatus {
+  return status;
+}
+
+export function subscribeYoloStatus(cb: (s: YoloStatus) => void): () => void {
+  listeners.add(cb);
+  cb(status);
+  return () => {
+    listeners.delete(cb);
+  };
+}
+
+function defaultConfig(opts: YoloInitOptions): Config {
+  const head: ModelHead = opts.head ?? "yolo-detr";
+  return {
+    modelUrl: opts.modelUrl ?? "/models/yolo26n.onnx",
+    head,
+    inputSize: opts.inputSize ?? 640,
+    classIdMap: opts.classIdMap ?? null,
+  };
+}
+
+// Fetch the ONNX model with progress reporting so the UI can show "32%
+// downloaded" instead of a mystery delay. Falls back to a single `fetch` +
+// `arrayBuffer()` if the browser can't stream (very old browsers).
+async function fetchModelWithProgress(url: string): Promise<ArrayBuffer> {
+  const resp = await fetch(url, { cache: "force-cache" });
+  if (!resp.ok) {
+    throw new Error(`model fetch failed: ${resp.status} ${resp.statusText}`);
+  }
+  const total = Number(resp.headers.get("content-length") ?? 0);
+  setStatus({ stage: "downloading", bytesLoaded: 0, bytesTotal: total, progress: total > 0 ? 0 : -1 });
+
+  if (!resp.body || !("getReader" in resp.body)) {
+    const buf = await resp.arrayBuffer();
+    setStatus({ bytesLoaded: buf.byteLength, bytesTotal: buf.byteLength, progress: 1 });
+    return buf;
+  }
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      loaded += value.byteLength;
+      setStatus({
+        bytesLoaded: loaded,
+        bytesTotal: total,
+        progress: total > 0 ? loaded / total : -1,
+      });
+    }
+  }
+  const merged = new Uint8Array(loaded);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.byteLength;
+  }
+  return merged.buffer;
+}
+
+async function tryCreateSession(
+  model: ArrayBuffer,
+  providers: ("webgpu" | "wasm")[]
+): Promise<{ session: ort.InferenceSession; backend: "webgpu" | "wasm" }> {
+  const errors: string[] = [];
+  for (const p of providers) {
+    try {
+      const s = await ort.InferenceSession.create(model, {
+        executionProviders: [p] as ort.InferenceSession.ExecutionProviderConfig[],
+        graphOptimizationLevel: "all",
+        // Keep this session as quiet as possible — session-level logLevel
+        // defaults to warning, which Next.js dev overlays as errors.
+        logSeverityLevel: 3,
+      });
+      // eslint-disable-next-line no-console
+      console.log(`[yolo] session created, backend=${p}`);
+      return { session: s, backend: p };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`${p}: ${msg}`);
+      // Use console.log so the Next.js dev overlay doesn't promote this to
+      // an error card. Real failures throw below after all providers fail.
+      // eslint-disable-next-line no-console
+      console.log(`[yolo] backend ${p} unavailable, trying next:`, msg);
+    }
+  }
+  throw new Error(`all backends failed — ${errors.join(" | ")}`);
+}
+
+// Load the ONNX model + runtime. Idempotent — concurrent callers share the
+// same promise. WebGPU is attempted first when available, WASM otherwise.
+//
+// Publishes progress/backend/error via the status subscription so the UI can
+// render a load bar and surface failures inline.
+export async function initYolo(
+  opts: YoloInitOptions = {}
+): Promise<ort.InferenceSession> {
+  if (session && cfg && cfg.modelUrl === (opts.modelUrl ?? cfg.modelUrl)) {
+    return session;
+  }
+  if (initPromise) return initPromise;
+
+  cfg = defaultConfig(opts);
+  const wasmPaths = opts.wasmPaths ?? "/ort/";
+  const preferWebGPU = opts.preferWebGPU ?? true;
+
+  setStatus({
+    stage: "downloading",
+    backend: null,
+    progress: 0,
+    bytesLoaded: 0,
+    bytesTotal: 0,
+    error: null,
+    modelUrl: cfg.modelUrl,
+  });
+
+  ort.env.wasm.wasmPaths = wasmPaths;
+  // Stay single-threaded by default. Multi-threaded WASM needs COOP/COEP
+  // headers (SharedArrayBuffer) which are brittle on localhost + Safari; the
+  // single-threaded SIMD path is plenty fast for YOLO26n and it Just Works
+  // everywhere.
+  ort.env.wasm.numThreads = 1;
+  // Disable the proxy worker path — it's finicky across Next.js dev and
+  // Safari, and single-threaded in-process inference is reliable.
+  ort.env.wasm.proxy = false;
+  // ORT is chatty at warning level (partial EP assignment, etc.) and Next.js
+  // dev promotes every warning to a fullscreen error overlay that hides the
+  // camera feed. Bump to error-only — actual failures still surface.
+  ort.env.logLevel = "error";
+
+  initPromise = (async () => {
+    try {
+      const modelBuf = await fetchModelWithProgress(cfg!.modelUrl);
+      setStatus({ stage: "compiling", progress: 1 });
+      const providers: ("webgpu" | "wasm")[] = preferWebGPU
+        ? ["webgpu", "wasm"]
+        : ["wasm"];
+      const { session: s, backend } = await tryCreateSession(modelBuf, providers);
+      session = s;
+      setStatus({ stage: "ready", backend, error: null });
+      return s;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // console.log, not console.error — Next.js dev overlay hijacks
+      // console.error into a fullscreen card. The error is surfaced via the
+      // status observable / error banner already.
+      // eslint-disable-next-line no-console
+      console.log("[yolo] init failed:", err);
+      setStatus({ stage: "error", error: msg });
+      initPromise = null; // let callers retry
+      throw err;
+    }
+  })();
+  return initPromise;
+}
+
+// Tear everything down so we can call initYolo again with a fresh try. Used
+// by the retry button in the UI.
+export function resetYolo(): void {
+  session = null;
+  cfg = null;
+  initPromise = null;
+  setStatus({
+    stage: "idle",
+    backend: null,
+    progress: 0,
+    bytesLoaded: 0,
+    bytesTotal: 0,
+    error: null,
+    modelUrl: null,
+  });
+}
+
+export function isYoloReady(): boolean {
+  return session !== null;
+}
+
+// Letterbox into SIZE×SIZE preserving aspect ratio, pad with RGB(114,114,114).
+// Returns the tensor plus the transform needed to map predictions back to
+// the source's pixel space.
+type LetterboxResult = {
+  tensor: ort.Tensor;
+  scale: number;
+  padX: number;
+  padY: number;
+  size: number;
+};
+
+function letterbox(
+  source: CanvasImageSource,
+  srcW: number,
+  srcH: number,
+  scratch: HTMLCanvasElement,
+  size: number
+): LetterboxResult | null {
+  const scale = Math.min(size / srcW, size / srcH);
+  const newW = Math.round(srcW * scale);
+  const newH = Math.round(srcH * scale);
+  const padX = Math.floor((size - newW) / 2);
+  const padY = Math.floor((size - newH) / 2);
+
+  scratch.width = size;
+  scratch.height = size;
+  const ctx = scratch.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.fillStyle = "rgb(114,114,114)";
+  ctx.fillRect(0, 0, size, size);
+  ctx.drawImage(source, padX, padY, newW, newH);
+
+  const { data } = ctx.getImageData(0, 0, size, size);
+  const pixels = size * size;
+  const tensor = new Float32Array(3 * pixels);
+  const rOff = 0;
+  const gOff = pixels;
+  const bOff = 2 * pixels;
+  for (let i = 0; i < pixels; i++) {
+    const src = i * 4;
+    tensor[rOff + i] = data[src] / 255;
+    tensor[gOff + i] = data[src + 1] / 255;
+    tensor[bOff + i] = data[src + 2] / 255;
+  }
+
+  return {
+    tensor: new ort.Tensor("float32", tensor, [1, 3, size, size]),
+    scale,
+    padX,
+    padY,
+    size,
+  };
+}
+
+// Sigmoid with mild precision guard. Used per-logit in the DETR head only
+// (thousands of calls per frame; hand-inlined rather than relying on Math).
+function sigmoid(x: number): number {
+  return 1 / (1 + Math.exp(-x));
+}
+
+function iouBox(
+  ax1: number, ay1: number, ax2: number, ay2: number,
+  bx1: number, by1: number, bx2: number, by2: number
+): number {
+  const x1 = Math.max(ax1, bx1);
+  const y1 = Math.max(ay1, by1);
+  const x2 = Math.min(ax2, bx2);
+  const y2 = Math.min(ay2, by2);
+  if (x2 <= x1 || y2 <= y1) return 0;
+  const inter = (x2 - x1) * (y2 - y1);
+  const areaA = Math.max(0, (ax2 - ax1) * (ay2 - ay1));
+  const areaB = Math.max(0, (bx2 - bx1) * (by2 - by1));
+  const union = areaA + areaB - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+function nms(dets: Detection[], iouThreshold: number): Detection[] {
+  if (dets.length < 2) return dets;
+  const sorted = [...dets].sort((a, b) => b.score - a.score);
+  const keep: Detection[] = [];
+  const suppressed = new Uint8Array(sorted.length);
+  for (let i = 0; i < sorted.length; i++) {
+    if (suppressed[i]) continue;
+    const a = sorted[i];
+    keep.push(a);
+    for (let j = i + 1; j < sorted.length; j++) {
+      if (suppressed[j]) continue;
+      const b = sorted[j];
+      const ov = iouBox(a.x1, a.y1, a.x2, a.y2, b.x1, b.y1, b.x2, b.y2);
+      const t = a.classId === b.classId ? iouThreshold : 0.85;
+      if (ov > t) suppressed[j] = 1;
+    }
+  }
+  return keep;
+}
+
+export type DetectOptions = {
+  confThreshold?: number;
+  iouThreshold?: number;
+  classFilter?: (id: number) => boolean;
+  maxDetections?: number;
+};
+
+function mapToCoco80(
+  rawClassId: number,
+  classIdMap: Int32Array | null
+): number {
+  if (!classIdMap) return rawClassId;
+  if (rawClassId < 0 || rawClassId >= classIdMap.length) return -1;
+  return classIdMap[rawClassId];
+}
+
+// Build a Detection from normalized cxcywh (DETR) in the letterbox-input
+// coordinate frame. Handles the letterbox inverse and clamps to the source.
+function detectionFromDetrBox(
+  cxN: number,
+  cyN: number,
+  wN: number,
+  hN: number,
+  score: number,
+  coco80: number,
+  pre: LetterboxResult,
+  vw: number,
+  vh: number
+): Detection | null {
+  if (coco80 < 0 || coco80 >= COCO_CLASSES.length) return null;
+  const cx640 = cxN * pre.size;
+  const cy640 = cyN * pre.size;
+  const w640 = wN * pre.size;
+  const h640 = hN * pre.size;
+  const cx = (cx640 - pre.padX) / pre.scale;
+  const cy = (cy640 - pre.padY) / pre.scale;
+  const w = w640 / pre.scale;
+  const h = h640 / pre.scale;
+  const x1 = Math.max(0, cx - w / 2);
+  const y1 = Math.max(0, cy - h / 2);
+  const x2 = Math.min(vw, cx + w / 2);
+  const y2 = Math.min(vh, cy + h / 2);
+  if (x2 - x1 < 4 || y2 - y1 < 4) return null;
+  return {
+    x1, y1, x2, y2,
+    cx, cy, w, h,
+    score,
+    classId: coco80,
+    className: COCO_CLASSES[coco80] ?? "?",
+  };
+}
+
+// DETR-style post-processing: iterate N queries, take sigmoid-max class per
+// query, threshold, convert boxes. No NMS — set prediction handles dedup.
+function postprocessDetr(
+  outputs: Record<string, ort.Tensor>,
+  pre: LetterboxResult,
+  vw: number,
+  vh: number,
+  conf: number,
+  classIdMap: Int32Array | null,
+  classFilter?: (id: number) => boolean
+): Detection[] {
+  // Tolerate both name pairs: YOLO26n uses (logits, pred_boxes); RF-DETR
+  // flavors often use (pred_logits, pred_boxes).
+  const logitsTensor =
+    outputs["logits"] ?? outputs["pred_logits"] ?? null;
+  const boxesTensor = outputs["pred_boxes"] ?? null;
+  if (!logitsTensor || !boxesTensor) return [];
+  const logits = logitsTensor.data as Float32Array;
+  const boxes = boxesTensor.data as Float32Array;
+  const [, nQueries, nClasses] = logitsTensor.dims as [number, number, number];
+
+  const out: Detection[] = [];
+  for (let q = 0; q < nQueries; q++) {
+    let bestLogit = -Infinity;
+    let bestCls = -1;
+    const base = q * nClasses;
+    for (let c = 0; c < nClasses; c++) {
+      const v = logits[base + c];
+      if (v > bestLogit) {
+        bestLogit = v;
+        bestCls = c;
+      }
+    }
+    const score = sigmoid(bestLogit);
+    if (score < conf) continue;
+
+    const coco80 = mapToCoco80(bestCls, classIdMap);
+    if (coco80 < 0) continue;
+    if (classFilter && !classFilter(coco80)) continue;
+
+    const bi = q * 4;
+    const det = detectionFromDetrBox(
+      boxes[bi], boxes[bi + 1], boxes[bi + 2], boxes[bi + 3],
+      score, coco80, pre, vw, vh
+    );
+    if (det) out.push(det);
+  }
+  return out;
+}
+
+// YOLOv8-head post-processing: [1, 4+C, N] with rows 0..3 = cxcywh in input
+// pixels. Classic anchor-grid output — needs NMS.
+function postprocessYoloV8(
+  outputs: Record<string, ort.Tensor>,
+  pre: LetterboxResult,
+  vw: number,
+  vh: number,
+  conf: number,
+  iouT: number,
+  classFilter?: (id: number) => boolean
+): Detection[] {
+  const key = Object.keys(outputs)[0];
+  const out = outputs[key];
+  const [, nFeatures, nBoxes] = out.dims as [number, number, number];
+  const data = out.data as Float32Array;
+  const nClasses = nFeatures - 4;
+
+  const candidates: Detection[] = [];
+  for (let i = 0; i < nBoxes; i++) {
+    let bestScore = 0;
+    let bestClass = -1;
+    for (let c = 0; c < nClasses; c++) {
+      const s = data[(4 + c) * nBoxes + i];
+      if (s > bestScore) {
+        bestScore = s;
+        bestClass = c;
+      }
+    }
+    if (bestScore < conf) continue;
+    if (classFilter && !classFilter(bestClass)) continue;
+
+    const cx640 = data[0 * nBoxes + i];
+    const cy640 = data[1 * nBoxes + i];
+    const w640 = data[2 * nBoxes + i];
+    const h640 = data[3 * nBoxes + i];
+
+    const cx = (cx640 - pre.padX) / pre.scale;
+    const cy = (cy640 - pre.padY) / pre.scale;
+    const w = w640 / pre.scale;
+    const h = h640 / pre.scale;
+
+    const x1 = Math.max(0, cx - w / 2);
+    const y1 = Math.max(0, cy - h / 2);
+    const x2 = Math.min(vw, cx + w / 2);
+    const y2 = Math.min(vh, cy + h / 2);
+    if (x2 - x1 < 4 || y2 - y1 < 4) continue;
+
+    candidates.push({
+      x1, y1, x2, y2,
+      cx, cy, w, h,
+      score: bestScore,
+      classId: bestClass,
+      className: COCO_CLASSES[bestClass] ?? "?",
+    });
+  }
+  return nms(candidates, iouT);
+}
+
+export async function detect(
+  video: HTMLVideoElement,
+  scratch: HTMLCanvasElement,
+  opts: DetectOptions = {}
+): Promise<Detection[]> {
+  // Returning [] on "not initialized" rather than throwing is intentional: in
+  // Next.js dev, HMR can reload this module (wiping `session`) while the
+  // consumer component stays mounted and keeps calling detect(). Throwing
+  // there fires console.error → Next's dev overlay → looks like a real bug.
+  // Empty results until the caller re-inits is the correct idle behavior.
+  if (!session || !cfg) return [];
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return [];
+
+  const conf = opts.confThreshold ?? 0.35;
+  const iouT = opts.iouThreshold ?? 0.45;
+  const maxDet = opts.maxDetections ?? 50;
+
+  const pre = letterbox(video, vw, vh, scratch, cfg.inputSize);
+  if (!pre) return [];
+
+  const inputName = session.inputNames[0];
+  const feeds: Record<string, ort.Tensor> = { [inputName]: pre.tensor };
+  const outputs = (await session.run(feeds)) as Record<string, ort.Tensor>;
+
+  const results =
+    cfg.head === "yolo-detr"
+      ? postprocessDetr(outputs, pre, vw, vh, conf, cfg.classIdMap, opts.classFilter)
+      : postprocessYoloV8(outputs, pre, vw, vh, conf, iouT, opts.classFilter);
+
+  return results.length > maxDet
+    ? results.sort((a, b) => b.score - a.score).slice(0, maxDet)
+    : results;
+}
+
+// COCO-91 → COCO-80 mapping used by RF-DETR exports (91 raw classes include
+// N/A gaps from the original COCO JSON). Pre-computed constant — commented
+// out until we flip RF-DETR on as the default, but ready to wire.
+export const RF_DETR_COCO91_TO_COCO80: Int32Array = new Int32Array([
+  // 0..90, -1 = drop (N/A). Derived from standard COCO 91→80 mapping.
+  -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, -1, 11, -1, -1, 12, 13, 14, 15,
+  16, 17, 18, 19, 20, 21, 22, -1, 23, -1, -1, 24, 25, -1, 26, 27, 28, 29, 30, 31,
+  32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, -1, 45, 46, 47, 48, 49, 50,
+  51, 52, 53, 54, 55, 56, 57, 58, 59, 60, -1, 61, -1, -1, 62, -1, 63, 64, 65, 66,
+  67, 68, 69, 70, 71, 72, -1, 73, 74, 75, 76, 77, 78, 79,
+]);
+
+// Debug helper — emits the letterboxed frame as a JPEG data URL.
+export function debugLetterboxDataUrl(
+  video: HTMLVideoElement,
+  scratch: HTMLCanvasElement
+): string | null {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh || !cfg) return null;
+  if (!letterbox(video, vw, vh, scratch, cfg.inputSize)) return null;
+  return scratch.toDataURL("image/jpeg", 0.7);
+}
