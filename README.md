@@ -10,8 +10,11 @@ Works with up to three objects at once.
 
 ## Get started
 
-You need **Node 20+** and a **[Zhipu GLM API key](https://open.bigmodel.cn/)**.
-That's it for the main app.
+You need **Node 20+** and **three API keys** — all important:
+
+1. **[Zhipu GLM](https://open.bigmodel.cn/)** — vision + writing (the brains)
+2. **[Fish.audio](https://fish.audio/)** — cloned character voices (the voice)
+3. **[OpenAI](https://platform.openai.com/)** — Whisper mic talk-back + TTS fallback
 
 ```bash
 git clone https://github.com/OpenBitX/duidui.git
@@ -20,10 +23,13 @@ npm install
 cp .env.example .env.local
 ```
 
-Open `.env.local` and paste your key:
+Open `.env.local` and paste all three:
 
 ```ini
-ZHIPU_API_KEY=your-key-here
+ZHIPU_API_KEY=your-zhipu-key
+FISH_API_KEY=your-fish-key
+FISH_REFERENCE_ID=your-fish-voice-id
+OPENAI_API_KEY=your-openai-key
 ```
 
 Then:
@@ -48,17 +54,18 @@ Open <http://localhost:3000>, let it use your camera, tap something. 🎉
 
 ---
 
-## API keys
+## What each key does
 
-Only `ZHIPU_API_KEY` is required. The others unlock extra features:
+All three keys matter — the app works best with the full set:
 
-| Key | What it does | Required? |
-| --- | --- | --- |
-| `ZHIPU_API_KEY` | GLM vision + in-character writing | ✅ yes |
-| `FISH_API_KEY` + `FISH_REFERENCE_ID` | Higher-quality cloned voices (Fish.audio) | optional |
-| `OPENAI_API_KEY` | Mic talk-back (Whisper) and TTS fallback | optional |
+| Key | What it powers |
+| --- | --- |
+| `ZHIPU_API_KEY` | GLM-5V vision (decides where the face goes) + GLM-4v-flash in-character dialogue |
+| `FISH_API_KEY` + `FISH_REFERENCE_ID` | Fish.audio `s1` — the primary voice (cloned, character-specific) |
+| `OPENAI_API_KEY` | Whisper (mic talk-back transcription) + `tts-1`/`nova` TTS fallback |
 
-No TTS keys? The app runs caption-only — face still animates, just silent.
+Skip Fish → voices fall back to OpenAI TTS. Skip both TTS keys → caption-only
+mode. Skip OpenAI → mic talk-back stops working.
 
 ---
 
