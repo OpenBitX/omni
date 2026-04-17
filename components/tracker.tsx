@@ -725,9 +725,22 @@ export function Tracker() {
       );
 
       try {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[speak:${trackId}] → generateLine  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB`
+        );
+        const t0 = performance.now();
         const { line, audioDataUrl, backend } = await generateLine(cropDataUrl);
-        if (callGen !== track.speakGen) return;
+        if (callGen !== track.speakGen) {
+          // eslint-disable-next-line no-console
+          console.log(`[speak:${trackId}] ← superseded (speakGen mismatch)`);
+          return;
+        }
         setLastTtsBackend(backend);
+        // eslint-disable-next-line no-console
+        console.log(
+          `[speak:${trackId}] ← ${Math.round(performance.now() - t0)}ms  backend=${backend}  line="${line}"`
+        );
 
         setTracksUI((prev) =>
           prev.map((t) =>
@@ -1199,10 +1212,23 @@ export function Tracker() {
         formData.append("className", track.className);
         if (cropDataUrl) formData.append("imageDataUrl", cropDataUrl);
 
+        // eslint-disable-next-line no-console
+        console.log(
+          `[talk:${trackId}] → converseWithObject  class="${track.className}"  audio=${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  crop=${cropDataUrl ? Math.round(cropDataUrl.length / 1024) + "KB" : "none"}`
+        );
+        const t0 = performance.now();
         const { transcript, reply, audioDataUrl, backend } =
           await converseWithObject(formData);
         setLastTtsBackend(backend);
-        if (callGen !== track.speakGen) return;
+        if (callGen !== track.speakGen) {
+          // eslint-disable-next-line no-console
+          console.log(`[talk:${trackId}] ← superseded (speakGen mismatch)`);
+          return;
+        }
+        // eslint-disable-next-line no-console
+        console.log(
+          `[talk:${trackId}] ← ${Math.round(performance.now() - t0)}ms  backend=${backend}  heard="${transcript}"  reply="${reply}"`
+        );
 
         // Echo what Whisper heard so the user has an instant signal that
         // their voice message landed — even before the reply starts playing.
@@ -1600,9 +1626,15 @@ export function Tracker() {
 
   const startRecording = useCallback(async () => {
     if (recorderRef.current && recorderRef.current.state === "recording") return;
+    // eslint-disable-next-line no-console
+    console.log("[mic] ▶ start recording");
     const ctx = ensureAudioCtx();
     const stream = await openMicStream();
-    if (!stream) return;
+    if (!stream) {
+      // eslint-disable-next-line no-console
+      console.log("[mic] ✖ no mic stream");
+      return;
+    }
     if (ctx && !talkAnalyserRef.current) {
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
@@ -1713,6 +1745,8 @@ export function Tracker() {
   }, [ensureAudioCtx, openMicStream, pickTalkTarget, sendTalkToTrack, showRejection]);
 
   const stopRecording = useCallback(() => {
+    // eslint-disable-next-line no-console
+    console.log("[mic] ◼ stop recording");
     const mr = recorderRef.current;
     if (mr && mr.state === "recording") {
       try {
