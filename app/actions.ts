@@ -1,18 +1,27 @@
 "use server";
 
-import OpenAI from "openai";
+import OpenAI, { toFile } from "openai";
 
-// Vision + line model is Zhipu's GLM-5V-Turbo (same as the server-side
-// Mirror pipeline in server/server.py). TTS stays on OpenAI because GLM
-// doesn't ship a drop-in `tts-1 / nova` equivalent. The app degrades to
-// caption-only (no audio) when `OPENAI_API_KEY` isn't set.
+// Two-model strategy.
 //
-// NOTE: glm-5v-turbo is a reasoning model. It spends a chunk of its
-// completion budget on `reasoning_content` before emitting `content`, so
-// don't cap max_tokens tightly — leave enough headroom that reasoning
-// doesn't crowd out the real answer.
-const GLM_MODEL = "glm-5v-turbo";
-const GLM_TIMEOUT_MS = 90_000; // reasoning-style model; give it headroom
+//   `GLM_MODEL_DEEP` (glm-5v-turbo): reasoning-style VLM, used for the
+//   one-shot `assessObject` call at tap time. That call picks the best
+//   face-placement point on the crop — it's rare, its quality matters
+//   more than its latency, and the reasoning tokens genuinely help.
+//
+//   `GLM_MODEL_FAST` (glm-4v-flash): a vision-capable model with no
+//   reasoning-spiral overhead. Used for the HOT-PATH calls:
+//   `generateLine` (tap → opening line) and `converseWithObject`
+//   (voice-in → voice-out). Still sees the object crop for character
+//   continuity; just doesn't burn 500 reasoning tokens before it speaks.
+//   Typical latency drops from ~3–5s to ~1–2s, which is the difference
+//   between "lively conversation" and "slideshow".
+//
+// Override with env vars GLM_MODEL_DEEP / GLM_MODEL_FAST if you want to
+// try others (glm-4v-plus, etc.) without a code change.
+const GLM_MODEL_DEEP = process.env.GLM_MODEL_DEEP?.trim() || "glm-5v-turbo";
+const GLM_MODEL_FAST = process.env.GLM_MODEL_FAST?.trim() || "glm-4v-flash";
+const GLM_TIMEOUT_MS = 90_000;
 const GLM_RETRIES = 2;
 
 // bigmodel.cn keys look like `<hex>.<secret>`; api.z.ai keys look like `sk-…`.
@@ -152,8 +161,12 @@ async function glmVisionCall(args: {
   imageDataUrl?: string;
   maxTokens: number;
   temperature: number;
+  /** Which GLM model to call. Defaults to the fast VLM; the slower
+   *  reasoning model is opt-in per caller. */
+  model?: string;
 }): Promise<string> {
   const client = getGlmClient();
+  const model = args.model ?? GLM_MODEL_FAST;
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= GLM_RETRIES + 1; attempt++) {
     try {
@@ -167,7 +180,7 @@ async function glmVisionCall(args: {
         });
       }
       const resp = await client.chat.completions.create({
-        model: GLM_MODEL,
+        model,
         max_tokens: args.maxTokens,
         temperature: args.temperature,
         messages: [
@@ -207,10 +220,13 @@ export async function assessObject(
     system: ASSESS_SYSTEM,
     userText: `Tap at (${tx.toFixed(3)}, ${ty.toFixed(3)}). Find the best face placement and commit. Default to suitable=true — only say false for a person or a completely empty/uniform image. Return JSON only.`,
     imageDataUrl,
-    // Reasoning headroom — GLM spends most of its budget on inner thought
-    // before emitting the actual JSON answer.
+    // Reasoning headroom — the deep VLM spends most of its budget on inner
+    // thought before emitting the actual JSON answer.
     maxTokens: 1536,
     temperature: 0.2,
+    // assessObject runs once per tap and its quality matters more than its
+    // latency — lean on the reasoning model here specifically.
+    model: GLM_MODEL_DEEP,
   });
 
   const parsed = extractJsonObject(raw);
@@ -250,7 +266,7 @@ export async function assessObject(
 
 export async function generateLine(
   imageDataUrl: string
-): Promise<{ line: string; audioDataUrl: string | null }> {
+): Promise<{ line: string; audioDataUrl: string | null; backend: TtsBackend }> {
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
   }
@@ -259,33 +275,201 @@ export async function generateLine(
     system: FACE_SYSTEM,
     userText: "What does this thing say?",
     imageDataUrl,
-    // Reasoning headroom — the actual line is ~14 words but the model
-    // can spend 400+ tokens reasoning about tone, count, and vibe first.
-    maxTokens: 1024,
+    // glm-4v-flash doesn't reasoning-spiral, so we can tighten the budget.
+    // 120 tokens ≈ 60 words of headroom for a 14-word target.
+    maxTokens: 120,
     temperature: 0.95,
   });
   const line = extractTextLine(raw);
   if (!line) throw new Error("empty line from model");
 
-  // TTS stays on OpenAI — GLM has no tts-1/nova equivalent. Skip audio if the
-  // key is missing so a GLM-only deploy still shows captions.
+  const tts = await synthesizeSpeech(line);
+  return { line, audioDataUrl: tts.audioDataUrl, backend: tts.backend };
+}
+
+// === Voice-in, voice-out conversation ==================================
+//
+// The full loop:
+//   1. Browser records audio via MediaRecorder → Blob
+//   2. POST as FormData to this server action
+//   3. OpenAI Whisper transcribes the audio
+//   4. GLM-5V-Turbo generates an in-character reply (seeing the object
+//      crop as vision context so it stays in the same persona)
+//   5. Fish.audio TTS renders the reply; fallback ladder is OpenAI TTS
+//      and then caption-only
+// The client plays the returned audio through the track's AnalyserNode,
+// which the FaceVoice mouth classifier is already wired to.
+
+const FISH_TTS_URL = "https://api.fish.audio/v1/tts";
+
+type TtsBackend = "fish" | "openai" | "none";
+
+// Fish.audio synthesis. Returns mp3 bytes or null if the key is absent;
+// throws on HTTP/content errors so the caller can fall through.
+async function fishTTS(text: string): Promise<Buffer | null> {
+  const key = process.env.FISH_API_KEY?.trim();
+  if (!key) return null;
+
+  const body: Record<string, unknown> = {
+    text,
+    format: "mp3",
+    mp3_bitrate: 128,
+    normalize: true,
+    latency: "normal",
+    chunk_length: 200,
+  };
+  const referenceId = process.env.FISH_REFERENCE_ID?.trim();
+  if (referenceId) body.reference_id = referenceId;
+
+  const resp = await fetch(FISH_TTS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+      // Fish's API takes the model as a header (confirmed against their
+      // OpenBitX reference client, which we ported here).
+      model: process.env.FISH_MODEL?.trim() || "s1",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`fish ${resp.status}: ${text.slice(0, 200)}`);
+  }
+  const ct = resp.headers.get("content-type") ?? "";
+  if (ct.includes("application/json")) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`fish returned non-audio: ${text.slice(0, 200)}`);
+  }
+  return Buffer.from(await resp.arrayBuffer());
+}
+
+async function openaiTTS(text: string): Promise<Buffer | null> {
   const openai = getOpenAIClient();
-  if (!openai) {
-    return { line, audioDataUrl: null };
+  if (!openai) return null;
+  const speech = await openai.audio.speech.create({
+    model: "tts-1",
+    voice: "nova",
+    input: text,
+    response_format: "mp3",
+  });
+  return Buffer.from(await speech.arrayBuffer());
+}
+
+async function synthesizeSpeech(
+  text: string
+): Promise<{ audioDataUrl: string | null; backend: TtsBackend }> {
+  // Fish first when configured — character-specific voices via reference_id
+  // are a much better match for our talking-object vibe than `tts-1/nova`.
+  try {
+    const mp3 = await fishTTS(text);
+    if (mp3) {
+      return {
+        audioDataUrl: `data:audio/mpeg;base64,${mp3.toString("base64")}`,
+        backend: "fish",
+      };
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[tts] fish failed, falling back:", err);
+  }
+  // OpenAI as a dependable fallback.
+  try {
+    const mp3 = await openaiTTS(text);
+    if (mp3) {
+      return {
+        audioDataUrl: `data:audio/mpeg;base64,${mp3.toString("base64")}`,
+        backend: "openai",
+      };
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[tts] openai failed too:", err);
+  }
+  // Caption-only mode — the caller should still render the line.
+  return { audioDataUrl: null, backend: "none" };
+}
+
+async function transcribeAudio(blob: Blob): Promise<string> {
+  const openai = getOpenAIClient();
+  if (!openai) throw new Error("whisper needs OPENAI_API_KEY");
+  // toFile handles the Node-vs-Web File interop so OpenAI SDK accepts the
+  // MediaRecorder output uniformly regardless of what Node version we're on.
+  const filename =
+    blob.type.includes("mp4") ? "talk.mp4" :
+    blob.type.includes("ogg") ? "talk.ogg" :
+    "talk.webm";
+  const file = await toFile(blob, filename, {
+    type: blob.type || "audio/webm",
+  });
+  const result = await openai.audio.transcriptions.create({
+    file,
+    model: "whisper-1",
+    // Leaving language unset so non-English speakers still work; pass an
+    // explicit language if you want the ~10–30% latency boost.
+  });
+  return (result.text ?? "").trim();
+}
+
+const RESPOND_SYSTEM = (className: string) =>
+  `You are the secret inner voice of a ${className} the user is talking to. You see yourself in the crop provided. They just said something to you; reply with ONE short, in-character line (max 22 words) that actually responds to what they said.
+
+Rules:
+- First person, in character as the ${className}.
+- Funny, warm, slightly unhinged. Aim for a smile.
+- Actually acknowledge what they said — don't ignore their line.
+- No meta-commentary, no "as a [thing]", no "I am a [thing]".
+- No quotes, no emojis, no stage directions, no ellipses at the end.
+- If their message is unclear, pick the most interesting interpretation and commit.
+
+Return only the line. No prose, no <think> reasoning, no extra text.`;
+
+export type ConverseResult = {
+  transcript: string;
+  reply: string;
+  audioDataUrl: string | null;
+  backend: TtsBackend;
+};
+
+export async function converseWithObject(
+  formData: FormData
+): Promise<ConverseResult> {
+  const audio = formData.get("audio");
+  const className = String(formData.get("className") ?? "thing").slice(0, 60);
+  const imageDataUrl = String(formData.get("imageDataUrl") ?? "");
+
+  if (!(audio instanceof Blob)) {
+    throw new Error("missing audio");
+  }
+  // Very short blobs are almost always accidental button taps. Reject
+  // fast rather than burning a Whisper call.
+  if (audio.size < 1024) {
+    throw new Error("recording too short");
+  }
+  if (audio.size > 10_000_000) {
+    throw new Error("recording too large");
   }
 
-  try {
-    const speech = await openai.audio.speech.create({
-      model: "tts-1",
-      voice: "nova",
-      input: line,
-      response_format: "mp3",
-    });
-    const buf = Buffer.from(await speech.arrayBuffer());
-    const audioDataUrl = `data:audio/mpeg;base64,${buf.toString("base64")}`;
-    return { line, audioDataUrl };
-  } catch {
-    // TTS failed — still return the line so the caption can render.
-    return { line, audioDataUrl: null };
+  const transcript = await transcribeAudio(audio);
+  if (!transcript) {
+    // Whisper found nothing meaningful. Return an in-character "didn't
+    // catch that" rather than failing hard.
+    return { transcript: "", reply: "hmm?", audioDataUrl: null, backend: "none" };
   }
+
+  const raw = await glmVisionCall({
+    system: RESPOND_SYSTEM(className),
+    userText: `They said: "${transcript.replace(/"/g, "'")}". Reply in character — one short line.`,
+    imageDataUrl: imageDataUrl.startsWith("data:image/") ? imageDataUrl : undefined,
+    // glm-4v-flash skips the reasoning pre-amble; 160 tokens is plenty for
+    // the 22-word target plus a little overhead.
+    maxTokens: 160,
+    temperature: 0.95,
+  });
+  const reply = extractTextLine(raw);
+  if (!reply) throw new Error("empty reply from model");
+
+  const tts = await synthesizeSpeech(reply);
+  return { transcript, reply, audioDataUrl: tts.audioDataUrl, backend: tts.backend };
 }
