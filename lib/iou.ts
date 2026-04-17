@@ -114,12 +114,16 @@ export type BoxEMA = {
   h: EMAFilter;
 };
 
-export function newBoxEMA(alpha = 0.4): BoxEMA {
+// Split alphas — position is fast (responsive to motion) while size is slow
+// (kills the "breathing" effect from bbox edge jitter). Objects rarely change
+// size abruptly in real use, so a slow size EMA costs little and buys a lot
+// of visual stability.
+export function newBoxEMA(posAlpha = 0.4, sizeAlpha = 0.15): BoxEMA {
   return {
-    cx: new EMAFilter(alpha),
-    cy: new EMAFilter(alpha),
-    w: new EMAFilter(alpha),
-    h: new EMAFilter(alpha),
+    cx: new EMAFilter(posAlpha),
+    cy: new EMAFilter(posAlpha),
+    w: new EMAFilter(sizeAlpha),
+    h: new EMAFilter(sizeAlpha),
   };
 }
 
