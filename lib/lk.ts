@@ -160,86 +160,193 @@ export function detectCorners(
   return out;
 }
 
-export function trackLK(
+// Image pyramid for multi-scale tracking. Level 0 is full resolution; each
+// level thereafter is half-size via 2x2 box average. Pyramid LK searches
+// for motion at coarse levels first (where a 40-pixel displacement looks
+// like a 10-pixel one) and refines at finer levels — so point tracking
+// survives large inter-frame motion that breaks single-level LK.
+export type Pyramid = { levels: Gray[] };
+
+function downsample2x(g: Gray): Gray {
+  const sw = g.width;
+  const sh = g.height;
+  const w = Math.max(1, sw >> 1);
+  const h = Math.max(1, sh >> 1);
+  const src = g.data;
+  const out = new Uint8ClampedArray(w * h);
+  for (let y = 0; y < h; y++) {
+    const sy = y << 1;
+    for (let x = 0; x < w; x++) {
+      const sx = x << 1;
+      const v =
+        (src[sy * sw + sx] +
+          src[sy * sw + sx + 1] +
+          src[(sy + 1) * sw + sx] +
+          src[(sy + 1) * sw + sx + 1]) >>
+        2;
+      out[y * w + x] = v;
+    }
+  }
+  return { data: out, width: w, height: h };
+}
+
+export function buildPyramid(gray: Gray, depth: number): Pyramid {
+  const levels: Gray[] = [gray];
+  for (let i = 1; i < depth; i++) {
+    const p = levels[i - 1];
+    if (p.width < 16 || p.height < 16) break;
+    levels.push(downsample2x(p));
+  }
+  return { levels };
+}
+
+// Track one point at one pyramid level. Refines `guess` toward the location
+// in `curr` that matches the `(anchorX, anchorY)` patch in `prev`. Returns
+// the refined position (same coordinate space as inputs), whether it
+// converged inside the frame, and the post-fit patch SAD.
+function trackPointAtLevel(
   prev: Gray,
   curr: Gray,
+  ix: Float32Array,
+  iy: Float32Array,
+  anchorX: number,
+  anchorY: number,
+  guessX: number,
+  guessY: number,
+  winHalf: number,
+  maxIters: number,
+  tol: number
+): { x: number; y: number; found: boolean; sad: number } {
+  const w = prev.width;
+  const h = prev.height;
+
+  let gxx = 0;
+  let gyy = 0;
+  let gxy = 0;
+  for (let dy = -winHalf; dy <= winHalf; dy++) {
+    for (let dx = -winHalf; dx <= winHalf; dx++) {
+      const gx = sampleF(ix, w, h, anchorX + dx, anchorY + dy);
+      const gy = sampleF(iy, w, h, anchorX + dx, anchorY + dy);
+      gxx += gx * gx;
+      gyy += gy * gy;
+      gxy += gx * gy;
+    }
+  }
+  const det = gxx * gyy - gxy * gxy;
+  if (det < 1e-4) return { x: guessX, y: guessY, found: false, sad: 0 };
+  const invDet = 1 / det;
+
+  let cx = guessX;
+  let cy = guessY;
+  let ok = true;
+  for (let k = 0; k < maxIters; k++) {
+    let bx = 0;
+    let by = 0;
+    for (let dy = -winHalf; dy <= winHalf; dy++) {
+      for (let dx = -winHalf; dx <= winHalf; dx++) {
+        const it =
+          sample(curr, cx + dx, cy + dy) - sample(prev, anchorX + dx, anchorY + dy);
+        const gx = sampleF(ix, w, h, anchorX + dx, anchorY + dy);
+        const gy = sampleF(iy, w, h, anchorX + dx, anchorY + dy);
+        bx += gx * it;
+        by += gy * it;
+      }
+    }
+    const ux = -invDet * (gyy * bx - gxy * by);
+    const uy = -invDet * (-gxy * bx + gxx * by);
+    cx += ux;
+    cy += uy;
+    if (!Number.isFinite(cx) || !Number.isFinite(cy)) {
+      ok = false;
+      break;
+    }
+    if (Math.abs(ux) + Math.abs(uy) < tol) break;
+  }
+
+  if (!ok || cx < 1 || cy < 1 || cx > w - 2 || cy > h - 2) {
+    return { x: cx, y: cy, found: false, sad: 0 };
+  }
+
+  let sad = 0;
+  for (let dy = -winHalf; dy <= winHalf; dy++) {
+    for (let dx = -winHalf; dx <= winHalf; dx++) {
+      sad += Math.abs(
+        sample(curr, cx + dx, cy + dy) - sample(prev, anchorX + dx, anchorY + dy)
+      );
+    }
+  }
+  const avgSad = sad / ((winHalf * 2 + 1) * (winHalf * 2 + 1));
+  return { x: cx, y: cy, found: true, sad: avgSad };
+}
+
+// Pyramid LK: track `pts` from `prev` to `curr`. Input and output point
+// coordinates are in full-resolution (level-0) space. The search runs
+// coarse-to-fine, so large displacements converge.
+export function trackLK(
+  prev: Pyramid,
+  curr: Pyramid,
   pts: Pt[],
-  opts?: { winHalf?: number; iters?: number; tolerance?: number }
+  opts?: {
+    winHalf?: number;
+    iters?: number;
+    tolerance?: number;
+    sadThreshold?: number;
+  }
 ): TrackedPt[] {
   const winHalf = opts?.winHalf ?? 4;
   const maxIters = opts?.iters ?? 12;
   const tol = opts?.tolerance ?? 0.03;
-  const { ix, iy } = computeGradients(prev);
-  const w = prev.width;
-  const h = prev.height;
-  const out: TrackedPt[] = new Array(pts.length);
+  const sadThreshold = opts?.sadThreshold ?? 40;
+  const depth = Math.min(prev.levels.length, curr.levels.length);
 
+  // Precompute prev gradients at every level once per call.
+  const grads = prev.levels
+    .slice(0, depth)
+    .map((g) => computeGradients(g));
+
+  const out: TrackedPt[] = new Array(pts.length);
   for (let i = 0; i < pts.length; i++) {
     const p = pts[i];
-    const px = p.x;
-    const py = p.y;
+    const topScale = 1 << (depth - 1);
+    let cx = p.x / topScale;
+    let cy = p.y / topScale;
+    let found = true;
+    let finalSad = 0;
 
-    // Structure tensor at the prev location (constant across iterations).
-    let gxx = 0;
-    let gyy = 0;
-    let gxy = 0;
-    for (let dy = -winHalf; dy <= winHalf; dy++) {
-      for (let dx = -winHalf; dx <= winHalf; dx++) {
-        const gx = sampleF(ix, w, h, px + dx, py + dy);
-        const gy = sampleF(iy, w, h, px + dx, py + dy);
-        gxx += gx * gx;
-        gyy += gy * gy;
-        gxy += gx * gy;
-      }
-    }
-    const det = gxx * gyy - gxy * gxy;
-    if (det < 1e-4) {
-      out[i] = { x: px, y: py, found: false };
-      continue;
-    }
-    const invDet = 1 / det;
-
-    let cx = px;
-    let cy = py;
-    let ok = true;
-    for (let k = 0; k < maxIters; k++) {
-      let bx = 0;
-      let by = 0;
-      for (let dy = -winHalf; dy <= winHalf; dy++) {
-        for (let dx = -winHalf; dx <= winHalf; dx++) {
-          const it = sample(curr, cx + dx, cy + dy) - sample(prev, px + dx, py + dy);
-          const gx = sampleF(ix, w, h, px + dx, py + dy);
-          const gy = sampleF(iy, w, h, px + dx, py + dy);
-          bx += gx * it;
-          by += gy * it;
-        }
-      }
-      // δv = -G^-1 b, then v += δv.
-      const ux = -invDet * (gyy * bx - gxy * by);
-      const uy = -invDet * (-gxy * bx + gxx * by);
-      cx += ux;
-      cy += uy;
-      if (!Number.isFinite(cx) || !Number.isFinite(cy)) {
-        ok = false;
+    for (let L = depth - 1; L >= 0; L--) {
+      const scale = 1 << L;
+      const anchorX = p.x / scale;
+      const anchorY = p.y / scale;
+      const r = trackPointAtLevel(
+        prev.levels[L],
+        curr.levels[L],
+        grads[L].ix,
+        grads[L].iy,
+        anchorX,
+        anchorY,
+        cx,
+        cy,
+        winHalf,
+        maxIters,
+        tol
+      );
+      cx = r.x;
+      cy = r.y;
+      if (!r.found) {
+        // Return result in full-resolution coords for caller consistency.
+        cx *= scale;
+        cy *= scale;
+        found = false;
         break;
       }
-      if (Math.abs(ux) + Math.abs(uy) < tol) break;
-    }
-
-    if (!ok || cx < 1 || cy < 1 || cx > w - 2 || cy > h - 2) {
-      out[i] = { x: cx, y: cy, found: false };
-      continue;
-    }
-
-    // Reject if appearance drift is huge — catches occlusions.
-    let sad = 0;
-    for (let dy = -winHalf; dy <= winHalf; dy++) {
-      for (let dx = -winHalf; dx <= winHalf; dx++) {
-        sad += Math.abs(sample(curr, cx + dx, cy + dy) - sample(prev, px + dx, py + dy));
+      if (L === 0) finalSad = r.sad;
+      else {
+        cx *= 2;
+        cy *= 2;
       }
     }
-    const avgSad = sad / ((winHalf * 2 + 1) * (winHalf * 2 + 1));
-    out[i] = { x: cx, y: cy, found: avgSad < 40 };
+
+    out[i] = { x: cx, y: cy, found: found && finalSad < sadThreshold };
   }
   return out;
 }
@@ -310,6 +417,19 @@ export function applyTransform(t: Transform, p: Pt): Pt {
   return {
     x: t.a * p.x - t.b * p.y + t.tx,
     y: t.b * p.x + t.a * p.y + t.ty,
+  };
+}
+
+// Returns the similarity equivalent to applying `first`, then `second`:
+//   composeTransforms(first, second)(p) = second(first(p))
+// A similarity is complex multiplication T(p) = c·p + t with c = a + i·b.
+// So c_new = c2·c1 and t_new = c2·t1 + t2.
+export function composeTransforms(first: Transform, second: Transform): Transform {
+  return {
+    a: second.a * first.a - second.b * first.b,
+    b: second.a * first.b + second.b * first.a,
+    tx: second.a * first.tx - second.b * first.ty + second.tx,
+    ty: second.b * first.tx + second.a * first.ty + second.ty,
   };
 }
 

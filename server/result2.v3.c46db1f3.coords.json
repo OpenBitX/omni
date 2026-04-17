@@ -1,0 +1,22 @@
+{
+  "left_eye": [
+    210,
+    160
+  ],
+  "right_eye": [
+    300,
+    160
+  ],
+  "mouth": [
+    255,
+    220
+  ],
+  "subject_bbox": [
+    149,
+    79,
+    420,
+    350
+  ],
+  "eye_width": 60,
+  "mouth_width": 110
+}

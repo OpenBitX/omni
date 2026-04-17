@@ -11,3 +11,7 @@ server/__pycache__/
 server/*.pyc
 # dlib landmarks model — ~100 MB, not suitable for git
 server/shape_predictor_68_face_landmarks.dat
+
+# onnxruntime-web runtime bundle — ~36 MB, copied from node_modules on postinstall
+public/ort/
+

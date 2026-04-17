@@ -1,0 +1,16 @@
+{
+  "left_eye": [
+    227,
+    180
+  ],
+  "right_eye": [
+    284,
+    180
+  ],
+  "mouth": [
+    256,
+    291
+  ],
+  "eye_width": 60,
+  "mouth_width": 148
+}
