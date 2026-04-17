@@ -2,25 +2,16 @@
 
 import OpenAI, { toFile } from "openai";
 
-// Two-model strategy.
+// Single-model strategy: `glm-5v-turbo` for everything. We had briefly split
+// into a DEEP (assess) / FAST (hot-path) pair but the fast model on Zhipu
+// (`glm-4v-flash`) was silently deprecated — probing on 2026-04-18 showed
+// only `glm-4.5v` and `glm-5v-turbo` still responding. Going back to one
+// model keeps the wiring simple; override at will via env.
 //
-//   `GLM_MODEL_DEEP` (glm-5v-turbo): reasoning-style VLM, used for the
-//   one-shot `assessObject` call at tap time. That call picks the best
-//   face-placement point on the crop — it's rare, its quality matters
-//   more than its latency, and the reasoning tokens genuinely help.
-//
-//   `GLM_MODEL_FAST` (glm-4v-flash): a vision-capable model with no
-//   reasoning-spiral overhead. Used for the HOT-PATH calls:
-//   `generateLine` (tap → opening line) and `converseWithObject`
-//   (voice-in → voice-out). Still sees the object crop for character
-//   continuity; just doesn't burn 500 reasoning tokens before it speaks.
-//   Typical latency drops from ~3–5s to ~1–2s, which is the difference
-//   between "lively conversation" and "slideshow".
-//
-// Override with env vars GLM_MODEL_DEEP / GLM_MODEL_FAST if you want to
-// try others (glm-4v-plus, etc.) without a code change.
+// If you see `模型不存在，请检查模型代码` ("model does not exist") again, run
+// `node scripts/test-glm.mjs` to discover which names are currently served.
 const GLM_MODEL_DEEP = process.env.GLM_MODEL_DEEP?.trim() || "glm-5v-turbo";
-const GLM_MODEL_FAST = process.env.GLM_MODEL_FAST?.trim() || "glm-4v-flash";
+const GLM_MODEL_FAST = process.env.GLM_MODEL_FAST?.trim() || "glm-5v-turbo";
 const GLM_TIMEOUT_MS = 90_000;
 const GLM_RETRIES = 2;
 
@@ -167,8 +158,10 @@ async function glmVisionCall(args: {
 }): Promise<string> {
   const client = getGlmClient();
   const model = args.model ?? GLM_MODEL_FAST;
+  const tag = `[glm ${model}]`;
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= GLM_RETRIES + 1; attempt++) {
+    const t0 = Date.now();
     try {
       const userContent: OpenAI.Chat.ChatCompletionContentPart[] = [
         { type: "text", text: args.userText },
@@ -179,6 +172,10 @@ async function glmVisionCall(args: {
           image_url: { url: args.imageDataUrl },
         });
       }
+      // eslint-disable-next-line no-console
+      console.log(
+        `${tag} → call (attempt ${attempt}/${GLM_RETRIES + 1}, image=${args.imageDataUrl ? "yes" : "no"}, max_tokens=${args.maxTokens}, userText="${args.userText.slice(0, 80)}${args.userText.length > 80 ? "…" : ""}")`
+      );
       const resp = await client.chat.completions.create({
         model,
         max_tokens: args.maxTokens,
@@ -188,15 +185,26 @@ async function glmVisionCall(args: {
           { role: "user", content: userContent },
         ],
       });
+      const dt = Date.now() - t0;
       const content = resp.choices[0]?.message?.content ?? "";
+      const usage = resp.usage;
+      // eslint-disable-next-line no-console
+      console.log(
+        `${tag} ← ${dt}ms content=${content.length}ch tokens=${usage?.prompt_tokens ?? "?"}+${usage?.completion_tokens ?? "?"}`
+      );
       if (typeof content !== "string" || !content.trim()) {
         throw new Error("empty response");
       }
       return content;
     } catch (err) {
+      const dt = Date.now() - t0;
       lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      // eslint-disable-next-line no-console
+      console.log(
+        `${tag} ✖ attempt ${attempt} failed after ${dt}ms: ${msg.slice(0, 160)}`
+      );
       if (attempt > GLM_RETRIES) break;
-      // Mild backoff — Zhipu rate-limits on bursts.
       await new Promise((r) => setTimeout(r, 400 * attempt));
     }
   }
@@ -215,6 +223,9 @@ export async function assessObject(
   }
   const tx = clamp01(tapX);
   const ty = clamp01(tapY);
+  const t0 = Date.now();
+  // eslint-disable-next-line no-console
+  console.log(`[assess] ▶ start  tap=(${tx.toFixed(2)},${ty.toFixed(2)})  crop=${Math.round(imageDataUrl.length / 1024)}KB`);
 
   const raw = await glmVisionCall({
     system: ASSESS_SYSTEM,
@@ -261,6 +272,10 @@ export async function assessObject(
     typeof p.reason === "string"
       ? p.reason.replace(/\s+/g, " ").trim().slice(0, 120)
       : "";
+  // eslint-disable-next-line no-console
+  console.log(
+    `[assess] ◀ done   suitable=${suitable}  face=(${cx.toFixed(2)},${cy.toFixed(2)})  reason="${reason}"  total=${Date.now() - t0}ms`
+  );
   return { suitable, cx, cy, bbox, reason };
 }
 
@@ -270,20 +285,30 @@ export async function generateLine(
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
   }
+  const t0 = Date.now();
+  // eslint-disable-next-line no-console
+  console.log(`[generateLine] ▶ start  crop=${Math.round(imageDataUrl.length / 1024)}KB`);
 
   const raw = await glmVisionCall({
     system: FACE_SYSTEM,
     userText: "What does this thing say?",
     imageDataUrl,
-    // glm-4v-flash doesn't reasoning-spiral, so we can tighten the budget.
-    // 120 tokens ≈ 60 words of headroom for a 14-word target.
-    maxTokens: 120,
+    // glm-4.5v IS a reasoning model — it spends ~400–600 tokens on inner
+    // thought before the actual line appears. 1024 leaves plenty of room
+    // for a 14-word answer without truncation.
+    maxTokens: 1024,
     temperature: 0.95,
   });
   const line = extractTextLine(raw);
   if (!line) throw new Error("empty line from model");
+  // eslint-disable-next-line no-console
+  console.log(`[generateLine]   line: "${line}"`);
 
   const tts = await synthesizeSpeech(line);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[generateLine] ◀ done  backend=${tts.backend}  total=${Date.now() - t0}ms`
+  );
   return { line, audioDataUrl: tts.audioDataUrl, backend: tts.backend };
 }
 
@@ -308,7 +333,11 @@ type TtsBackend = "fish" | "openai" | "none";
 // throws on HTTP/content errors so the caller can fall through.
 async function fishTTS(text: string): Promise<Buffer | null> {
   const key = process.env.FISH_API_KEY?.trim();
-  if (!key) return null;
+  if (!key) {
+    // eslint-disable-next-line no-console
+    console.log("[tts fish] — skipping: no FISH_API_KEY");
+    return null;
+  }
 
   const body: Record<string, unknown> = {
     text,
@@ -321,40 +350,61 @@ async function fishTTS(text: string): Promise<Buffer | null> {
   const referenceId = process.env.FISH_REFERENCE_ID?.trim();
   if (referenceId) body.reference_id = referenceId;
 
+  const t0 = Date.now();
+  // eslint-disable-next-line no-console
+  console.log(
+    `[tts fish] → synthesizing ${text.length}ch ref=${referenceId ?? "default"} model=${process.env.FISH_MODEL?.trim() || "s1"}`
+  );
   const resp = await fetch(FISH_TTS_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
-      // Fish's API takes the model as a header (confirmed against their
-      // OpenBitX reference client, which we ported here).
       model: process.env.FISH_MODEL?.trim() || "s1",
     },
     body: JSON.stringify(body),
   });
 
+  const dt = Date.now() - t0;
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
+    // eslint-disable-next-line no-console
+    console.log(`[tts fish] ✖ ${resp.status} in ${dt}ms: ${text.slice(0, 160)}`);
     throw new Error(`fish ${resp.status}: ${text.slice(0, 200)}`);
   }
   const ct = resp.headers.get("content-type") ?? "";
   if (ct.includes("application/json")) {
     const text = await resp.text().catch(() => "");
+    // eslint-disable-next-line no-console
+    console.log(`[tts fish] ✖ non-audio response in ${dt}ms: ${text.slice(0, 160)}`);
     throw new Error(`fish returned non-audio: ${text.slice(0, 200)}`);
   }
-  return Buffer.from(await resp.arrayBuffer());
+  const buf = Buffer.from(await resp.arrayBuffer());
+  // eslint-disable-next-line no-console
+  console.log(`[tts fish] ← ${Math.round(buf.length / 1024)}KB mp3 in ${Date.now() - t0}ms`);
+  return buf;
 }
 
 async function openaiTTS(text: string): Promise<Buffer | null> {
   const openai = getOpenAIClient();
-  if (!openai) return null;
+  if (!openai) {
+    // eslint-disable-next-line no-console
+    console.log("[tts openai] — skipping: no OPENAI_API_KEY");
+    return null;
+  }
+  const t0 = Date.now();
+  // eslint-disable-next-line no-console
+  console.log(`[tts openai] → tts-1/nova synthesizing ${text.length}ch`);
   const speech = await openai.audio.speech.create({
     model: "tts-1",
     voice: "nova",
     input: text,
     response_format: "mp3",
   });
-  return Buffer.from(await speech.arrayBuffer());
+  const buf = Buffer.from(await speech.arrayBuffer());
+  // eslint-disable-next-line no-console
+  console.log(`[tts openai] ← ${Math.round(buf.length / 1024)}KB mp3 in ${Date.now() - t0}ms`);
+  return buf;
 }
 
 async function synthesizeSpeech(
@@ -388,14 +438,14 @@ async function synthesizeSpeech(
     console.warn("[tts] openai failed too:", err);
   }
   // Caption-only mode — the caller should still render the line.
+  // eslint-disable-next-line no-console
+  console.log("[tts] — no backend available, caption-only");
   return { audioDataUrl: null, backend: "none" };
 }
 
 async function transcribeAudio(blob: Blob): Promise<string> {
   const openai = getOpenAIClient();
   if (!openai) throw new Error("whisper needs OPENAI_API_KEY");
-  // toFile handles the Node-vs-Web File interop so OpenAI SDK accepts the
-  // MediaRecorder output uniformly regardless of what Node version we're on.
   const filename =
     blob.type.includes("mp4") ? "talk.mp4" :
     blob.type.includes("ogg") ? "talk.ogg" :
@@ -403,13 +453,23 @@ async function transcribeAudio(blob: Blob): Promise<string> {
   const file = await toFile(blob, filename, {
     type: blob.type || "audio/webm",
   });
+  const t0 = Date.now();
+  // eslint-disable-next-line no-console
+  console.log(
+    `[whisper] → transcribing ${Math.round(blob.size / 1024)}KB (${blob.type || "?"}) as ${filename}`
+  );
   const result = await openai.audio.transcriptions.create({
     file,
     model: "whisper-1",
     // Leaving language unset so non-English speakers still work; pass an
     // explicit language if you want the ~10–30% latency boost.
   });
-  return (result.text ?? "").trim();
+  const text = (result.text ?? "").trim();
+  // eslint-disable-next-line no-console
+  console.log(
+    `[whisper] ← ${Date.now() - t0}ms "${text.slice(0, 120)}${text.length > 120 ? "…" : ""}"`
+  );
+  return text;
 }
 
 const RESPOND_SYSTEM = (className: string) =>
@@ -435,26 +495,36 @@ export type ConverseResult = {
 export async function converseWithObject(
   formData: FormData
 ): Promise<ConverseResult> {
+  const t0 = Date.now();
   const audio = formData.get("audio");
   const className = String(formData.get("className") ?? "thing").slice(0, 60);
   const imageDataUrl = String(formData.get("imageDataUrl") ?? "");
 
   if (!(audio instanceof Blob)) {
+    // eslint-disable-next-line no-console
+    console.log("[converse] ✖ missing audio");
     throw new Error("missing audio");
   }
-  // Very short blobs are almost always accidental button taps. Reject
-  // fast rather than burning a Whisper call.
+  // eslint-disable-next-line no-console
+  console.log(
+    `[converse] ▶ start  class="${className}"  audio=${Math.round(audio.size / 1024)}KB (${audio.type || "?"})  crop=${imageDataUrl ? Math.round(imageDataUrl.length / 1024) + "KB" : "none"}`
+  );
+
   if (audio.size < 1024) {
+    // eslint-disable-next-line no-console
+    console.log(`[converse] ✖ recording too short (${audio.size}B)`);
     throw new Error("recording too short");
   }
   if (audio.size > 10_000_000) {
+    // eslint-disable-next-line no-console
+    console.log(`[converse] ✖ recording too large (${audio.size}B)`);
     throw new Error("recording too large");
   }
 
   const transcript = await transcribeAudio(audio);
   if (!transcript) {
-    // Whisper found nothing meaningful. Return an in-character "didn't
-    // catch that" rather than failing hard.
+    // eslint-disable-next-line no-console
+    console.log(`[converse] ◀ empty transcript — returning "hmm?"  total=${Date.now() - t0}ms`);
     return { transcript: "", reply: "hmm?", audioDataUrl: null, backend: "none" };
   }
 
@@ -462,14 +532,18 @@ export async function converseWithObject(
     system: RESPOND_SYSTEM(className),
     userText: `They said: "${transcript.replace(/"/g, "'")}". Reply in character — one short line.`,
     imageDataUrl: imageDataUrl.startsWith("data:image/") ? imageDataUrl : undefined,
-    // glm-4v-flash skips the reasoning pre-amble; 160 tokens is plenty for
-    // the 22-word target plus a little overhead.
-    maxTokens: 160,
+    maxTokens: 1024,
     temperature: 0.95,
   });
   const reply = extractTextLine(raw);
   if (!reply) throw new Error("empty reply from model");
+  // eslint-disable-next-line no-console
+  console.log(`[converse]   reply: "${reply}"`);
 
   const tts = await synthesizeSpeech(reply);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[converse] ◀ done  backend=${tts.backend}  total=${Date.now() - t0}ms`
+  );
   return { transcript, reply, audioDataUrl: tts.audioDataUrl, backend: tts.backend };
 }
