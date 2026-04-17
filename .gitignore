@@ -15,3 +15,12 @@ server/shape_predictor_68_face_landmarks.dat
 # onnxruntime-web runtime bundle — ~36 MB, copied from node_modules on postinstall
 public/ort/
 
+# Uploaded / debug base images and coord caches under server/ (regenerated on demand)
+server/Screenshot_*.png
+server/*.coords.json
+
+# Large / unused ONNX models — only yolo26n.onnx is tracked
+public/models/rf-detr-nano.onnx
+public/models/yolov8n.onnx
+public/models/yolo26n-seg.onnx
+
