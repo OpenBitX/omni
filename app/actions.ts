@@ -2,11 +2,17 @@
 
 import OpenAI from "openai";
 
-// Vision + line model is Zhipu's GLM-5V-AUTO. TTS stays on OpenAI because
-// GLM doesn't ship a drop-in `tts-1 / nova` equivalent. The app degrades to
+// Vision + line model is Zhipu's GLM-5V-Turbo (same as the server-side
+// Mirror pipeline in server/server.py). TTS stays on OpenAI because GLM
+// doesn't ship a drop-in `tts-1 / nova` equivalent. The app degrades to
 // caption-only (no audio) when `OPENAI_API_KEY` isn't set.
-const GLM_MODEL = "glm-5v-auto";
-const GLM_TIMEOUT_MS = 60_000; // reasoning-style model; give it headroom
+//
+// NOTE: glm-5v-turbo is a reasoning model. It spends a chunk of its
+// completion budget on `reasoning_content` before emitting `content`, so
+// don't cap max_tokens tightly — leave enough headroom that reasoning
+// doesn't crowd out the real answer.
+const GLM_MODEL = "glm-5v-turbo";
+const GLM_TIMEOUT_MS = 90_000; // reasoning-style model; give it headroom
 const GLM_RETRIES = 2;
 
 // bigmodel.cn keys look like `<hex>.<secret>`; api.z.ai keys look like `sk-…`.
@@ -201,7 +207,9 @@ export async function assessObject(
     system: ASSESS_SYSTEM,
     userText: `Tap at (${tx.toFixed(3)}, ${ty.toFixed(3)}). Find the best face placement and commit. Default to suitable=true — only say false for a person or a completely empty/uniform image. Return JSON only.`,
     imageDataUrl,
-    maxTokens: 200,
+    // Reasoning headroom — GLM spends most of its budget on inner thought
+    // before emitting the actual JSON answer.
+    maxTokens: 1536,
     temperature: 0.2,
   });
 
@@ -251,7 +259,9 @@ export async function generateLine(
     system: FACE_SYSTEM,
     userText: "What does this thing say?",
     imageDataUrl,
-    maxTokens: 80,
+    // Reasoning headroom — the actual line is ~14 words but the model
+    // can spend 400+ tokens reasoning about tone, count, and vibe first.
+    maxTokens: 1024,
     temperature: 0.95,
   });
   const line = extractTextLine(raw);
