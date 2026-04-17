@@ -1,0 +1,120 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system,
+    "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", Menlo, monospace;
+
+  --color-paper: #fafaf7;
+  --color-paper-2: #f3f2ee;
+  --color-ink: #0a0a0a;
+  --color-ink-2: #1a1a1a;
+  --color-mute: #6b6b6b;
+  --color-hairline: rgba(10, 10, 10, 0.08);
+  --color-hairline-strong: rgba(10, 10, 10, 0.14);
+  --color-accent: #0a0a0a;
+
+  --radius-frame: 28px;
+  --radius-card: 20px;
+
+  --shadow-frame:
+    0 1px 1px rgba(10, 10, 10, 0.04),
+    0 8px 24px rgba(10, 10, 10, 0.06),
+    0 32px 64px -16px rgba(10, 10, 10, 0.12);
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior: none;
+  font-feature-settings: "ss01", "cv11";
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+input,
+textarea,
+[data-selectable] {
+  user-select: text;
+}
+
+/* Subtle film-grain for the paper shell */
+.paper-grain::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.5;
+  mix-blend-mode: multiply;
+  background-image: radial-gradient(
+      1200px 600px at 20% -10%,
+      rgba(10, 10, 10, 0.04),
+      transparent 60%
+    ),
+    radial-gradient(
+      900px 500px at 110% 110%,
+      rgba(10, 10, 10, 0.035),
+      transparent 60%
+    );
+}
+
+@keyframes breathe {
+  0%, 100% { transform: scale(1); opacity: 0.92; }
+  50% { transform: scale(1.06); opacity: 1; }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.breathe { animation: breathe 2.2s var(--ease-out-expo) infinite; }
+.pulse-dot { animation: pulse-dot 1.2s ease-in-out infinite; }
+.rise { animation: rise 420ms var(--ease-out-expo) both; }
+.fade-in { animation: fade-in 280ms ease-out both; }
+
+.shimmer-track {
+  position: relative;
+  overflow: hidden;
+}
+.shimmer-track::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.55) 50%,
+    transparent 100%
+  );
+  animation: shimmer 1.6s ease-in-out infinite;
+}
+
+/* Hairline separators — crisp on retina */
+.hairline { box-shadow: inset 0 0 0 1px var(--color-hairline); }
+.hairline-b { box-shadow: inset 0 -1px 0 var(--color-hairline); }
+.hairline-t { box-shadow: inset 0 1px 0 var(--color-hairline); }
