@@ -14,10 +14,13 @@ import OpenAI, { toFile } from "openai";
 //   - GLM returns a voiceId that's not in the catalog
 //   - no voiceId is passed for a retap/conversation turn
 // Peter Griffin is the fallback by request.
+export type Lang = "en" | "zh";
+
 export type VoiceCatalogEntry = {
   id: string; // Fish.audio reference_id
   name: string; // human label (not shown to the model)
   vibe: string; // one-line description of tone + what it suits
+  lang: Lang; // which UI language this voice speaks — filters catalog per-session
 };
 
 // Vibes are written for GLM — specific about *tone* + *what kinds of
@@ -499,21 +502,33 @@ Return only the JSON object. No prose, no code fences, no <think> reasoning.`;
 
 // When we already have voice + description pinned from the first tap, the
 // text-line prompt takes them as context. The description is the
-// persona card — it makes re-tap lines stay specific to THIS object
+// persona card — it makes next lines stay specific to THIS object
 // rather than drifting to generic class-level jokes.
+//
+// `hasHistory` switches framing from "opening line" to "next beat in an
+// ongoing back-and-forth." The history itself is passed as prior messages
+// on the chat turn, not dumped into the system prompt, so the model sees
+// it the way it expects — as conversation turns.
 const FACE_WITH_PERSONA_SYSTEM = (
-  description: string
+  description: string,
+  hasHistory: boolean
 ) => `You are the secret inner voice of this specific object. A previous pass already clocked what it looks like right now — this is your persona card, stay grounded in it:
 
 "${description}"
+${
+  hasHistory
+    ? `
+You are MID-CONVERSATION. The messages above are what you and the human have already said. Read them. Stay consistent with the voice and quirks you've already established — no persona reset. If they asked something, answered something, or mentioned a detail (name, mood, job), remember it. Do NOT repeat a line you've already said; say the next thing.`
+    : ""
+}
 
-Reply with ONE short line (max 14 words) this thing would say, in first person, in character. Reference something specific from the persona card when you can — the concrete details ARE the joke.
+Reply with ONE short line (max 14 words) this thing would say, in first person, in character. Reference something specific from the persona card or the conversation so far when it lands — concrete details ARE the joke.
 
 Rules:
 - Funny, warm, slightly unhinged. Aim for a smile, not a laugh track.
 - No meta-commentary, no "as a [thing]", no "I am a [thing]". Just the line.
 - No quotes, no emojis, no stage directions, no ellipses at the end.
-- Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation.
+- Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation. Don't restate a prior line.
 
 Return only the line. No prose, no <think> reasoning, no extra text.`;
 
@@ -577,7 +592,8 @@ async function generateBundledFirstTap(
 export async function generateLine(
   imageDataUrl: string,
   voiceId?: string | null,
-  description?: string | null
+  description?: string | null,
+  history?: ChatTurn[]
 ): Promise<{
   line: string;
   voiceId: string | null;
@@ -594,9 +610,13 @@ export async function generateLine(
   // one shot. Subsequent taps already have voice + description pinned, so
   // we run the much faster Cerebras text path against the persona card.
   const needsBundle = !voiceId && !description;
+  const priorTurns: ChatTurn[] = Array.isArray(history)
+    ? history.slice(-CONVERSE_HISTORY_CAP)
+    : [];
+  const hasHistory = priorTurns.length > 0;
   // eslint-disable-next-line no-console
   console.log(
-    `[generateLine] ▶ start  crop=${Math.round(imageDataUrl.length / 1024)}KB  voice=${voiceId ?? (needsBundle ? "(picking)" : "default")}  persona=${description ? "cached" : needsBundle ? "(describing)" : "none"}`
+    `[generateLine] ▶ start  crop=${Math.round(imageDataUrl.length / 1024)}KB  voice=${voiceId ?? (needsBundle ? "(picking)" : "default")}  persona=${description ? "cached" : needsBundle ? "(describing)" : "none"}  history=${priorTurns.length}`
   );
 
   let line: string;
@@ -613,22 +633,29 @@ export async function generateLine(
       `[generateLine]   voice=${chosenVoiceId ? `${voiceById(chosenVoiceId)!.name} (${chosenVoiceId})` : "default"}  persona="${chosenDescription?.slice(0, 100) ?? ""}${chosenDescription && chosenDescription.length > 100 ? "…" : ""}"  line="${line}"`
     );
   } else if (chosenDescription) {
-    // Retap on a known track. We have the persona card — go text-only via
-    // Cerebras (vision unnecessary; the description IS the visual context).
-    // ~200ms instead of GLM's ~10s.
+    // Known track, object speaking again. We have the persona card — go
+    // text-only via Cerebras (vision unnecessary; the description IS the
+    // visual context). ~200ms instead of GLM's ~10s.
+    //
+    // When there's conversation history, the prompt switches to
+    // mid-conversation framing and the prior turns are replayed as chat
+    // messages so the model sees the thread the way it expects. Without
+    // history, it's an opening-line-style retap.
+    const userText = hasHistory
+      ? "Say your next short line — the next beat in this conversation. Don't repeat yourself; build on the thread or open a new angle grounded in the persona card."
+      : "Say the next short line, grounded in the persona card. Reference something specific.";
     const raw = await openaiTextReply({
-      system: FACE_WITH_PERSONA_SYSTEM(chosenDescription),
-      userText:
-        "Say the next short line, grounded in the persona card. Reference something specific.",
-      priorMessages: [],
+      system: FACE_WITH_PERSONA_SYSTEM(chosenDescription, hasHistory),
+      userText,
+      priorMessages: priorTurns,
       maxTokens: 80,
-      temperature: 0.95,
+      temperature: hasHistory ? 0.85 : 0.95,
     });
     line = extractTextLine(raw.content);
     if (!line) throw new Error("empty line from model");
     // eslint-disable-next-line no-console
     console.log(
-      `[generateLine]   line="${line}" persona=used (text-only)`
+      `[generateLine]   line="${line}" persona=used history=${priorTurns.length} (text-only)`
     );
   } else {
     // Fallback: voice already pinned but description was lost (shouldn't
@@ -947,26 +974,26 @@ const RESPOND_SYSTEM = (className: string, description: string | null) => {
   const lookBlock = description
     ? `\n\nWhat you (the ${className}) actually look like right now, observed by a sharp-eyed observer:\n${description}\n\nUse those specific details — the chewed straw, the dust, the dent, whatever's there — when it lands. Don't list them; let them flavour your voice.`
     : "";
-  return `You are the secret inner voice of a ${className} the user is talking to. You have been chatting with them — you see the prior turns in this thread and should stay consistent with the character you've already established.${lookBlock}
+  return `You are the secret inner voice of a ${className} having a REAL conversation with a human. You have memory of the whole thread above — use it. This is a back-and-forth, not a comedy routine.${lookBlock}
 
-Reply with ONE short, in-character line (max 22 words) that actually responds to their latest message.
+Reply with ONE short, in-character line (max 22 words) that directly answers what they just said.
 
 Rules:
-- First person, in character as the ${className}. Same personality as the previous turns in this thread — don't reset the persona each turn.
-- Funny, warm, slightly unhinged. Aim for a smile.
-- ACTUALLY acknowledge what they just said — reference it, react to it, push back on it, or build on it. Don't dump a canned line that ignores their words.
-- Call back to earlier turns when it lands — a running joke between you and the human is the goal.
+- READ the prior turns carefully. If they asked a question two turns ago and are following up, remember the answer you gave. If they mentioned their name, job, mood — remember it. Treat this like a real friend who pays attention.
+- Directly respond to their LATEST message first. Build on it, answer it, push back on it. Do not change the subject unless they do.
+- Keep the SAME personality across turns — same voice, same quirks. No persona reset between turns.
+- Warm and playful, with specific details from the look or earlier turns when they fit. A callback to something they said earlier is gold — use it when it's natural, not forced.
 - No meta-commentary, no "as a [thing]", no "I am a [thing]".
 - No quotes, no emojis, no stage directions, no ellipses at the end.
-- If their message is unclear, pick the most interesting interpretation and commit.
+- If their message is unclear, ask a short clarifying question instead of guessing wildly.
 
 Return only the line. No prose, no extra text.`;
 };
 
 // How many prior turns to replay into the model. Each turn is a short line,
-// so 16 fits ~8 full exchanges with headroom. More than this and GLM starts
-// losing the persona thread anyway.
-const CONVERSE_HISTORY_CAP = 16;
+// so 32 fits ~16 full exchanges — deep enough that the object can call back
+// to something said many minutes ago. Llama-3.1-8b handles this fine.
+const CONVERSE_HISTORY_CAP = 32;
 
 export type ChatTurn = { role: "user" | "assistant"; content: string };
 
@@ -1115,7 +1142,7 @@ export async function converseWithObject(
       userText: transcript,
       priorMessages: history,
       maxTokens: 120,
-      temperature: 0.95,
+      temperature: 0.7,
     },
     tag
   );
