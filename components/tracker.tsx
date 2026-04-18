@@ -161,22 +161,21 @@ const FACE_NATIVE_PX = FACE_VOICE_WIDTH;
 const FACE_SCALE_MIN = 0.25;
 const FACE_SCALE_MAX = 3.0;
 
+// Voice gain is modulated by how much of the box is still in frame (slides
+// off → gets quieter) and by box size relative to the viewport (fills frame
+// → ULTRA loud). Reference size at which the size-boost equals 1.0, as a
+// fraction of min(videoWidth, videoHeight). Exponent >1 makes the growth
+// super-linear so "it's RIGHT THERE" actually feels louder. Capped so we
+// don't blow the speakers.
+const VOICE_SIZE_REF_FRAC = 0.22;
+const VOICE_SIZE_EXP = 1.6;
+const VOICE_GAIN_MAX = 4.0;
+
 // CSS blend mode applied to the face when it rides inside an object's
 // silhouette. `hard-light` adopts the object's color cast without crushing
 // the face detail the way `multiply` does. Easy to tune — set to `normal`
 // to turn the tint off entirely and just keep the silhouette clip.
 const FACE_BLEND_MODE = "hard-light";
-
-// Minimum eigenvalue ratio before we rotate the face to the object's long
-// axis. Below this the object is roughly round and its "orientation" is
-// quantization noise — a cup at 1.05 doesn't want a tilted face. Bananas,
-// pens, laptops sit well above 2.
-const ORIENTATION_MIN_RATIO = 1.25;
-
-// Low-pass on the per-track rotation angle. PCA output jitters by a few
-// degrees between inferences on non-rigid silhouettes; this smooths it
-// without adding perceptible lag at 3–30 hz inference.
-const ROTATION_EMA_ALPHA = 0.25;
 
 // Classes the app explicitly refuses to put a face on — it's about things,
 // not people. Mirrors the ASSESS_SYSTEM policy upstream.
@@ -470,11 +469,6 @@ type TrackRefs = {
   // (renderBox.cx - maskAnchor.cx) so the silhouette glides with the face
   // during inter-inference extrapolation instead of snapping at inference rate.
   maskAnchor: { cx: number; cy: number } | null;
-  // Face rotation in radians. Target comes from the mask's principal-axis
-  // angle; smoothed by ROTATION_EMA_ALPHA, gated by ORIENTATION_MIN_RATIO
-  // so round objects stay upright. Applied on top of translate+scale in
-  // the render transform so the face tilts with bananas, pens, laptops.
-  rotation: number;
 };
 
 // How long a caption stays on screen after its voice line finishes. Long
@@ -505,9 +499,6 @@ type TrackUI = {
   maskTop: number;
   maskWidth: number;
   maskHeight: number;
-  // Face rotation (radians) piped from TrackRefs. Applied via CSS rotate()
-  // inside the face transform.
-  rotation: number;
 };
 
 // Stream an mp3 response body into a MediaSource SourceBuffer and play it
@@ -519,6 +510,7 @@ async function playViaMediaSource(args: {
   ctx: AudioContext;
   track: TrackRefs;
   trackId: string;
+  turnId: string;
   callGen: number;
   respBody: ReadableStream<Uint8Array>;
   mediaSourceCtor: typeof MediaSource;
@@ -526,11 +518,13 @@ async function playViaMediaSource(args: {
   scheduleCaptionClear: () => void;
   setSpeaking: (on: boolean) => void;
   tStart: number;
+  onFirstSound?: () => void;
 }): Promise<void> {
   const {
     ctx,
     track,
     trackId,
+    turnId,
     callGen,
     respBody,
     mediaSourceCtor,
@@ -538,6 +532,7 @@ async function playViaMediaSource(args: {
     scheduleCaptionClear,
     setSpeaking,
     tStart,
+    onFirstSound,
   } = args;
 
   const mediaSource = new mediaSourceCtor();
@@ -654,7 +649,7 @@ async function playViaMediaSource(args: {
         started = true;
         // eslint-disable-next-line no-console
         console.log(
-          `[stream:${trackId}] first chunk → playing after ${Math.round(performance.now() - tStart)}ms (${value.byteLength}B)`
+          `[tts #${turnId}] ◀ first chunk in ${Math.round(performance.now() - tStart)}ms (${value.byteLength}B) — playing`
         );
         setSpeaking(true);
         try {
@@ -664,9 +659,11 @@ async function playViaMediaSource(args: {
           // recording), but swallow + log just in case.
           // eslint-disable-next-line no-console
           console.log(
-            `[stream:${trackId}] audioEl.play() rejected: ${err instanceof Error ? err.message : String(err)}`
+            `[tts #${turnId}] audioEl.play() rejected: ${err instanceof Error ? err.message : String(err)}`
           );
         }
+        // Fire the press → first-sound summary callback.
+        onFirstSound?.();
       }
     }
     // Signal end-of-stream to MediaSource so the audio element can
@@ -680,12 +677,12 @@ async function playViaMediaSource(args: {
     }
     // eslint-disable-next-line no-console
     console.log(
-      `[stream:${trackId}] done streaming after ${Math.round(performance.now() - tStart)}ms  ended=${endedFired}`
+      `[tts #${turnId}] ✓ stream done in ${Math.round(performance.now() - tStart)}ms ${trackId} ended=${endedFired}`
     );
   } catch (err) {
     // eslint-disable-next-line no-console
     console.log(
-      `[stream:${trackId}] ✖ ${err instanceof Error ? err.message : String(err)}`
+      `[tts #${turnId}] ✖ ${err instanceof Error ? err.message : String(err)} (${trackId})`
     );
     throw err;
   }
@@ -721,6 +718,9 @@ export function Tracker() {
   // user has a clear signal their voice message landed.
   const [heardText, setHeardText] = useState<string | null>(null);
   const heardClearTimerRef = useRef<number | null>(null);
+  // First-run onboarding card. Starts false so SSR markup matches; a client
+  // effect flips it on when localStorage says the user hasn't dismissed it.
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<BlobPart[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -734,6 +734,13 @@ export function Tracker() {
   const speechTranscriptPartsRef = useRef<string[]>([]);
   const speechFinishedRef = useRef<Promise<void> | null>(null);
   const resolveSpeechFinishedRef = useRef<(() => void) | null>(null);
+  // Per-press correlation id + timestamps so we can emit one clean
+  // press-to-first-sound summary per turn that's easy to scan in the
+  // dev console.
+  const turnCounterRef = useRef<number>(0);
+  const turnIdRef = useRef<string>("0");
+  const turnPressAtRef = useRef<number>(0);
+  const turnSrFinishedAtRef = useRef<number>(0);
   const talkAnalyserRef = useRef<AnalyserNode | null>(null);
   const talkFreqDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const talkSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -783,6 +790,28 @@ export function Tracker() {
   // Global tap generation — any tap that triggers async work captures this;
   // if it changes before the async resolves, the result is dropped.
   const generationRef = useRef(0);
+
+  // --- First-run onboarding ---------------------------------------------
+  // Checked once on mount. localStorage key is versioned so we can re-show
+  // it cheaply if the flow changes materially.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem("tracker:onboarded:v1") !== "1") {
+        setShowOnboarding(true);
+      }
+    } catch {
+      setShowOnboarding(true);
+    }
+  }, []);
+
+  const dismissOnboarding = useCallback(() => {
+    setShowOnboarding(false);
+    try {
+      localStorage.setItem("tracker:onboarded:v1", "1");
+    } catch {
+      // private mode / storage disabled — fine, they'll see it again next visit.
+    }
+  }, []);
 
   // --- Camera setup ------------------------------------------------------
   useEffect(() => {
@@ -1126,11 +1155,14 @@ export function Tracker() {
       trackId: string,
       callGen: number,
       text: string,
-      voiceId: string | null
+      voiceId: string | null,
+      turnId?: string,
+      onFirstSound?: () => void
     ): Promise<void> => {
       const ctx = ensureAudioCtx();
       const track = tracksRef.current.find((t) => t.id === trackId);
       if (!ctx || !track) return;
+      const tid = turnId ?? "?";
 
       // Reset lip-sync state for this new reply. Peak calibrates to the
       // incoming stream's actual loudness; without this, a previous loud
@@ -1171,13 +1203,17 @@ export function Tracker() {
       const t0 = performance.now();
       // eslint-disable-next-line no-console
       console.log(
-        `[stream:${trackId}] → /api/tts/stream text=${text.length}ch voice=${voiceId ?? "default"}`
+        `[tts #${tid}] → /api/tts/stream text=${text.length}ch voice=${voiceId ?? "default"}`
       );
 
       const resp = await fetch("/api/tts/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, voiceId: voiceId ?? "" }),
+        body: JSON.stringify({
+          text,
+          voiceId: voiceId ?? "",
+          turnId: tid,
+        }),
       });
       if (callGen !== track.speakGen) {
         // Retap while we were awaiting headers — drop.
@@ -1198,7 +1234,7 @@ export function Tracker() {
       );
       // eslint-disable-next-line no-console
       console.log(
-        `[stream:${trackId}] headers in ${Math.round(performance.now() - t0)}ms backend=${backend}`
+        `[tts #${tid}] ◀ headers in ${Math.round(performance.now() - t0)}ms backend=${backend}`
       );
 
       const mediaSourceCtor: typeof MediaSource | null =
@@ -1213,6 +1249,7 @@ export function Tracker() {
           ctx,
           track,
           trackId,
+          turnId: tid,
           callGen,
           respBody: resp.body,
           mediaSourceCtor,
@@ -1225,6 +1262,7 @@ export function Tracker() {
               )
             ),
           tStart: t0,
+          onFirstSound,
         });
       } else {
         // Fallback: buffer the whole mp3, decode, play via AudioBufferSource.
@@ -1232,7 +1270,7 @@ export function Tracker() {
         // browsers without MediaSource (older iOS, etc.).
         // eslint-disable-next-line no-console
         console.log(
-          `[stream:${trackId}] MediaSource unavailable — buffering full mp3 as fallback`
+          `[tts #${tid}] MediaSource unavailable — buffering full mp3 as fallback`
         );
         const buf = await resp.arrayBuffer();
         if (callGen !== track.speakGen) return;
@@ -1258,6 +1296,8 @@ export function Tracker() {
           prev.map((t) => (t.id === trackId ? { ...t, speaking: true } : t))
         );
         source.start();
+        // Fallback path still counts as "first sound" once playback begins.
+        onFirstSound?.();
       }
     },
     [ensureAudioCtx]
@@ -1528,9 +1568,20 @@ export function Tracker() {
         const target = t.missedFrames >= LOST_AFTER_MISSES ? 0 : 1;
         t.opacity = lerp(t.opacity, target, OPACITY_EMA_ALPHA);
         // Voice rides with the face — disembodied audio when the face has
-        // faded out feels haunted. Direct .value assignment is fine at 60Hz
-        // for the small per-frame steps the lerp produces.
-        if (t.gain) t.gain.gain.value = t.opacity;
+        // faded out feels haunted. Layered on top: visible-area fraction
+        // (slides off frame → voice drops off), and super-linear size
+        // boost (fills the frame → ULTRA loud). Capped at VOICE_GAIN_MAX.
+        if (t.gain) {
+          const b = t.smoothedBox;
+          const visW = Math.max(0, Math.min(b.x2, v.videoWidth) - Math.max(b.x1, 0));
+          const visH = Math.max(0, Math.min(b.y2, v.videoHeight) - Math.max(b.y1, 0));
+          const visibleFrac = b.w > 0 && b.h > 0 ? (visW * visH) / (b.w * b.h) : 0;
+          const refPx = VOICE_SIZE_REF_FRAC * Math.min(v.videoWidth, v.videoHeight);
+          const sizeFrac = refPx > 0 ? Math.min(b.w, b.h) / refPx : 1;
+          const sizeBoost = Math.pow(Math.max(sizeFrac, 0.05), VOICE_SIZE_EXP);
+          const g = t.opacity * visibleFrac * sizeBoost;
+          t.gain.gain.value = Math.max(0, Math.min(g, VOICE_GAIN_MAX));
+        }
       }
 
       // (3) Per-track mouth-shape classification. Gate on either audio
@@ -1603,7 +1654,6 @@ export function Tracker() {
           );
           const opacity = t.opacity;
           const shape = t.shape;
-          const rotation = t.rotation;
 
           // Project the silhouette clip into element space, offset by how
           // far the tracker thinks the object has moved since the mask was
@@ -1645,8 +1695,7 @@ export function Tracker() {
             ui.maskLeft === maskLeft &&
             ui.maskTop === maskTop &&
             ui.maskWidth === maskWidth &&
-            ui.maskHeight === maskHeight &&
-            ui.rotation === rotation
+            ui.maskHeight === maskHeight
           ) {
             return ui;
           }
@@ -1663,7 +1712,6 @@ export function Tracker() {
             maskTop,
             maskWidth,
             maskHeight,
-            rotation,
           };
         });
         return changed ? next : prev;
@@ -1788,20 +1836,15 @@ export function Tracker() {
               }
             }
 
-            // Orientation — rotate the face along the object's long axis
-            // when the silhouette is comfortably elongated. Below the
-            // ratio threshold, target 0 so round objects (cups, balls)
-            // stay upright instead of drifting with PCA noise. Principal
-            // axis is 180° ambiguous — wrap delta to ±π/2 before the EMA
-            // so we don't spin the long way around when the axis flips.
-            const axisRatio = match.axisRatio ?? 0;
-            const rawAngle = match.principalAngle ?? 0;
-            const targetAngle =
-              axisRatio >= ORIENTATION_MIN_RATIO ? rawAngle : 0;
-            let delta = targetAngle - t.rotation;
-            while (delta > Math.PI / 2) delta -= Math.PI;
-            while (delta < -Math.PI / 2) delta += Math.PI;
-            t.rotation += delta * ROTATION_EMA_ALPHA;
+            // Face anchor stays at the smoothed box center ({rx:0, ry:0}).
+            // The box center already uses the mask centroid (mean pixel
+            // position), which is stable for both square and elongated
+            // silhouettes. An earlier version anchored to the "pole of
+            // inaccessibility" and rotated the face to the object's
+            // principal axis, but on vertical-long silhouettes PCA landed
+            // at ~90° so the face sat sideways — eyes/mouth fell outside
+            // the narrow mask clip and looked random. The speech bubble's
+            // simple centered attachment is what we want here.
           }
         } else {
           t.missedFrames++;
@@ -1870,10 +1913,18 @@ export function Tracker() {
   // so lips sync) but routes through the converseWithObject server action
   // instead of the one-shot generateLine.
   const sendTalkToTrack = useCallback(
-    async (trackId: string, blob: Blob, clientTranscript?: string) => {
+    async (
+      trackId: string,
+      blob: Blob,
+      clientTranscript?: string,
+      turnId?: string
+    ) => {
       const ctx = ensureAudioCtx();
       const track = tracksRef.current.find((t) => t.id === trackId);
       if (!ctx || !track) return;
+      // Tag every log line for this turn with the press-incremented id so
+      // the dev console can be filtered to one user interaction at a time.
+      const tid = turnId ?? "?";
 
       const callGen = ++track.speakGen;
 
@@ -1908,6 +1959,7 @@ export function Tracker() {
               : "talk.webm";
         formData.append("audio", blob, filename);
         formData.append("className", track.className);
+        formData.append("turnId", tid);
         if (track.voiceId) formData.append("voiceId", track.voiceId);
         // Rich visual notes hydrated in the background by describeObject.
         // This is what lets converseWithObject stay text-only on the hot
@@ -1928,16 +1980,13 @@ export function Tracker() {
           JSON.stringify(track.history.slice(-16))
         );
 
-        // eslint-disable-next-line no-console
-        console.log(
-          `[talk:${trackId}] → converseWithObject  class="${track.className}"  audio=${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  voice=${track.voiceId ?? "default"}  history=${track.history.length}  desc=${track.description ? track.description.length + "ch" : "none"}  client-stt=${trimmedTranscript ? trimmedTranscript.length + "ch" : "no"}`
-        );
         const t0 = performance.now();
         const { transcript, reply, voiceId: replyVoiceId } =
           await converseWithObject(formData);
+        const converseMs = Math.round(performance.now() - t0);
         if (callGen !== track.speakGen) {
           // eslint-disable-next-line no-console
-          console.log(`[talk:${trackId}] ← superseded (speakGen mismatch)`);
+          console.log(`[converse #${tid}] ✗ superseded (speakGen mismatch)`);
           return;
         }
         // Commit the exchange to this track's memory so future turns see
@@ -1950,7 +1999,7 @@ export function Tracker() {
         track.history = nextHistory.slice(-16);
         // eslint-disable-next-line no-console
         console.log(
-          `[talk:${trackId}] ← ${Math.round(performance.now() - t0)}ms  heard="${transcript}"  reply="${reply}"  history=${track.history.length}`
+          `[converse #${tid}] ◀ client-roundtrip=${converseMs}ms  heard="${transcript.slice(0, 60)}${transcript.length > 60 ? "…" : ""}"  reply="${reply.slice(0, 60)}${reply.length > 60 ? "…" : ""}"`
         );
 
         // Fire-and-forget: refresh the description off a fresh crop so the
@@ -1984,7 +2033,29 @@ export function Tracker() {
         // Kick off the streaming TTS — bytes start flowing into the audio
         // element as Fish generates them. No base64 round-trip, no "wait
         // for full mp3" gap between LLM done and mouth moving.
-        await playStreamingReply(trackId, callGen, reply, replyVoiceId ?? track.voiceId);
+        const ttsT0 = performance.now();
+        await playStreamingReply(
+          trackId,
+          callGen,
+          reply,
+          replyVoiceId ?? track.voiceId,
+          tid,
+          () => {
+            // First audio chunk has been queued — user hears sound now.
+            const firstSoundAt = performance.now();
+            const ttsTtfb = Math.round(firstSoundAt - ttsT0);
+            const press = turnPressAtRef.current;
+            const sr = turnSrFinishedAtRef.current;
+            const totalMs = press ? Math.round(firstSoundAt - press) : -1;
+            const srMs = press && sr ? Math.round(sr - press) : -1;
+            // eslint-disable-next-line no-console
+            console.log(
+              `[turn #${tid}] ◀ FIRST SOUND in ${totalMs}ms  ━  ${
+                srMs >= 0 ? `sr=${srMs}ms` : "sr=server-fallback"
+              } ▸ converse=${converseMs}ms ▸ tts-ttfb=${ttsTtfb}ms`
+            );
+          }
+        );
       } catch (e) {
         if (callGen !== track.speakGen) return;
         const msg = e instanceof Error ? e.message : "talk failed";
@@ -2223,7 +2294,6 @@ export function Tracker() {
         maskDataUrl: null,
         maskSrcBox: null,
         maskAnchor: null,
-        rotation: 0,
       };
 
       // LRU eviction when the slots are full.
@@ -2299,7 +2369,6 @@ export function Tracker() {
           maskTop: 0,
           maskWidth: 0,
           maskHeight: 0,
-          rotation: 0,
         },
       ]);
 
@@ -2360,8 +2429,14 @@ export function Tracker() {
 
   const startRecording = useCallback(async () => {
     if (recorderRef.current && recorderRef.current.state === "recording") return;
+    // Bump per-press correlation id so all logs for this turn share a tag.
+    turnCounterRef.current += 1;
+    turnIdRef.current = String(turnCounterRef.current);
+    turnPressAtRef.current = performance.now();
+    turnSrFinishedAtRef.current = 0;
+    const turnId = turnIdRef.current;
     // eslint-disable-next-line no-console
-    console.log("[mic] ▶ start recording");
+    console.log(`[turn #${turnId}] ▶ press`);
     const ctx = ensureAudioCtx();
     const stream = await openMicStream();
     if (!stream) {
@@ -2402,7 +2477,7 @@ export function Tracker() {
       recordedBlobRef.current = blob;
       // eslint-disable-next-line no-console
       console.log(
-        `[tracker] captured ${Math.round(blob.size / 1024)} KB of audio (${blob.type})`
+        `[mic #${turnIdRef.current}] ◼ captured ${Math.round(blob.size / 1024)}KB ${blob.type}`
       );
 
       // The voice-in, voice-out loop — send the blob to whichever face is
@@ -2430,6 +2505,7 @@ export function Tracker() {
       // can pass its transcript through and skip the server STT roundtrip
       // entirely. Cap at 500ms — if SR is slower than that something is
       // off and the server fallback will still produce a transcript.
+      const turnId = turnIdRef.current;
       void (async () => {
         const finished = speechFinishedRef.current;
         if (finished) {
@@ -2443,11 +2519,17 @@ export function Tracker() {
           .replace(/\s+/g, " ")
           .trim();
         speechTranscriptPartsRef.current = [];
+        // SR latency = sr.onend timestamp - press timestamp (or now if sr
+        // never fired, which means we'll fall back to server STT).
+        const srMs =
+          turnSrFinishedAtRef.current && turnPressAtRef.current
+            ? Math.round(turnSrFinishedAtRef.current - turnPressAtRef.current)
+            : -1;
         // eslint-disable-next-line no-console
         console.log(
-          `[sr] → handing off transcript (${transcript ? transcript.length + "ch" : "empty"}) to converseWithObject`
+          `[sr #${turnId}] → handoff  transcript=${transcript ? `"${transcript.slice(0, 80)}${transcript.length > 80 ? "…" : ""}" (${transcript.length}ch)` : "empty"}  ${srMs >= 0 ? `srMs=${srMs}` : "fallback-server"}`
         );
-        await sendTalkToTrack(target.id, blob, transcript);
+        await sendTalkToTrack(target.id, blob, transcript, turnId);
       })();
     };
 
@@ -2469,18 +2551,38 @@ export function Tracker() {
         speechFinishedRef.current = new Promise<void>((resolve) => {
           resolveSpeechFinishedRef.current = resolve;
         });
+        // Cancel any pending clear-timer from the previous turn so it can't
+        // wipe the live interim text mid-speech.
+        if (heardClearTimerRef.current != null) {
+          clearTimeout(heardClearTimerRef.current);
+          heardClearTimerRef.current = null;
+        }
+        setHeardText(null);
         const sr = new SR();
         sr.lang = "en-US";
         sr.continuous = true;
-        sr.interimResults = false;
+        // Stream partials as the user speaks so the "you said" bubble updates
+        // live. Final chunks still land in speechTranscriptPartsRef for the
+        // server handoff; Whisper's authoritative result overwrites at end.
+        sr.interimResults = true;
         sr.maxAlternatives = 1;
         sr.onresult = (e) => {
+          let interim = "";
           for (let i = e.resultIndex; i < e.results.length; i++) {
             const r = e.results[i];
-            if (r.isFinal && r[0]?.transcript) {
-              speechTranscriptPartsRef.current.push(r[0].transcript);
+            const t = r[0]?.transcript;
+            if (!t) continue;
+            if (r.isFinal) {
+              speechTranscriptPartsRef.current.push(t);
+            } else {
+              interim += t;
             }
           }
+          const live = (
+            speechTranscriptPartsRef.current.join(" ") +
+            (interim ? " " + interim : "")
+          ).trim();
+          if (live) setHeardText(live);
         };
         sr.onerror = (ev) => {
           // eslint-disable-next-line no-console
@@ -2489,9 +2591,10 @@ export function Tracker() {
           );
         };
         sr.onend = () => {
+          turnSrFinishedAtRef.current = performance.now();
           // eslint-disable-next-line no-console
           console.log(
-            `[sr] ◼ ended  parts=${speechTranscriptPartsRef.current.length}`
+            `[sr #${turnIdRef.current}] ◼ ended  parts=${speechTranscriptPartsRef.current.length}`
           );
           resolveSpeechFinishedRef.current?.();
           resolveSpeechFinishedRef.current = null;
@@ -2500,7 +2603,7 @@ export function Tracker() {
         sr.start();
         speechRecognitionRef.current = sr;
         // eslint-disable-next-line no-console
-        console.log("[sr] ▶ started (browser-side transcription)");
+        console.log(`[sr #${turnIdRef.current}] ▶ started`);
       } catch (err) {
         // eslint-disable-next-line no-console
         console.log(
@@ -2690,21 +2793,42 @@ export function Tracker() {
         // unclipped float so the face appears instantly on tap instead of
         // waiting for YOLO.
         const clipped = t.maskDataUrl && t.maskWidth > 0 && t.maskHeight > 0;
+        // Pad the wrapper well beyond the silhouette's bbox. `mask-image`
+        // with `mask-repeat: no-repeat` gives alpha 0 outside its declared
+        // area, so any face pixel that renders past the wrapper's box
+        // disappears. When the pole of inaccessibility sits near a
+        // silhouette edge (crescents, handles, thin shapes), the face
+        // naturally overhangs the bbox — without this pad, chunks of the
+        // face randomly vanish. Pad scales with the face's CSS footprint.
+        const pad = clipped
+          ? Math.max(FACE_VOICE_WIDTH, FACE_VOICE_HEIGHT) * t.scale
+          : 0;
+        const wrapLeft = t.maskLeft - pad;
+        const wrapTop = t.maskTop - pad;
+        const wrapWidth = t.maskWidth + pad * 2;
+        const wrapHeight = t.maskHeight + pad * 2;
         return (
           <div key={t.id}>
             {clipped ? (
               <div
                 className="pointer-events-none absolute will-change-transform"
                 style={{
-                  left: t.maskLeft,
-                  top: t.maskTop,
-                  width: t.maskWidth,
-                  height: t.maskHeight,
+                  left: wrapLeft,
+                  top: wrapTop,
+                  width: wrapWidth,
+                  height: wrapHeight,
+                  // Pin the silhouette into its ORIGINAL rect inside the
+                  // padded wrapper — mask-size in px, mask-position offset
+                  // by `pad`. Pixels in the padding have mask alpha 0 so
+                  // they read as invisible, but they exist as a buffer so
+                  // face overhang doesn't get clipped to nothing.
                   WebkitMaskImage: `url(${t.maskDataUrl})`,
-                  WebkitMaskSize: "100% 100%",
+                  WebkitMaskSize: `${t.maskWidth}px ${t.maskHeight}px`,
+                  WebkitMaskPosition: `${pad}px ${pad}px`,
                   WebkitMaskRepeat: "no-repeat",
                   maskImage: `url(${t.maskDataUrl})`,
-                  maskSize: "100% 100%",
+                  maskSize: `${t.maskWidth}px ${t.maskHeight}px`,
+                  maskPosition: `${pad}px ${pad}px`,
                   maskRepeat: "no-repeat",
                   mixBlendMode: FACE_BLEND_MODE,
                   // drop-shadow projects OUTSIDE the mask silhouette — mixed
@@ -2716,16 +2840,14 @@ export function Tracker() {
                 }}
               >
                 {/* Inner: face positioned at its anchor in element coords,
-                    expressed relative to the mask wrapper's origin. Rotation
-                    (driven by the object's PCA principal angle) goes between
-                    centering and scale so the pivot stays at the anchor. */}
+                    expressed relative to the padded wrapper's origin. */}
                 <div
                   style={{
                     position: "absolute",
-                    left: t.left - t.maskLeft,
-                    top: t.top - t.maskTop,
+                    left: t.left - wrapLeft,
+                    top: t.top - wrapTop,
                     transformOrigin: "0 0",
-                    transform: `translate(-50%, -50%) rotate(${t.rotation}rad) scale(${t.scale})`,
+                    transform: `translate(-50%, -50%) scale(${t.scale})`,
                   }}
                 >
                   <FaceVoice shape={t.shape} />
@@ -2736,7 +2858,7 @@ export function Tracker() {
                 className="pointer-events-none absolute left-0 top-0 will-change-transform"
                 style={{
                   transformOrigin: "0 0",
-                  transform: `translate(${t.left}px, ${t.top}px) translate(-50%, -50%) rotate(${t.rotation}rad) scale(${t.scale})`,
+                  transform: `translate(${t.left}px, ${t.top}px) translate(-50%, -50%) scale(${t.scale})`,
                   opacity: t.opacity,
                 }}
               >
@@ -3020,19 +3142,38 @@ export function Tracker() {
         </div>
       )}
 
-      {/* Ready-state centered hint. */}
-      {phase === "ready" && !errorMsg && (
+      {/* First-run onboarding card. Shown once, then dismissed via
+          localStorage. Replaces the old persistent "tap anything" hint. */}
+      {phase === "ready" && !errorMsg && showOnboarding && (
         <div
-          className="pointer-events-none absolute inset-0 grid place-items-center"
-          style={{ animation: "fade-in 500ms ease-out both" }}
+          className="absolute inset-0 z-20 grid place-items-center px-6"
+          style={{ animation: "fade-in 280ms ease-out both" }}
         >
-          <div className="flex flex-col items-center gap-3">
-            <span className="bubble-btn grid h-16 w-16 place-items-center rounded-full bg-white/15 ring-1 ring-white/30 backdrop-blur-xl">
-              <span className="h-3 w-3 rounded-full bg-white/90" />
+          <div
+            className="absolute inset-0 bg-black/30 backdrop-blur-[2px]"
+            onClick={dismissOnboarding}
+          />
+          <div
+            className="relative flex max-w-[20rem] flex-col items-center gap-4 rounded-[28px] bg-white/95 px-7 pt-7 pb-5 text-center shadow-[0_30px_80px_-20px_rgba(236,72,153,0.5)] ring-1 ring-white/80 backdrop-blur-xl"
+            style={{ animation: "bubble-in 460ms cubic-bezier(0.16,1,0.3,1) both" }}
+          >
+            <span className="bubble-btn grid h-16 w-16 place-items-center rounded-full bg-gradient-to-br from-pink-200 to-rose-300 ring-1 ring-white">
+              <span className="h-3 w-3 rounded-full bg-white" />
             </span>
-            <span className="serif-italic rounded-full bg-black/25 px-4 py-1.5 text-[13px] font-medium text-white/90 ring-1 ring-white/15 backdrop-blur-xl">
-              tap anything — up to {MAX_FACES} at once
-            </span>
+            <div className="flex flex-col gap-1">
+              <span className="serif-italic text-[20px] font-semibold leading-tight text-[color:var(--ink)]">
+                hi — tap anything
+              </span>
+              <span className="text-[13px] leading-snug text-[color:var(--ink)]/70">
+                give it a face, hear it talk. up to {MAX_FACES} at once.
+              </span>
+            </div>
+            <button
+              onClick={dismissOnboarding}
+              className="mt-1 rounded-full bg-gradient-to-r from-pink-400 to-rose-400 px-6 py-2 text-[13px] font-semibold text-white shadow-[0_10px_24px_-10px_rgba(236,72,153,0.7)] ring-1 ring-white/40 transition hover:brightness-105 active:scale-[0.97]"
+            >
+              ok, got it
+            </button>
           </div>
         </div>
       )}

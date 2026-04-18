@@ -24,6 +24,7 @@ const OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech";
 type TtsBody = {
   text?: unknown;
   voiceId?: unknown;
+  turnId?: unknown;
 };
 
 export async function POST(req: Request) {
@@ -37,6 +38,13 @@ export async function POST(req: Request) {
     typeof payload.text === "string" ? payload.text.trim().slice(0, 600) : "";
   const voiceId =
     typeof payload.voiceId === "string" ? payload.voiceId.trim() : "";
+  // Turn id from the client — same correlation id used in [converse #N]
+  // logs so you can grep one full press-to-sound flow out of the log.
+  const turnId =
+    typeof payload.turnId === "string"
+      ? payload.turnId.trim().slice(0, 16) || "?"
+      : "?";
+  const tag = ` #${turnId}`;
   if (!text) {
     return NextResponse.json({ error: "missing text" }, { status: 400 });
   }
@@ -59,7 +67,7 @@ export async function POST(req: Request) {
     const t0 = Date.now();
     // eslint-disable-next-line no-console
     console.log(
-      `[tts-stream fish] → text=${text.length}ch voice=${voiceId || "default"}`
+      `[tts fish${tag}] → text=${text.length}ch voice=${voiceId || "default"}`
     );
     const fishRes = await fetch(FISH_TTS_URL, {
       method: "POST",
@@ -74,7 +82,7 @@ export async function POST(req: Request) {
     if (fishRes.ok && fishRes.body && !ct.includes("application/json")) {
       // eslint-disable-next-line no-console
       console.log(
-        `[tts-stream fish] ← streaming bytes (first headers in ${Date.now() - t0}ms, content-type=${ct})`
+        `[tts fish${tag}] ✓ ttfb=${Date.now() - t0}ms streaming audio/mpeg`
       );
       return new Response(fishRes.body, {
         status: 200,
@@ -90,7 +98,7 @@ export async function POST(req: Request) {
     const err = await fishRes.text().catch(() => "");
     // eslint-disable-next-line no-console
     console.log(
-      `[tts-stream fish] ✖ ${fishRes.status} in ${Date.now() - t0}ms: ${err.slice(0, 160)} — falling through`
+      `[tts fish${tag}] ✖ ${fishRes.status} in ${Date.now() - t0}ms: ${err.slice(0, 160)} — falling through`
     );
   }
 
@@ -98,7 +106,7 @@ export async function POST(req: Request) {
   if (openaiKey) {
     const t0 = Date.now();
     // eslint-disable-next-line no-console
-    console.log(`[tts-stream openai] → text=${text.length}ch`);
+    console.log(`[tts openai${tag}] → text=${text.length}ch`);
     const oaRes = await fetch(OPENAI_TTS_URL, {
       method: "POST",
       headers: {
@@ -115,7 +123,7 @@ export async function POST(req: Request) {
     if (oaRes.ok && oaRes.body) {
       // eslint-disable-next-line no-console
       console.log(
-        `[tts-stream openai] ← streaming bytes (first headers in ${Date.now() - t0}ms)`
+        `[tts openai${tag}] ✓ ttfb=${Date.now() - t0}ms streaming audio/mpeg`
       );
       return new Response(oaRes.body, {
         status: 200,
@@ -130,7 +138,7 @@ export async function POST(req: Request) {
     const err = await oaRes.text().catch(() => "");
     // eslint-disable-next-line no-console
     console.log(
-      `[tts-stream openai] ✖ ${oaRes.status} in ${Date.now() - t0}ms: ${err.slice(0, 160)}`
+      `[tts openai${tag}] ✖ ${oaRes.status} in ${Date.now() - t0}ms: ${err.slice(0, 160)}`
     );
   }
 

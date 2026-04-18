@@ -142,19 +142,34 @@ export function classifyShape(
 function extractFeatures(
   timeBuf: Uint8Array<ArrayBuffer>,
   freqBuf: Uint8Array<ArrayBuffer>
-): { rms: number; centroid: number; midEnergy: number } {
-  // RMS over normalized time-domain samples.
+): {
+  rms: number;
+  centroid: number;
+  midEnergy: number;
+  highEnergy: number;
+  zcr: number;
+} {
+  // RMS + zero-crossing rate over normalized time-domain samples. ZCR
+  // spikes during fricatives (F/V/S/SH) — used below to separate the
+  // labiodental "G" shape from plain bright vowels.
   let s = 0;
+  let zc = 0;
+  let prev = timeBuf[0] - 128;
   for (let i = 0; i < timeBuf.length; i++) {
     const v = (timeBuf[i] - 128) / 128;
     s += v * v;
+    const cur = timeBuf[i] - 128;
+    if ((cur >= 0) !== (prev >= 0)) zc++;
+    prev = cur;
   }
   const rms = Math.sqrt(s / timeBuf.length);
+  const zcr = zc / timeBuf.length;
 
-  // Spectral centroid + mid-band energy fraction.
+  // Spectral centroid + mid-band + high-band energy fractions.
   let total = 0;
   let weighted = 0;
   let mids = 0;
+  let highs = 0;
   const loMid = freqBuf.length * 0.2;
   const hiMid = freqBuf.length * 0.5;
   for (let i = 0; i < freqBuf.length; i++) {
@@ -162,10 +177,12 @@ function extractFeatures(
     total += m;
     weighted += m * i;
     if (i > loMid && i < hiMid) mids += m;
+    if (i >= hiMid) highs += m;
   }
   const centroid = total > 0 ? weighted / total / freqBuf.length : 0;
   const midEnergy = total > 0 ? mids / total : 0;
-  return { rms, centroid, midEnergy };
+  const highEnergy = total > 0 ? highs / total : 0;
+  return { rms, centroid, midEnergy, highEnergy, zcr };
 }
 
 // Per-track state held across RAF frames. One instance per talking face.
@@ -176,6 +193,8 @@ export type LipSyncState = {
   envelope: number;    // Asymmetric-follower RMS envelope (fast attack / slow release)
   centroid: number;    // EMA-smoothed spectral centroid
   midEnergy: number;   // EMA-smoothed mid-band energy fraction
+  highEnergy: number;  // EMA-smoothed high-band fraction — fricative detector
+  zcr: number;         // EMA-smoothed zero-crossing rate — fricative confirm
   peak: number;        // Rolling peak of envelope — used to normalize openness
   prevShape: MouthShape;
   heldFrames: number;  // Frames we've been on prevShape
@@ -186,6 +205,8 @@ export function createLipSyncState(): LipSyncState {
     envelope: 0,
     centroid: 0,
     midEnergy: 0,
+    highEnergy: 0,
+    zcr: 0,
     peak: 0,
     prevShape: "X",
     heldFrames: 0,
@@ -213,13 +234,18 @@ export function classifyShapeSmooth(
   timeBuf: Uint8Array<ArrayBuffer>,
   freqBuf: Uint8Array<ArrayBuffer>
 ): MouthShape {
-  const { rms, centroid, midEnergy } = extractFeatures(timeBuf, freqBuf);
+  const { rms, centroid, midEnergy, highEnergy, zcr } = extractFeatures(
+    timeBuf,
+    freqBuf
+  );
 
   // Asymmetric envelope follower on instantaneous RMS.
   const a = rms > state.envelope ? ENV_ATTACK : ENV_RELEASE;
   state.envelope = state.envelope + a * (rms - state.envelope);
   state.centroid = state.centroid + SPECTRAL_ALPHA * (centroid - state.centroid);
   state.midEnergy = state.midEnergy + SPECTRAL_ALPHA * (midEnergy - state.midEnergy);
+  state.highEnergy = state.highEnergy + SPECTRAL_ALPHA * (highEnergy - state.highEnergy);
+  state.zcr = state.zcr + SPECTRAL_ALPHA * (zcr - state.zcr);
 
   // Adaptive peak. Fast up, slow down, clamped to a floor so we don't
   // amplify DC/background noise into a wide-open mouth during silence.
@@ -232,19 +258,37 @@ export function classifyShapeSmooth(
   // Normalized openness in [0, 1].
   const openness = Math.min(1, state.envelope / Math.max(state.peak, PEAK_FLOOR));
 
+  // Fricative/labiodental detector: quiet-ish, high-frequency-dominant,
+  // high zero-crossing rate. F/V/TH-like sounds. Maps to the `G` atlas
+  // (upper teeth on lower lip). Gate before the plain centroid branches
+  // so we don't steal every bright vowel.
+  const isFricative =
+    openness < 0.55 &&
+    state.highEnergy > 0.32 &&
+    state.centroid > 0.45 &&
+    state.zcr > 0.12;
+
   let next: MouthShape;
   if (state.envelope < SILENCE_ENV) {
     next = "X";
   } else if (openness < 0.2) {
     next = "A";
+  } else if (isFricative) {
+    // F/V labiodental — teeth-on-lip posture.
+    next = "G";
   } else if (state.centroid > 0.5) {
-    // Bright / front vowels + fricatives — wide but not tall.
+    // Bright / front vowels — wide but not tall.
     next = openness > 0.65 ? "C" : "B";
   } else if (state.centroid < 0.28) {
     // Dark / back vowels — rounded, tall.
     next = openness > 0.7 ? "D" : "F";
   } else if (state.midEnergy > 0.48) {
+    // Mid-frequency, rounded vowel — "oh"-like.
     next = "E";
+  } else if (openness > 0.35 && openness < 0.7) {
+    // Mid-centroid, moderate openness, not clearly E — L-lateral /
+    // half-open transitional vowels. Maps to the `H` atlas.
+    next = "H";
   } else {
     next = openness > 0.75 ? "D" : "C";
   }
