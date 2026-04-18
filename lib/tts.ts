@@ -1,18 +1,19 @@
-// Shared TTS provider ladder used by both `/api/tts/stream` and the
-// combined `/api/speak` route. Lifted out of the route handler so the
-// speak endpoint can fire Cartesia the instant the VLM returns instead
-// of paying a second client→server round-trip.
+// Cartesia-only TTS passthrough used by `/api/tts/stream` and the
+// combined `/api/speak` route.
 //
-// Ladder: Cartesia Sonic → Fish → OpenAI tts-1/nova → null (caller 503s).
-// Whoever responds first wins; behavior is identical to the previous
-// inlined version.
+// No fallback providers by design — the old Cartesia → Fish → OpenAI
+// cascade was what caused the "long dead air / no audio at all"
+// behaviour: an aggressive Cartesia timeout would abort a request that
+// was about to succeed, bounce through Fish (usually unconfigured), and
+// finally land on OpenAI tts-1/nova for another ~1–2s of silence.
+// Timeout is generous (120s) so a slow-but-real response wins instead
+// of being aborted.
 
 const CARTESIA_TTS_URL = "https://api.cartesia.ai/tts/bytes";
 const CARTESIA_VERSION = "2024-11-13";
-const FISH_TTS_URL = "https://api.fish.audio/v1/tts";
-const OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech";
+const CARTESIA_TTFB_TIMEOUT_MS = 120_000;
 
-export type TtsBackend = "cartesia" | "fish" | "openai";
+export type TtsBackend = "cartesia";
 
 export type StreamTtsOptions = {
   text: string;
@@ -87,17 +88,11 @@ function fixMojibake(s: string): string {
     if (c > 0xff) return s;
     if (c >= 0x80) suspect++;
   }
-  // Need meaningful signal — a single `é` in an English sentence is
-  // not mojibake. Require at least 30% extended-latin density AND a
-  // minimum absolute count so one-stray-char strings are left alone.
   if (suspect < 3 || suspect < s.length * 0.3) return s;
   try {
     const bytes = new Uint8Array(s.length);
     for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
     const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    // Only accept the recovery if it yields CJK / kana / hangul — that's
-    // the only universe where mojibake is plausibly happening for us.
-    // Otherwise the source text was probably legitimate accented latin.
     if (/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(decoded)) {
       // eslint-disable-next-line no-console
       console.log(
@@ -111,8 +106,9 @@ function fixMojibake(s: string): string {
   return s;
 }
 
-// Returns the first provider that yields a streamable audio body. `null`
-// means every configured provider failed — caller should 503.
+// Returns the Cartesia audio stream, or `null` when the key is missing
+// or Cartesia returned a non-audio response. The caller 503s in that
+// case — there is no secondary provider anymore.
 export async function streamTts(
   opts: StreamTtsOptions
 ): Promise<StreamTtsResult | null> {
@@ -125,166 +121,93 @@ export async function streamTts(
   const emotion = opts.emotion ?? [];
   const speed = opts.speed ?? null;
 
-  // --- Cartesia Sonic (primary) ------------------------------------------
   const cartesiaKey = process.env.CARTESIA_API_KEY?.trim();
-  if (cartesiaKey) {
-    const modelId = process.env.CARTESIA_MODEL_ID?.trim() || "sonic-3";
-    const defaultVoice =
-      lang === "zh"
-        ? process.env.CARTESIA_VOICE_ID_ZH?.trim() ||
-          "0cd0cde2-3b93-42b5-bcb9-f214a591aa29"
-        : process.env.CARTESIA_VOICE_ID_EN?.trim() ||
-          "a0e99841-438c-4a64-b679-ae501e7d6091";
-    const uuidRe =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const chosenVoice = uuidRe.test(voiceId) ? voiceId : defaultVoice;
-    type CartesiaVoice = {
-      mode: "id";
-      id: string;
-      experimental_controls?: {
-        emotion?: string[];
-        speed?: string | number;
-      };
-    };
-    const voicePayload: CartesiaVoice = { mode: "id", id: chosenVoice };
-    if (emotion.length > 0 || speed !== null) {
-      voicePayload.experimental_controls = {
-        ...(emotion.length > 0 ? { emotion } : {}),
-        ...(speed !== null ? { speed } : {}),
-      };
-    }
-    const t0 = Date.now();
+  if (!cartesiaKey) {
     // eslint-disable-next-line no-console
-    console.log(
-      `[tts cartesia${tag}] → model=${modelId} voice=${chosenVoice} lang=${lang} text=${text.length}ch emotion=[${emotion.join(",") || "-"}] speed=${speed ?? "-"}`
-    );
-    const CARTESIA_TTFB_TIMEOUT_MS = 4000;
-    const cartCtrl = new AbortController();
-    const cartTimeout = setTimeout(
-      () =>
-        cartCtrl.abort(
-          new Error(`cartesia ttfb > ${CARTESIA_TTFB_TIMEOUT_MS}ms`)
-        ),
-      CARTESIA_TTFB_TIMEOUT_MS
-    );
-    try {
-      const cartRes = await fetch(CARTESIA_TTS_URL, {
-        method: "POST",
-        headers: {
-          "X-API-Key": cartesiaKey,
-          "Cartesia-Version": CARTESIA_VERSION,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model_id: modelId,
-          transcript: text,
-          voice: voicePayload,
-          output_format: {
-            container: "mp3",
-            bit_rate: 128000,
-            sample_rate: 44100,
-          },
-          language: lang === "zh" ? "zh" : "en",
-        }),
-        signal: cartCtrl.signal,
-      });
-      clearTimeout(cartTimeout);
-      const ct = cartRes.headers.get("content-type") ?? "";
-      if (cartRes.ok && cartRes.body && !ct.includes("application/json")) {
-        // eslint-disable-next-line no-console
-        console.log(
-          `[tts cartesia${tag}] ✓ ttfb=${Date.now() - t0}ms streaming audio/mpeg`
-        );
-        return { stream: cartRes.body, backend: "cartesia" };
-      }
-      const err = await cartRes.text().catch(() => "");
-      // eslint-disable-next-line no-console
-      console.log(
-        `[tts cartesia${tag}] ✖ ${cartRes.status} in ${Date.now() - t0}ms: ${err.slice(0, 200)} — falling through`
-      );
-    } catch (err) {
-      clearTimeout(cartTimeout);
-      // eslint-disable-next-line no-console
-      console.log(
-        `[tts cartesia${tag}] ✖ exception: ${err instanceof Error ? err.message : String(err)} — falling through`
-      );
-    }
+    console.log(`[tts cartesia${tag}] ✖ CARTESIA_API_KEY not set`);
+    return null;
   }
 
-  // --- Fish (secondary) --------------------------------------------------
-  const fishKey = process.env.FISH_API_KEY?.trim();
-  if (fishKey) {
-    const body: Record<string, unknown> = {
-      text,
-      format: "mp3",
-      mp3_bitrate: 128,
-      normalize: true,
-      latency: "balanced",
-      chunk_length: 100,
+  const modelId = process.env.CARTESIA_MODEL_ID?.trim() || "sonic-3";
+  const defaultVoice =
+    lang === "zh"
+      ? process.env.CARTESIA_VOICE_ID_ZH?.trim() ||
+        "0cd0cde2-3b93-42b5-bcb9-f214a591aa29"
+      : process.env.CARTESIA_VOICE_ID_EN?.trim() ||
+        "a0e99841-438c-4a64-b679-ae501e7d6091";
+  const uuidRe =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const chosenVoice = uuidRe.test(voiceId) ? voiceId : defaultVoice;
+  type CartesiaVoice = {
+    mode: "id";
+    id: string;
+    experimental_controls?: {
+      emotion?: string[];
+      speed?: string | number;
     };
-    if (voiceId) body.reference_id = voiceId;
-
-    const t0 = Date.now();
-    // eslint-disable-next-line no-console
-    console.log(
-      `[tts fish${tag}] → text=${text.length}ch voice=${voiceId || "default"}`
-    );
-    const fishRes = await fetch(FISH_TTS_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${fishKey}`,
-        "Content-Type": "application/json",
-        model: process.env.FISH_MODEL?.trim() || "s1",
-      },
-      body: JSON.stringify(body),
-    });
-    const ct = fishRes.headers.get("content-type") ?? "";
-    if (fishRes.ok && fishRes.body && !ct.includes("application/json")) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[tts fish${tag}] ✓ ttfb=${Date.now() - t0}ms streaming audio/mpeg`
-      );
-      return { stream: fishRes.body, backend: "fish" };
-    }
-    const err = await fishRes.text().catch(() => "");
-    // eslint-disable-next-line no-console
-    console.log(
-      `[tts fish${tag}] ✖ ${fishRes.status} in ${Date.now() - t0}ms: ${err.slice(0, 160)} — falling through`
-    );
+  };
+  const voicePayload: CartesiaVoice = { mode: "id", id: chosenVoice };
+  if (emotion.length > 0 || speed !== null) {
+    voicePayload.experimental_controls = {
+      ...(emotion.length > 0 ? { emotion } : {}),
+      ...(speed !== null ? { speed } : {}),
+    };
   }
-
-  // --- OpenAI (tertiary) -------------------------------------------------
-  const openaiKey = process.env.OPENAI_API_KEY?.trim();
-  if (openaiKey) {
-    const t0 = Date.now();
-    // eslint-disable-next-line no-console
-    console.log(`[tts openai${tag}] → text=${text.length}ch`);
-    const oaRes = await fetch(OPENAI_TTS_URL, {
+  const t0 = Date.now();
+  // eslint-disable-next-line no-console
+  console.log(
+    `[tts cartesia${tag}] → model=${modelId} voice=${chosenVoice} lang=${lang} text=${text.length}ch emotion=[${emotion.join(",") || "-"}] speed=${speed ?? "-"}`
+  );
+  const ctrl = new AbortController();
+  const timer = setTimeout(
+    () =>
+      ctrl.abort(
+        new Error(`cartesia ttfb > ${CARTESIA_TTFB_TIMEOUT_MS}ms`)
+      ),
+    CARTESIA_TTFB_TIMEOUT_MS
+  );
+  try {
+    const res = await fetch(CARTESIA_TTS_URL, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${openaiKey}`,
+        "X-API-Key": cartesiaKey,
+        "Cartesia-Version": CARTESIA_VERSION,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "tts-1",
-        voice: "nova",
-        input: text,
-        response_format: "mp3",
+        model_id: modelId,
+        transcript: text,
+        voice: voicePayload,
+        output_format: {
+          container: "mp3",
+          bit_rate: 128000,
+          sample_rate: 44100,
+        },
+        language: lang === "zh" ? "zh" : "en",
       }),
+      signal: ctrl.signal,
     });
-    if (oaRes.ok && oaRes.body) {
+    clearTimeout(timer);
+    const ct = res.headers.get("content-type") ?? "";
+    if (res.ok && res.body && !ct.includes("application/json")) {
       // eslint-disable-next-line no-console
       console.log(
-        `[tts openai${tag}] ✓ ttfb=${Date.now() - t0}ms streaming audio/mpeg`
+        `[tts cartesia${tag}] ✓ ttfb=${Date.now() - t0}ms streaming audio/mpeg`
       );
-      return { stream: oaRes.body, backend: "openai" };
+      return { stream: res.body, backend: "cartesia" };
     }
-    const err = await oaRes.text().catch(() => "");
+    const err = await res.text().catch(() => "");
     // eslint-disable-next-line no-console
     console.log(
-      `[tts openai${tag}] ✖ ${oaRes.status} in ${Date.now() - t0}ms: ${err.slice(0, 160)}`
+      `[tts cartesia${tag}] ✖ ${res.status} in ${Date.now() - t0}ms: ${err.slice(0, 200)}`
     );
+    return null;
+  } catch (err) {
+    clearTimeout(timer);
+    // eslint-disable-next-line no-console
+    console.log(
+      `[tts cartesia${tag}] ✖ exception after ${Date.now() - t0}ms: ${err instanceof Error ? err.message : String(err)}`
+    );
+    return null;
   }
-
-  return null;
 }

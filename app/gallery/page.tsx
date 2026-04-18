@@ -53,32 +53,35 @@ export default function GalleryPage() {
 
 function Header({ hasCards }: { hasCards: boolean }) {
   return (
-    <header className="mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-4 sm:px-6">
-      <Link
-        href="/"
-        className="inline-flex items-center gap-2 rounded-full bg-white/10 px-3.5 py-1.5 text-[12px] font-medium ring-1 ring-white/20 backdrop-blur-xl transition hover:bg-white/20"
-      >
-        <span aria-hidden>←</span>
-        <span>camera</span>
-      </Link>
-      <h1 className="serif-italic text-[20px] font-medium leading-none text-white/95 sm:text-[24px]">
+    <header className="mx-auto grid w-full max-w-[560px] grid-cols-[1fr_auto_1fr] items-center gap-3 px-4 sm:px-6">
+      <div className="justify-self-start">
+        <Link
+          href="/"
+          aria-label="back to camera"
+          className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-[11.5px] font-medium ring-1 ring-white/20 backdrop-blur-xl transition hover:bg-white/20"
+        >
+          <span aria-hidden>←</span>
+          <span>camera</span>
+        </Link>
+      </div>
+      <h1 className="serif-italic justify-self-center text-[22px] font-medium leading-none text-white/95 sm:text-[26px]">
         gallery
       </h1>
-      {hasCards ? (
-        <button
-          type="button"
-          onClick={() => {
-            if (window.confirm("Clear every card in the gallery?")) {
-              clearSessionCards();
-            }
-          }}
-          className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-[11.5px] font-semibold uppercase tracking-wider ring-1 ring-white/20 backdrop-blur-xl transition hover:bg-white/20"
-        >
-          clear all
-        </button>
-      ) : (
-        <span className="inline-flex h-[30px] w-[78px]" aria-hidden />
-      )}
+      <div className="justify-self-end">
+        {hasCards && (
+          <button
+            type="button"
+            onClick={() => {
+              if (window.confirm("Clear every card in the gallery?")) {
+                clearSessionCards();
+              }
+            }}
+            className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-white/80 ring-1 ring-white/20 backdrop-blur-xl transition hover:bg-white/20 hover:text-white/95"
+          >
+            clear
+          </button>
+        )}
+      </div>
     </header>
   );
 }
@@ -261,6 +264,26 @@ function GalleryGrid({ cards }: { cards: readonly SessionCard[] }) {
       audioCtxRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Mobile Safari suspends AudioContexts when the tab goes to the
+  // background. On return we proactively resume so the next card tap
+  // doesn't hit a silent graph.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      const ctx = audioCtxRef.current;
+      if (ctx && ctx.state === "suspended") {
+        ctx.resume().catch(() => {});
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("pageshow", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("pageshow", onVisible);
+    };
   }, []);
 
   // --- Mic ---------------------------------------------------------------
@@ -551,23 +574,21 @@ function GalleryGrid({ cards }: { cards: readonly SessionCard[] }) {
           {errorMsg}
         </div>
       )}
-      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
-        {cards.map((card) => (
-          <CardItem
-            key={card.id}
-            card={card}
-            status={statusByCard[card.id] ?? "idle"}
-            heardText={heardByCard[card.id] ?? null}
-            replyText={liveReplyByCard[card.id] ?? null}
-            shape={
-              statusByCard[card.id] === "speaking" ? shape : "X"
-            }
-            onMicPress={onMicPress}
-            onMicRelease={onMicRelease}
-            onRemove={() => removeSessionCard(card.id)}
-          />
+      <ul className="mx-auto flex w-full max-w-[560px] flex-col gap-4">
+        {cards.map((card, i) => (
+          <li key={card.id} style={{ animationDelay: `${Math.min(i, 8) * 40}ms` }} className="gallery-card-enter">
+            <CardItem
+              card={card}
+              status={statusByCard[card.id] ?? "idle"}
+              replyText={liveReplyByCard[card.id] ?? null}
+              shape={statusByCard[card.id] === "speaking" ? shape : "X"}
+              onMicPress={onMicPress}
+              onMicRelease={onMicRelease}
+              onRemove={() => removeSessionCard(card.id)}
+            />
+          </li>
         ))}
-      </div>
+      </ul>
     </>
   );
 }
@@ -577,7 +598,6 @@ function GalleryGrid({ cards }: { cards: readonly SessionCard[] }) {
 function CardItem({
   card,
   status,
-  heardText,
   replyText,
   shape,
   onMicPress,
@@ -586,7 +606,6 @@ function CardItem({
 }: {
   card: SessionCard;
   status: CardStatus;
-  heardText: string | null;
   replyText: string | null;
   shape: MouthShape;
   onMicPress: (cardId: string) => void;
@@ -597,10 +616,11 @@ function CardItem({
   const isSpeaking = status === "speaking";
   const isRecording = status === "recording";
   const isThinking = status === "thinking";
+  const [imgFailed, setImgFailed] = useState(false);
 
   return (
     <article
-      className="group relative flex flex-col overflow-hidden rounded-[24px] bg-white/8 ring-1 ring-white/15 backdrop-blur-xl transition-[transform,box-shadow] duration-200"
+      className="group relative flex items-stretch gap-4 overflow-hidden rounded-[22px] bg-white/[0.07] p-3 ring-1 ring-white/15 backdrop-blur-xl transition-[transform,box-shadow,background] duration-200 hover:bg-white/[0.1]"
       style={{
         boxShadow: isActive
           ? "0 18px 48px -18px rgba(255,137,190,0.55), 0 0 0 2px rgba(255,137,190,0.85)"
@@ -612,71 +632,72 @@ function CardItem({
         type="button"
         aria-label="remove from gallery"
         onClick={onRemove}
-        className="absolute right-3 top-3 z-20 grid h-7 w-7 place-items-center rounded-full bg-black/45 text-[13px] leading-none text-white/85 opacity-0 ring-1 ring-white/15 backdrop-blur-md transition-opacity duration-150 hover:bg-black/70 group-hover:opacity-100"
+        className="absolute right-2 top-2 z-20 grid h-6 w-6 place-items-center rounded-full bg-black/40 text-[12px] leading-none text-white/85 opacity-0 ring-1 ring-white/10 backdrop-blur-md transition-opacity duration-150 hover:bg-black/65 group-hover:opacity-100 focus:opacity-100"
       >
         ×
       </button>
 
-      <div className="relative aspect-[4/3] w-full overflow-hidden bg-black/40">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={card.imageDataUrl}
-          alt={card.className}
-          className="absolute inset-0 h-full w-full object-cover"
-          draggable={false}
-        />
+      <div
+        className="relative aspect-square h-auto w-[108px] shrink-0 overflow-hidden rounded-[16px] bg-black/35 sm:w-[132px]"
+        aria-hidden={isSpeaking ? undefined : true}
+      >
+        {imgFailed ? (
+          <div className="absolute inset-0 grid place-items-center text-[10px] uppercase tracking-widest text-white/40">
+            missing
+          </div>
+        ) : (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={card.imageDataUrl}
+            alt={card.className}
+            className="absolute inset-0 h-full w-full object-cover"
+            draggable={false}
+            onError={() => setImgFailed(true)}
+          />
+        )}
         {isSpeaking && (
           <div
             className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
             style={{
-              width: FACE_VOICE_WIDTH,
-              height: FACE_VOICE_HEIGHT,
+              width: FACE_VOICE_WIDTH * 0.55,
+              height: FACE_VOICE_HEIGHT * 0.55,
             }}
-            aria-hidden
           >
-            <FaceVoice shape={shape} />
-          </div>
-        )}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/70 to-transparent" />
-        <span className="absolute left-3 top-3 rounded-full bg-black/50 px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-white/90 ring-1 ring-white/15 backdrop-blur">
-          {card.className}
-        </span>
-        {isActive && (
-          <span
-            className="absolute bottom-3 left-3 inline-flex items-center gap-1.5 rounded-full bg-pink-400/90 px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-pink-950 shadow-lg shadow-pink-500/30"
-            aria-live="polite"
-          >
-            <span
-              className="h-1.5 w-1.5 rounded-full bg-pink-950"
+            <div
               style={{
-                animation: isRecording || isThinking
-                  ? "soft-pulse 1.1s ease-in-out infinite"
-                  : undefined,
+                width: FACE_VOICE_WIDTH,
+                height: FACE_VOICE_HEIGHT,
+                transform: "scale(0.55)",
+                transformOrigin: "0 0",
               }}
-            />
-            {isRecording ? "listening…" : isThinking ? "thinking…" : "speaking"}
-          </span>
+            >
+              <FaceVoice shape={shape} />
+            </div>
+          </div>
         )}
       </div>
 
-      <div className="flex flex-col gap-3 px-4 py-4">
-        <p className="text-[13.5px] leading-[1.45] text-white/85">
-          {card.description}
-        </p>
-        <blockquote className="border-l-2 border-pink-300/60 pl-3 text-[14px] italic leading-[1.5] text-white/95">
-          &ldquo;{card.line}&rdquo;
-        </blockquote>
-
-        {heardText && (
-          <p className="text-[11.5px] text-white/60">
-            you said: <span className="text-white/85">{heardText}</span>
+      <div className="flex min-w-0 flex-1 flex-col justify-between gap-2.5 py-1">
+        <div className="flex min-w-0 flex-col gap-1">
+          <h2
+            className="serif-italic truncate text-[22px] leading-tight text-white/95"
+            title={card.className}
+          >
+            {card.className}
+          </h2>
+          <p
+            className="line-clamp-2 text-[12.5px] italic leading-[1.35] text-white/60"
+            aria-live={isActive ? "polite" : undefined}
+          >
+            {isRecording
+              ? "listening…"
+              : isThinking
+                ? "thinking…"
+                : replyText && isSpeaking
+                  ? replyText
+                  : `“${card.line}”`}
           </p>
-        )}
-        {replyText && status !== "speaking" && (
-          <p className="text-[11.5px] text-pink-200/90">
-            latest: <span className="text-white/90">{replyText}</span>
-          </p>
-        )}
+        </div>
 
         <MicButton
           cardId={card.id}
@@ -707,7 +728,7 @@ function MicButton({
       : status === "thinking"
         ? "thinking…"
         : status === "speaking"
-          ? "speaking — tap to interrupt"
+          ? "tap to interrupt"
           : "hold to talk";
 
   return (
@@ -738,7 +759,7 @@ function MicButton({
       onPointerLeave={(e) => {
         if (e.buttons > 0) onRelease(cardId);
       }}
-      className="relative flex h-11 items-center justify-center gap-2 rounded-full text-[12.5px] font-semibold tracking-wide transition-[transform,box-shadow] duration-150 ease-out"
+      className="relative inline-flex h-9 w-fit items-center gap-1.5 rounded-full pl-2.5 pr-3.5 text-[11.5px] font-semibold tracking-wide transition-[transform,box-shadow] duration-150 ease-out"
       style={{
         background:
           status === "recording"
@@ -746,16 +767,25 @@ function MicButton({
             : busy
               ? "rgba(255,255,255,0.18)"
               : "linear-gradient(135deg, #ffb8d6 0%, #ffd4e3 100%)",
-        color: busy && status !== "recording" ? "rgba(255,255,255,0.85)" : "#3a0a29",
+        color: busy && status !== "recording" ? "rgba(255,255,255,0.88)" : "#3a0a29",
         boxShadow:
           status === "recording"
             ? "0 0 0 2px rgba(255,255,255,0.55), 0 10px 22px -8px rgba(255,111,174,0.65)"
-            : "0 8px 20px -10px rgba(255,111,174,0.55)",
+            : "0 6px 16px -8px rgba(255,111,174,0.55)",
         transform: status === "recording" ? "scale(0.97)" : undefined,
         touchAction: "none",
       }}
     >
-      <MicIcon />
+      <span
+        aria-hidden
+        className="grid h-5 w-5 place-items-center rounded-full"
+        style={{
+          background:
+            status === "recording" ? "rgba(255,255,255,0.25)" : "rgba(255,255,255,0.55)",
+        }}
+      >
+        <MicIcon />
+      </span>
       <span>{label}</span>
     </button>
   );

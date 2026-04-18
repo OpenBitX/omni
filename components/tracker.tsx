@@ -554,18 +554,6 @@ type TrackRefs = {
   // Auto-dismiss timer id for this track's caption once audio finishes.
   // Held per-track so a retap can cancel the prior dismissal.
   captionClearTimer: number | null;
-  // Streaming audio element for the conversation reply path. Separate from
-  // `source` (AudioBufferSourceNode) which handles the lock-time line —
-  // the streaming path uses MediaSource so playback starts as the first
-  // bytes arrive instead of waiting for the whole mp3. Stopping a track
-  // must clear BOTH.
-  streamingAudio: HTMLAudioElement | null;
-  streamingUrl: string | null;
-  // MediaElementAudioSourceNode wrapping `streamingAudio`. Stored so
-  // retap/eviction can disconnect it explicitly instead of leaving a
-  // dangling connection to the analyser (which can accumulate across
-  // multiple streams and keep feeding silence into the mouth classifier).
-  streamingSource: MediaElementAudioSourceNode | null;
   // Fish.audio reference_id chosen by GLM on the first `generateLine` for
   // this track. Once set, it's reused for every subsequent line and reply
   // so the object's voice stays consistent for the whole session on it.
@@ -627,11 +615,6 @@ type TrackUI = {
   speaking: boolean;
 };
 
-// Stream an mp3 response body into a MediaSource SourceBuffer and play it
-// through the track's analyser so the mouth syncs. Runs at module scope
-// (not a hook) because the logic is pure browser plumbing and keeps the
-// hot-path useCallback readable. Resolves when the 'ended' event fires or
-// the caller supersedes (callGen mismatch).
 // Map a speak-path error message to a short, user-friendly toast. Keeps
 // the branching out of the already-busy speakOnTrack try/catch and gives
 // us a single place to tweak user-facing wording.
@@ -645,306 +628,10 @@ function toastForSpeakError(msg: string): string {
   if (/decode|audio context|play\(\)/i.test(msg)) {
     return "couldn't play audio on this device — caption only";
   }
-  if (/tts stream|no TTS backend|fish|openai tts/i.test(msg)) {
+  if (/tts stream|no TTS backend|cartesia/i.test(msg)) {
     return "TTS backend failed — caption only";
   }
   return `couldn't speak: ${msg.slice(0, 80)}`;
-}
-
-async function playViaMediaSource(args: {
-  ctx: AudioContext;
-  track: TrackRefs;
-  trackId: string;
-  turnId: string;
-  callGen: number;
-  respBody: ReadableStream<Uint8Array>;
-  mediaSourceCtor: typeof MediaSource;
-  ensureAnalyser: () => void;
-  scheduleCaptionClear: () => void;
-  setSpeaking: (on: boolean) => void;
-  tStart: number;
-  onFirstSound?: () => void;
-}): Promise<void> {
-  const {
-    ctx,
-    track,
-    trackId,
-    turnId,
-    callGen,
-    respBody,
-    mediaSourceCtor,
-    ensureAnalyser,
-    scheduleCaptionClear,
-    setSpeaking,
-    tStart,
-    onFirstSound,
-  } = args;
-
-  // Ensure the analyser graph is live BEFORE any audio element exists, so
-  // the first chunk's playback can never out-race the graph wiring (which
-  // would show as "audio plays but mouth stays closed" for ~200ms).
-  ensureAnalyser();
-  if (!track.analyser) {
-    try {
-      await respBody.cancel();
-    } catch {
-      // ignore
-    }
-    throw new Error("analyser unavailable (AudioContext state?)");
-  }
-
-  const mediaSource = new mediaSourceCtor();
-  const url = URL.createObjectURL(mediaSource);
-  const audioEl = new Audio();
-  audioEl.preload = "auto";
-  audioEl.crossOrigin = "anonymous";
-  audioEl.src = url;
-
-  // Build the element's graph node NOW (one MediaElementAudioSourceNode
-  // per element per ctx). Doing this before play() guarantees the mouth
-  // classifier sees samples on the very first decoded chunk.
-  let mediaElSource: MediaElementAudioSourceNode;
-  try {
-    mediaElSource = ctx.createMediaElementSource(audioEl);
-  } catch (e) {
-    try {
-      URL.revokeObjectURL(url);
-    } catch {
-      // ignore
-    }
-    try {
-      await respBody.cancel();
-    } catch {
-      // ignore
-    }
-    throw new Error(
-      `createMediaElementSource failed: ${e instanceof Error ? e.message : String(e)}`
-    );
-  }
-  mediaElSource.connect(track.analyser);
-
-  track.streamingAudio = audioEl;
-  track.streamingUrl = url;
-  track.streamingSource = mediaElSource;
-
-  // Common teardown used by all early-exit paths below. Keeps the element
-  // graph + blob URL from leaking when MediaSource doesn't open or the
-  // caller has been superseded by a retap.
-  const teardownElementGraph = () => {
-    try {
-      mediaElSource.disconnect();
-    } catch {
-      // ignore
-    }
-    try {
-      URL.revokeObjectURL(url);
-    } catch {
-      // ignore
-    }
-    if (track.streamingSource === mediaElSource) track.streamingSource = null;
-    if (track.streamingAudio === audioEl) track.streamingAudio = null;
-    if (track.streamingUrl === url) track.streamingUrl = null;
-  };
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const onOpen = () => {
-        cleanup();
-        resolve();
-      };
-      const onErr = () => {
-        cleanup();
-        reject(new Error("MediaSource open failed"));
-      };
-      const cleanup = () => {
-        mediaSource.removeEventListener("sourceopen", onOpen);
-        mediaSource.removeEventListener("error", onErr);
-      };
-      mediaSource.addEventListener("sourceopen", onOpen, { once: true });
-      mediaSource.addEventListener("error", onErr, { once: true });
-    });
-  } catch (e) {
-    teardownElementGraph();
-    try {
-      await respBody.cancel();
-    } catch {
-      // ignore
-    }
-    throw e;
-  }
-
-  if (callGen !== track.speakGen) {
-    teardownElementGraph();
-    try {
-      await respBody.cancel();
-    } catch {
-      // ignore
-    }
-    return;
-  }
-
-  let sourceBuffer: SourceBuffer;
-  try {
-    sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
-    sourceBuffer.mode = "sequence";
-  } catch (e) {
-    teardownElementGraph();
-    try {
-      await respBody.cancel();
-    } catch {
-      // ignore
-    }
-    throw new Error(
-      `addSourceBuffer failed: ${e instanceof Error ? e.message : String(e)}`
-    );
-  }
-
-  let started = false;
-  let endedFired = false;
-  const finishPlayback = () => {
-    if (endedFired) return;
-    endedFired = true;
-    if (track.streamingAudio === audioEl) {
-      if (track.streamingSource === mediaElSource) {
-        try {
-          mediaElSource.disconnect();
-        } catch {
-          // already disconnected
-        }
-        track.streamingSource = null;
-      }
-      track.streamingAudio = null;
-      if (track.streamingUrl) {
-        try {
-          URL.revokeObjectURL(track.streamingUrl);
-        } catch {
-          // ignore
-        }
-        track.streamingUrl = null;
-      }
-      setSpeaking(false);
-      scheduleCaptionClear();
-    }
-  };
-  audioEl.addEventListener("ended", finishPlayback);
-  // 'error' on the media element fires when decode fails mid-stream (rare
-  // but possible on malformed mp3 bytes from Fish). Treat as end-of-
-  // utterance so UI doesn't stay stuck on speaking=true.
-  audioEl.addEventListener("error", () => {
-    // eslint-disable-next-line no-console
-    console.log(
-      `[tts #${turnId}] audio element error — ending playback ${trackId}`
-    );
-    finishPlayback();
-  });
-
-  const reader = respBody.getReader();
-
-  const appendChunk = (chunk: Uint8Array) =>
-    new Promise<void>((resolve, reject) => {
-      const onUpdate = () => {
-        sourceBuffer.removeEventListener("updateend", onUpdate);
-        sourceBuffer.removeEventListener("error", onErr);
-        resolve();
-      };
-      const onErr = () => {
-        sourceBuffer.removeEventListener("updateend", onUpdate);
-        sourceBuffer.removeEventListener("error", onErr);
-        reject(new Error("SourceBuffer append failed"));
-      };
-      sourceBuffer.addEventListener("updateend", onUpdate);
-      sourceBuffer.addEventListener("error", onErr);
-      try {
-        // chunk.buffer can be SharedArrayBuffer per TS lib types; SourceBuffer
-        // wants a plain ArrayBuffer. Copy into a fresh ArrayBuffer to satisfy
-        // the type and guarantee the append sees a stable buffer.
-        const copy = new Uint8Array(chunk.byteLength);
-        copy.set(chunk);
-        sourceBuffer.appendBuffer(copy.buffer);
-      } catch (e) {
-        sourceBuffer.removeEventListener("updateend", onUpdate);
-        sourceBuffer.removeEventListener("error", onErr);
-        reject(e instanceof Error ? e : new Error(String(e)));
-      }
-    });
-
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (callGen !== track.speakGen) {
-        // Retap while streaming — abandon and let stopTrackAudio clean up.
-        try {
-          await reader.cancel();
-        } catch {
-          // ignore
-        }
-        return;
-      }
-      if (done) break;
-      if (!value || value.byteLength === 0) continue;
-      await appendChunk(value);
-      // Kick off playback the moment the first chunk is decodable.
-      if (!started) {
-        started = true;
-        // eslint-disable-next-line no-console
-        console.log(
-          `[tts #${turnId}] ◀ first chunk in ${Math.round(performance.now() - tStart)}ms (${value.byteLength}B) — playing`
-        );
-        let playOk = true;
-        try {
-          await audioEl.play();
-        } catch (err) {
-          // Autoplay should be unlocked by the user gesture that kicked
-          // this stream off. If we still get rejected, don't lie with
-          // onFirstSound — let the caller's error path take over so the
-          // caption at least remains on screen.
-          playOk = false;
-          // eslint-disable-next-line no-console
-          console.log(
-            `[tts #${turnId}] audioEl.play() rejected: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
-        if (playOk) {
-          setSpeaking(true);
-          try {
-            onFirstSound?.();
-          } catch (cbErr) {
-            // Telemetry callback misbehaving must not break playback.
-            // eslint-disable-next-line no-console
-            console.log(
-              `[tts #${turnId}] onFirstSound threw: ${cbErr instanceof Error ? cbErr.message : String(cbErr)}`
-            );
-          }
-        } else {
-          try {
-            await reader.cancel();
-          } catch {
-            // ignore
-          }
-          throw new Error("audio element play() was rejected");
-        }
-      }
-    }
-    // Signal end-of-stream to MediaSource so the audio element can
-    // schedule its 'ended' event properly.
-    if (mediaSource.readyState === "open") {
-      try {
-        mediaSource.endOfStream();
-      } catch {
-        // ignore
-      }
-    }
-    // eslint-disable-next-line no-console
-    console.log(
-      `[tts #${turnId}] ✓ stream done in ${Math.round(performance.now() - tStart)}ms ${trackId} ended=${endedFired}`
-    );
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.log(
-      `[tts #${turnId}] ✖ ${err instanceof Error ? err.message : String(err)} (${trackId})`
-    );
-    throw err;
-  }
 }
 
 export function Tracker() {
@@ -958,11 +645,11 @@ export function Tracker() {
   const [cameraReady, setCameraReady] = useState(false);
   const [yoloStatus, setYoloStatusState] = useState<YoloStatus>(() => getYoloStatus());
   const [lastInferMs, setLastInferMs] = useState<number | null>(null);
-  // Which TTS backend rendered the most recent voice line. Shown in the
-  // diag panel so you can confirm Fish (vs. OpenAI fallback / caption-only)
-  // is actually in play without having to listen carefully.
+  // Which TTS backend rendered the most recent voice line. Now always
+  // `cartesia` on success or `none` on failure — kept as a single piece
+  // of state so the diag panel still shows whether audio ran at all.
   const [lastTtsBackend, setLastTtsBackend] = useState<
-    "cartesia" | "fish" | "openai" | "none" | null
+    "cartesia" | "none" | null
   >(null);
   const [diagOpen, setDiagOpen] = useState(false);
   const [diagError, setDiagError] = useState<string | null>(null);
@@ -1641,15 +1328,16 @@ export function Tracker() {
     []
   );
 
-  // Stop whatever a track is currently saying — both the
-  // AudioBufferSource (lock-time line) and the streaming HTMLAudioElement
-  // (conversation reply). Called from retap, eviction, etc.
+  // Stop whatever a track is currently saying. One code path — the
+  // AudioBufferSource — because all TTS (first-tap, retap, converse,
+  // group) decodes the full mp3 once and plays through the same node.
+  // Called from retap, eviction, mic press, etc.
   const stopTrackAudio = useCallback((track: TrackRefs) => {
     const ctx = audioCtxRef.current;
     // Brief gain ramp to 0 kills the click that otherwise fires when a
-    // hard source.stop() or pause() lands mid-waveform. ~8ms is below the
-    // perceptual threshold but above the single-frame click window. The
-    // RAF loop restores gain the next time audio plays.
+    // hard source.stop() lands mid-waveform. ~8ms is below the perceptual
+    // threshold but above the single-frame click window. The RAF loop
+    // restores gain the next time audio plays.
     if (track.gain && ctx) {
       try {
         const now = ctx.currentTime;
@@ -1677,42 +1365,6 @@ export function Tracker() {
       }
       track.source = null;
     }
-    if (track.streamingSource) {
-      try {
-        track.streamingSource.disconnect();
-      } catch {
-        // already disconnected
-      }
-      track.streamingSource = null;
-    }
-    if (track.streamingAudio) {
-      try {
-        track.streamingAudio.onended = null;
-        track.streamingAudio.onerror = null;
-      } catch {
-        // ignore
-      }
-      try {
-        track.streamingAudio.pause();
-      } catch {
-        // ignore
-      }
-      try {
-        track.streamingAudio.removeAttribute("src");
-        track.streamingAudio.load();
-      } catch {
-        // ignore — element already torn down
-      }
-      track.streamingAudio = null;
-    }
-    if (track.streamingUrl) {
-      try {
-        URL.revokeObjectURL(track.streamingUrl);
-      } catch {
-        // ignore
-      }
-      track.streamingUrl = null;
-    }
   }, []);
 
   // Park a forward reference to stopTrackAudio so clearAllTracks (defined
@@ -1726,17 +1378,19 @@ export function Tracker() {
 
   // --- Streaming TTS playback -------------------------------------------
   //
-  // The conversation hot path. We used to synthesize the whole mp3
-  // server-side, base64-encode it, pass it through a server action, fetch
-  // the data URL, and only then decode + play — burning ~600–1500ms of
-  // dead air. This helper fetches `/api/tts/stream` instead, feeds the
-  // bytes into a MediaSource SourceBuffer, and starts playback the moment
-  // the first chunk lands. Audio element → MediaElementSource → track.
-  // analyser → gain → destination keeps lip-sync intact.
+  // Unified TTS playback for every path (first-tap, retap, converse,
+  // group). Fetches the mp3 from `/api/tts/stream` (or reuses a body
+  // already opened by `/api/speak`), buffers to an ArrayBuffer, decodes
+  // once, and plays through an AudioBufferSource wired to this track's
+  // analyser + gain. One code path = one bug surface.
   //
-  // MediaSource isn't everywhere (notably older iOS), so we fall back to
-  // buffering the whole blob and going through the existing
-  // AudioBufferSource path — same code that speakOnTrack uses.
+  // This used to have a second path (MediaSource + SourceBuffer + an
+  // HTMLAudioElement) for sub-second TTFB streaming. It was fragile —
+  // retap/converse/group turns after the first kept dropping audio
+  // because of sourceopen races, orphaned MediaElementSource nodes, and
+  // piecemeal teardown between retaps. Deleted in favour of this one.
+  // We pay ~300–500ms of extra latency per turn and get audio that
+  // actually plays every single time.
   const playStreamingReply = useCallback(
     async (
       trackId: string,
@@ -1749,9 +1403,8 @@ export function Tracker() {
       speed?: string | null,
       // Optional pre-opened response body + backend label. When the
       // caller already has an audio stream in hand (e.g. from the
-      // /api/speak combined endpoint, which folds VLM + TTS into one
-      // response to save a client-side round-trip), we skip the
-      // /api/tts/stream POST here and jump straight to MediaSource.
+      // `/api/speak` combined endpoint that folds VLM + TTS into one
+      // response), skip the redundant `/api/tts/stream` POST.
       preopened?: { respBody: ReadableStream<Uint8Array>; backend: string }
     ): Promise<void> => {
       const ctx = ensureAudioCtx();
@@ -1763,44 +1416,6 @@ export function Tracker() {
       // incoming stream's actual loudness; without this, a previous loud
       // line leaves peak high and the quieter reply shows as closed mouth.
       track.lipSync = createLipSyncState();
-
-      const ensureAnalyser = () => {
-        if (track.analyser) {
-          // Restore the gain if stopTrackAudio previously ramped it down to
-          // 0 (mic-press interrupt, retap, LRU eviction). Without this, the
-          // analyser + destination chain is alive but inaudible — RAF only
-          // re-drives the gain when a source is live, and its direct
-          // `.value =` write doesn't always cancel a pending setTargetAtTime.
-          // This was the "no voice" bug on group-to-group turns after any
-          // mic press in the session.
-          if (track.gain) {
-            try {
-              const now = ctx.currentTime;
-              track.gain.gain.cancelScheduledValues(now);
-              track.gain.gain.setValueAtTime(
-                Math.max(0, track.opacity || 1),
-                now
-              );
-            } catch {
-              // ignore — scheduling failures are not fatal
-            }
-          }
-          return;
-        }
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 1024;
-        analyser.smoothingTimeConstant = 0.4;
-        const gain = ctx.createGain();
-        gain.gain.value = Math.max(0, track.opacity || 1);
-        analyser.connect(gain);
-        gain.connect(ctx.destination);
-        track.analyser = analyser;
-        track.gain = gain;
-        track.freqData = new Uint8Array(
-          new ArrayBuffer(analyser.frequencyBinCount)
-        );
-        track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
-      };
 
       const scheduleCaptionClear = () => {
         if (track.captionClearTimer != null) {
@@ -1817,10 +1432,6 @@ export function Tracker() {
       };
 
       const t0 = performance.now();
-      // eslint-disable-next-line no-console
-      console.log(
-        `[tts #${tid}] → /api/tts/stream text=${text.length}ch voice=${voiceId ?? "default"}`
-      );
 
       // Wait for the ctx to be `running` before we start the network leg.
       // On mobile, issuing the POST first and THEN resuming adds a race
@@ -1834,8 +1445,6 @@ export function Tracker() {
       let respBody: ReadableStream<Uint8Array>;
       let backend: string;
       if (preopened) {
-        // Caller has already fetched the stream (e.g. /api/speak). Reuse it
-        // so we don't fire a redundant /api/tts/stream POST behind the user.
         respBody = preopened.respBody;
         backend = preopened.backend;
         // eslint-disable-next-line no-console
@@ -1843,6 +1452,10 @@ export function Tracker() {
           `[tts #${tid}] ◀ reusing preopened stream backend=${backend}`
         );
       } else {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[tts #${tid}] → /api/tts/stream text=${text.length}ch voice=${voiceId ?? "default"}`
+        );
         const resp = await fetch("/api/tts/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1851,14 +1464,11 @@ export function Tracker() {
             voiceId: voiceId ?? "",
             turnId: tid,
             lang: langRef.current,
-            // Cartesia experimental_controls — one emotion string in an
-            // array, "normal" speed omitted so the default is picked up.
             emotion: emotion ? [emotion] : [],
             speed: speed ?? null,
           }),
         });
         if (callGen !== track.speakGen) {
-          // Retap while we were awaiting headers — drop.
           try {
             await resp.body?.cancel();
           } catch {
@@ -1877,69 +1487,71 @@ export function Tracker() {
           `[tts #${tid}] ◀ headers in ${Math.round(performance.now() - t0)}ms backend=${backend}`
         );
       }
-      setLastTtsBackend(
-        backend === "fish"
-          ? "fish"
-          : backend === "openai"
-            ? "openai"
-            : backend === "cartesia"
-              ? "none"
-              : "none"
+      setLastTtsBackend(backend === "cartesia" ? "cartesia" : "none");
+
+      // Buffer the full mp3, decode once, then hand to the AudioBufferSource
+      // pipeline. This is the same pipeline `playPreparedTurn` uses for
+      // group turns — unifying the two kept the "works first time, silent
+      // after" retap/converse bugs from coming back.
+      const buf = await new Response(respBody).arrayBuffer();
+      if (callGen !== track.speakGen) return;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[tts #${tid}] ◀ body buffered ${Math.round(buf.byteLength / 1024)}KB in ${Math.round(performance.now() - t0)}ms`
       );
 
-      const mediaSourceCtor: typeof MediaSource | null =
-        typeof window !== "undefined" &&
-        typeof window.MediaSource !== "undefined" &&
-        window.MediaSource.isTypeSupported?.("audio/mpeg")
-          ? window.MediaSource
-          : null;
-
-      if (mediaSourceCtor) {
-        await playViaMediaSource({
-          ctx,
-          track,
-          trackId,
-          turnId: tid,
-          callGen,
-          respBody,
-          mediaSourceCtor,
-          ensureAnalyser,
-          scheduleCaptionClear,
-          setSpeaking: (on: boolean) =>
-            setTracksUI((prev) =>
-              prev.map((t) =>
-                t.id === trackId ? { ...t, speaking: on } : t
-              )
-            ),
-          tStart: t0,
-          onFirstSound,
-        });
-      } else {
-        // Fallback: buffer the whole mp3, decode, play via AudioBufferSource.
-        // Loses the streaming latency win but keeps the app functional on
-        // browsers without MediaSource (older iOS, etc.).
-        // eslint-disable-next-line no-console
-        console.log(
-          `[tts #${tid}] MediaSource unavailable — buffering full mp3 as fallback`
+      let audioBuf: AudioBuffer;
+      try {
+        audioBuf = await ctx.decodeAudioData(buf);
+      } catch (e) {
+        throw new Error(
+          `decodeAudioData failed: ${e instanceof Error ? e.message : String(e)}`
         );
-        const buf = await new Response(respBody).arrayBuffer();
-        if (callGen !== track.speakGen) return;
-        let audioBuf: AudioBuffer;
+      }
+      if (callGen !== track.speakGen) return;
+
+      // Lazy analyser + gain. If they already exist, restore gain (it
+      // may have been ramped to 0 by stopTrackAudio during this same
+      // turn's interrupt of a previous one). The RAF loop then drives
+      // gain from opacity * visibility * size-boost per frame.
+      if (!track.analyser) {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.4;
+        const gain = ctx.createGain();
+        gain.gain.value = Math.max(0, track.opacity || 1);
+        analyser.connect(gain);
+        gain.connect(ctx.destination);
+        track.analyser = analyser;
+        track.gain = gain;
+        track.freqData = new Uint8Array(
+          new ArrayBuffer(analyser.frequencyBinCount)
+        );
+        track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+      } else if (track.gain) {
         try {
-          audioBuf = await ctx.decodeAudioData(buf);
-        } catch (e) {
-          throw new Error(
-            `decodeAudioData failed: ${e instanceof Error ? e.message : String(e)}`
+          const now = ctx.currentTime;
+          track.gain.gain.cancelScheduledValues(now);
+          track.gain.gain.setValueAtTime(
+            Math.max(0, track.opacity || 1),
+            now
           );
+        } catch {
+          // scheduling failures are not fatal
         }
-        if (callGen !== track.speakGen) return;
-        ensureAnalyser();
-        if (!track.analyser) {
-          throw new Error("analyser unavailable for fallback playback");
-        }
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuf;
-        source.connect(track.analyser);
+      }
+      if (!track.analyser) {
+        throw new Error("analyser unavailable (AudioContext state?)");
+      }
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuf;
+      source.connect(track.analyser);
+
+      // Resolve when this utterance finishes so callers that `await` the
+      // play can sequence follow-ups (e.g. the group turn scheduler
+      // triggering the next prepare after the current turn ends).
+      const ended = new Promise<void>((resolve) => {
         source.onended = () => {
           if (track.source === source) {
             try {
@@ -1955,35 +1567,37 @@ export function Tracker() {
             );
             scheduleCaptionClear();
           }
+          resolve();
         };
+      });
+
+      try {
+        source.start();
+      } catch (e) {
         try {
-          source.start();
-        } catch (e) {
-          try {
-            source.disconnect();
-          } catch {
-            // ignore
-          }
-          throw new Error(
-            `source.start failed: ${e instanceof Error ? e.message : String(e)}`
-          );
+          source.disconnect();
+        } catch {
+          // ignore
         }
-        // Only publish state after start() succeeds so a failure path
-        // leaves no stuck speaking=true.
-        track.source = source;
-        setTracksUI((prev) =>
-          prev.map((t) => (t.id === trackId ? { ...t, speaking: true } : t))
+        throw new Error(
+          `source.start failed: ${e instanceof Error ? e.message : String(e)}`
         );
-        // Fallback path still counts as "first sound" once playback begins.
-        try {
-          onFirstSound?.();
-        } catch (cbErr) {
-          // eslint-disable-next-line no-console
-          console.log(
-            `[tts #${tid}] onFirstSound threw: ${cbErr instanceof Error ? cbErr.message : String(cbErr)}`
-          );
-        }
       }
+      // Publish speaking state only after start() succeeds, so an error
+      // path can't leave speaking=true wedged.
+      track.source = source;
+      setTracksUI((prev) =>
+        prev.map((t) => (t.id === trackId ? { ...t, speaking: true } : t))
+      );
+      try {
+        onFirstSound?.();
+      } catch (cbErr) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[tts #${tid}] onFirstSound threw: ${cbErr instanceof Error ? cbErr.message : String(cbErr)}`
+        );
+      }
+      await ended;
     },
     [ensureAudioCtx, waitForAudioRunning]
   );
@@ -2024,9 +1638,8 @@ export function Tracker() {
         track.captionClearTimer = null;
       }
 
-      // Stop whatever this track was already saying (buffer source OR
-      // streaming element); other tracks keep going — concurrent voices
-      // are a feature.
+      // Stop whatever this track was already saying. Other tracks keep
+      // going — concurrent voices are a feature.
       stopTrackAudio(track);
       // UI: thinking=true, speaking=false, caption cleared.
       setTracksUI((prev) =>
@@ -2057,7 +1670,11 @@ export function Tracker() {
         const t0 = performance.now();
         // Hard cap on the whole line-generation step — a hung vision call
         // must not strand the UI on "thinking=true" forever.
-        const GENERATE_LINE_TIMEOUT_MS = 20_000;
+        // Covers VLM + Cartesia TTFB end-to-end on /api/speak. Long
+        // enough to ride out a slow Cartesia start instead of aborting
+        // a request that was about to succeed (the main cause of "no
+        // audio at all" on first tap).
+        const GENERATE_LINE_TIMEOUT_MS = 120_000;
 
         // First-tap: use /api/speak to fold VLM + Cartesia into one
         // response. Server fires TTS the instant `line` is parsed from the
@@ -2078,7 +1695,11 @@ export function Tracker() {
           const speakTimer = setTimeout(
             () =>
               speakCtrl.abort(
-                new Error("/api/speak timed out after 20s")
+                new Error(
+                  `/api/speak timed out after ${Math.round(
+                    GENERATE_LINE_TIMEOUT_MS / 1000
+                  )}s`
+                )
               ),
             GENERATE_LINE_TIMEOUT_MS
           );
@@ -2197,7 +1818,14 @@ export function Tracker() {
             ),
             new Promise<never>((_, reject) =>
               setTimeout(
-                () => reject(new Error("generateLine timed out after 20s")),
+                () =>
+                  reject(
+                    new Error(
+                      `generateLine timed out after ${Math.round(
+                        GENERATE_LINE_TIMEOUT_MS / 1000
+                      )}s`
+                    )
+                  ),
                 GENERATE_LINE_TIMEOUT_MS
               )
             ),
@@ -2280,23 +1908,18 @@ export function Tracker() {
           `[speak:${trackId} ${tapTag}] ← generateLine=${generateLineMs}ms  voice=${track.voiceId ?? "default"}  line="${line}"`
         );
 
-        // Show caption + stop spinner as soon as we have the line. There
-        // is a brief (~500–800ms) window before the first Cartesia chunk
-        // becomes audible, during which the text leads the audio — that's
-        // the unavoidable cost of streaming. But "caption now, audio
-        // shortly after" is strictly better than the alternatives
-        // (caption-only silence on autoplay block / MediaSource hang).
+        // Show caption + stop spinner as soon as we have the line. The
+        // buffered TTS path adds ~300–500ms between caption and first
+        // audible sample — the trade for a reliable playback pipeline
+        // that doesn't silently drop on retap/converse/group.
         setTracksUI((prev) =>
           prev.map((t) =>
             t.id === trackId ? { ...t, caption: line, thinking: false } : t
           )
         );
 
-        // Stream TTS bytes via `/api/tts/stream` + MediaSource instead of
-        // waiting for the server to synthesize the full mp3, base64 it,
-        // and ship it back in JSON. Same pipe the converse/group paths
-        // already use — first audio sample plays within the TTS ttfb
-        // (~400–800ms) rather than after the full 1.5–2.2s synth cost.
+        // Hand off to the unified playback path — fetch (or reuse the
+        // /api/speak body), decode once, play via AudioBufferSource.
         const tStream = performance.now();
         let firstSoundMs = 0;
         // First-tap path passes the already-open audio body from
@@ -2515,23 +2138,21 @@ export function Tracker() {
           // ramp by seeing if the source is null (stopTrackAudio runs
           // when source is being torn down) — if source is active, we're
           // the ones driving the gain.
-          if (t.source != null || t.streamingAudio != null) {
+          if (t.source != null) {
             t.gain.gain.value = clamped;
           }
         }
       }
 
-      // (3) Per-track mouth-shape classification. Gate on either audio
-      // path — `t.source` covers the lock-time AudioBufferSource line and
-      // `t.streamingAudio` covers the conversation reply's MediaSource
-      // stream. Without the streaming gate, replies play audibly but the
-      // mouth stays shut. `classifyShapeSmooth` keeps an envelope +
+      // (3) Per-track mouth-shape classification. One gate — `t.source`
+      // is the AudioBufferSource driving every line (first-tap, retap,
+      // converse, group). `classifyShapeSmooth` keeps an envelope +
       // adaptive peak in `t.lipSync` so openness is normalized to this
-      // utterance's actual level (quiet Fish voices still open the mouth)
+      // utterance's actual level (quiet voices still open the mouth)
       // and frame-to-frame flicker is filtered out.
       for (const t of tracksRef.current) {
         let shape: MouthShape = "X";
-        const audible = t.source != null || t.streamingAudio != null;
+        const audible = t.source != null;
         if (audible && t.analyser && t.freqData && t.timeData) {
           t.analyser.getByteTimeDomainData(t.timeData);
           t.analyser.getByteFrequencyData(t.freqData);
@@ -3231,8 +2852,8 @@ export function Tracker() {
         console.log(`[group:prep] ← stale after groupLine`);
         return;
       }
-      // Fetch the full TTS audio as a Blob (no MediaSource streaming —
-      // we want the whole file ready so playback is click-to-sound fast).
+      // Fetch the full TTS audio as a Blob so playback is click-to-sound
+      // fast when the scheduler fires the prepared turn.
       let audioBlob: Blob | null = null;
       try {
         const resp = await fetch("/api/tts/stream", {
@@ -3972,9 +3593,6 @@ export function Tracker() {
         shape: "X",
         lipSync: createLipSyncState(),
         captionClearTimer: null,
-        streamingAudio: null,
-        streamingUrl: null,
-        streamingSource: null,
         voiceId: null,
         history: [],
         description: null,
@@ -4124,7 +3742,7 @@ export function Tracker() {
     const wasBusy = tracksUIRef.current.some((t) => t.thinking || t.speaking);
     let stoppedAudio = 0;
     for (const t of tracksRef.current) {
-      if (t.source || t.streamingAudio) stoppedAudio++;
+      if (t.source) stoppedAudio++;
       t.speakGen++;
       stopTrackAudio(t);
       if (t.captionClearTimer != null) {
@@ -5129,13 +4747,11 @@ export function Tracker() {
             <dt className="text-white/50">tts</dt>
             <dd
               className={
-                lastTtsBackend === "fish"
+                lastTtsBackend === "cartesia"
                   ? "text-emerald-200"
-                  : lastTtsBackend === "openai"
-                    ? "text-amber-200"
-                    : lastTtsBackend === "none"
-                      ? "text-rose-200"
-                      : ""
+                  : lastTtsBackend === "none"
+                    ? "text-rose-200"
+                    : ""
               }
             >
               {lastTtsBackend ?? "—"}

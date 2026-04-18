@@ -910,8 +910,6 @@ export async function generateLine(
   line: string;
   voiceId: string | null;
   description: string | null;
-  audioDataUrl: string | null;
-  backend: TtsBackend;
 }> {
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
@@ -1006,11 +1004,9 @@ export async function generateLine(
   const total = Date.now() - t0;
   // TTS used to run serially here, adding ~1.5–2.2s of dead time to
   // every first-tap and retap before this server action could return.
-  // Callers now stream Fish/Cartesia bytes directly via `/api/tts/stream`
+  // Callers now stream Cartesia bytes directly via `/api/tts/stream`
   // (same MediaSource pattern used by `converseWithObject` and
-  // `groupLine`), so this action is text-only. `audioDataUrl`/`backend`
-  // stay in the return shape for the public /api route's compatibility
-  // but are always null/"none".
+  // `groupLine`), so this action is text-only.
   // eslint-disable-next-line no-console
   console.log(
     `[generateLine${tagStr}] ◀ done  path=${path} ▸ vlm=${vlmMs}ms ▸ llm=${llmMs}ms  total=${total}ms`
@@ -1019,8 +1015,6 @@ export async function generateLine(
     line,
     voiceId: chosenVoiceId,
     description: chosenDescription,
-    audioDataUrl: null,
-    backend: "none" as TtsBackend,
   };
 }
 
@@ -1373,237 +1367,12 @@ export async function groupLine(args: {
 // The full loop:
 //   1. Browser records audio via MediaRecorder → Blob
 //   2. POST as FormData to this server action
-//   3. OpenAI Whisper transcribes the audio
-//   4. GLM-5V-Turbo generates an in-character reply (seeing the object
-//      crop as vision context so it stays in the same persona)
-//   5. Fish.audio TTS renders the reply; fallback ladder is OpenAI TTS
-//      and then caption-only
+//   3. OpenAI transcribes the audio (client Web Speech API preferred)
+//   4. Cerebras/OpenAI text LLM generates an in-character reply off the
+//      pinned persona card
+//   5. Client streams Cartesia TTS for the reply via /api/tts/stream
 // The client plays the returned audio through the track's AnalyserNode,
 // which the FaceVoice mouth classifier is already wired to.
-
-const FISH_TTS_URL = "https://api.fish.audio/v1/tts";
-const CARTESIA_TTS_URL = "https://api.cartesia.ai/tts/bytes";
-const CARTESIA_VERSION = "2024-11-13";
-
-type TtsBackend = "cartesia" | "fish" | "openai" | "none";
-
-// Cartesia Sonic — ~90ms TTFB, the primary hot-path synthesizer. Returns
-// mp3 bytes or null if the key is absent. Throws on HTTP/content errors so
-// the caller can fall through to Fish or OpenAI.
-//
-// Voice IDs here are Cartesia's (UUIDs), NOT Fish reference_ids. When a
-// Fish-style reference_id is passed in, we ignore it and use the lang-
-// appropriate default so character variety can be reintroduced later via
-// a Fish→Cartesia mapping without breaking callers.
-async function cartesiaTTS(
-  text: string,
-  voiceId?: string | null,
-  lang: Lang = "en"
-): Promise<Buffer | null> {
-  const key = process.env.CARTESIA_API_KEY?.trim();
-  if (!key) {
-    // eslint-disable-next-line no-console
-    console.log("[tts cartesia] — skipping: no CARTESIA_API_KEY");
-    return null;
-  }
-  const modelId = process.env.CARTESIA_MODEL_ID?.trim() || "sonic-3";
-  const defaultVoice =
-    lang === "zh"
-      ? process.env.CARTESIA_VOICE_ID_ZH?.trim() ||
-        "0cd0cde2-3b93-42b5-bcb9-f214a591aa29"
-      : process.env.CARTESIA_VOICE_ID_EN?.trim() ||
-        "a0e99841-438c-4a64-b679-ae501e7d6091";
-  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const chosenVoice = voiceId && uuidRe.test(voiceId) ? voiceId : defaultVoice;
-
-  const t0 = Date.now();
-  // eslint-disable-next-line no-console
-  console.log(
-    `[tts cartesia] → synthesizing ${text.length}ch model=${modelId} voice=${chosenVoice} lang=${lang}`
-  );
-  const resp = await fetch(CARTESIA_TTS_URL, {
-    method: "POST",
-    headers: {
-      "X-API-Key": key,
-      "Cartesia-Version": CARTESIA_VERSION,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model_id: modelId,
-      transcript: text,
-      voice: { mode: "id", id: chosenVoice },
-      output_format: {
-        container: "mp3",
-        bit_rate: 128000,
-        sample_rate: 44100,
-      },
-      language: lang === "zh" ? "zh" : "en",
-    }),
-  });
-  const dt = Date.now() - t0;
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => "");
-    // eslint-disable-next-line no-console
-    console.log(
-      `[tts cartesia] ✖ ${resp.status} in ${dt}ms: ${body.slice(0, 200)}`
-    );
-    throw new Error(`cartesia ${resp.status}: ${body.slice(0, 200)}`);
-  }
-  const ct = resp.headers.get("content-type") ?? "";
-  if (ct.includes("application/json")) {
-    const body = await resp.text().catch(() => "");
-    // eslint-disable-next-line no-console
-    console.log(
-      `[tts cartesia] ✖ non-audio response in ${dt}ms: ${body.slice(0, 200)}`
-    );
-    throw new Error(`cartesia returned non-audio: ${body.slice(0, 200)}`);
-  }
-  const buf = Buffer.from(await resp.arrayBuffer());
-  // eslint-disable-next-line no-console
-  console.log(
-    `[tts cartesia] ← ${Math.round(buf.length / 1024)}KB mp3 in ${Date.now() - t0}ms`
-  );
-  return buf;
-}
-
-// Fish.audio synthesis. Returns mp3 bytes or null if the key is absent;
-// throws on HTTP/content errors so the caller can fall through.
-// `voiceId` (when provided) overrides `FISH_REFERENCE_ID` — this is how a
-// per-track voice stays consistent across the object's whole conversation.
-async function fishTTS(
-  text: string,
-  voiceId?: string | null,
-  lang: Lang = "en"
-): Promise<Buffer | null> {
-  const key = process.env.FISH_API_KEY?.trim();
-  if (!key) {
-    // eslint-disable-next-line no-console
-    console.log("[tts fish] — skipping: no FISH_API_KEY");
-    return null;
-  }
-
-  const body: Record<string, unknown> = {
-    text,
-    format: "mp3",
-    mp3_bitrate: 128,
-    normalize: true,
-    latency: "normal",
-    chunk_length: 200,
-  };
-  // Precedence: per-track pick → lang-appropriate default → legacy env.
-  // Default is lang-aware so an unmatched zh-mode pick doesn't fall to
-  // Peter Griffin reading Mandarin.
-  const referenceId = voiceId?.trim() || getDefaultVoiceId(lang);
-  if (referenceId) body.reference_id = referenceId;
-
-  const t0 = Date.now();
-  // eslint-disable-next-line no-console
-  console.log(
-    `[tts fish] → synthesizing ${text.length}ch ref=${referenceId ?? "default"} model=${process.env.FISH_MODEL?.trim() || "s1"}`
-  );
-  const resp = await fetch(FISH_TTS_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-      model: process.env.FISH_MODEL?.trim() || "s1",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const dt = Date.now() - t0;
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    // eslint-disable-next-line no-console
-    console.log(`[tts fish] ✖ ${resp.status} in ${dt}ms: ${text.slice(0, 160)}`);
-    throw new Error(`fish ${resp.status}: ${text.slice(0, 200)}`);
-  }
-  const ct = resp.headers.get("content-type") ?? "";
-  if (ct.includes("application/json")) {
-    const text = await resp.text().catch(() => "");
-    // eslint-disable-next-line no-console
-    console.log(`[tts fish] ✖ non-audio response in ${dt}ms: ${text.slice(0, 160)}`);
-    throw new Error(`fish returned non-audio: ${text.slice(0, 200)}`);
-  }
-  const buf = Buffer.from(await resp.arrayBuffer());
-  // eslint-disable-next-line no-console
-  console.log(`[tts fish] ← ${Math.round(buf.length / 1024)}KB mp3 in ${Date.now() - t0}ms`);
-  return buf;
-}
-
-async function openaiTTS(text: string): Promise<Buffer | null> {
-  const openai = getOpenAIClient();
-  if (!openai) {
-    // eslint-disable-next-line no-console
-    console.log("[tts openai] — skipping: no OPENAI_API_KEY");
-    return null;
-  }
-  const t0 = Date.now();
-  // eslint-disable-next-line no-console
-  console.log(`[tts openai] → tts-1/nova synthesizing ${text.length}ch`);
-  const speech = await openai.audio.speech.create({
-    model: "tts-1",
-    voice: "nova",
-    input: text,
-    response_format: "mp3",
-  });
-  const buf = Buffer.from(await speech.arrayBuffer());
-  // eslint-disable-next-line no-console
-  console.log(`[tts openai] ← ${Math.round(buf.length / 1024)}KB mp3 in ${Date.now() - t0}ms`);
-  return buf;
-}
-
-async function synthesizeSpeech(
-  text: string,
-  voiceId?: string | null,
-  lang: Lang = "en"
-): Promise<{ audioDataUrl: string | null; backend: TtsBackend }> {
-  // Cartesia Sonic first when configured — ~90ms TTFB, the whole point of
-  // this ladder. Fish still has the character voices; swap back in by
-  // clearing CARTESIA_API_KEY if you want those for a session.
-  try {
-    const mp3 = await cartesiaTTS(text, voiceId, lang);
-    if (mp3) {
-      return {
-        audioDataUrl: `data:audio/mpeg;base64,${mp3.toString("base64")}`,
-        backend: "cartesia",
-      };
-    }
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn("[tts] cartesia failed, falling back:", err);
-  }
-  // Fish fallback — character-specific voices via reference_id.
-  try {
-    const mp3 = await fishTTS(text, voiceId, lang);
-    if (mp3) {
-      return {
-        audioDataUrl: `data:audio/mpeg;base64,${mp3.toString("base64")}`,
-        backend: "fish",
-      };
-    }
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn("[tts] fish failed, falling back:", err);
-  }
-  // OpenAI as a dependable fallback.
-  try {
-    const mp3 = await openaiTTS(text);
-    if (mp3) {
-      return {
-        audioDataUrl: `data:audio/mpeg;base64,${mp3.toString("base64")}`,
-        backend: "openai",
-      };
-    }
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn("[tts] openai failed too:", err);
-  }
-  // Caption-only mode — the caller should still render the line.
-  // eslint-disable-next-line no-console
-  console.log("[tts] — no backend available, caption-only");
-  return { audioDataUrl: null, backend: "none" };
-}
 
 // Browser-side Web Speech API does the transcription on the client now —
 // the user's browser ships the transcript along with the audio blob, so
