@@ -304,15 +304,17 @@ export async function generateComicImage(
       taskUUID,
       positivePrompt: prompt,
       model: RUNWARE_MODEL,
-      width: 512,
-      height: 512,
+      width: 384,
+      height: 384,
       numberResults: 1,
       outputType: "URL",
-      // PNG so the solid-white background is lossless — the gallery
-      // uses mix-blend-mode: multiply to drop the white into the shelf
-      // wood, and JPEG artefacts around the subject halo badly under
-      // that blend.
-      outputFormat: "PNG",
+      // WEBP at moderate quality keeps the file well under ~40 KB so the
+      // gallery tile renders immediately instead of showing the alt-text
+      // filename while a ~1 MB PNG streams in. The whiteToAlpha SVG
+      // filter in globals.css thresholds near-white pixels, so mild
+      // compression artefacts near the silhouette still get clipped.
+      outputFormat: "WEBP",
+      outputQuality: 72,
       checkNSFW: false,
     },
   ];

@@ -1,6 +1,6 @@
 "use server";
 
-import OpenAI, { toFile } from "openai";
+import OpenAI from "openai";
 
 // === Fish.audio voice catalog ===========================================
 //
@@ -1456,53 +1456,9 @@ export async function groupLine(args: {
 // The client plays the returned audio through the track's AnalyserNode,
 // which the FaceVoice mouth classifier is already wired to.
 
-// Browser-side Web Speech API does the transcription on the client now —
-// the user's browser ships the transcript along with the audio blob, so
-// the server side here is purely a fallback for browsers that don't
-// support SpeechRecognition (Firefox, some embedded webviews).
-//
-// Override via OPENAI_STT_MODEL — `whisper-1` if you need non-English
-// auto-detect quality.
-const STT_MODEL_OPENAI =
-  process.env.OPENAI_STT_MODEL?.trim() || "gpt-4o-mini-transcribe";
-const STT_LANGUAGE_EN = process.env.OPENAI_STT_LANGUAGE?.trim() || "en";
-
-function sttLanguageFor(lang: Lang): string {
-  return lang === "zh" ? "zh" : STT_LANGUAGE_EN;
-}
-
-async function transcribeAudio(
-  blob: Blob,
-  lang: Lang,
-  turnTag = ""
-): Promise<string> {
-  const openai = getOpenAIClient();
-  if (!openai) throw new Error("transcription needs OPENAI_API_KEY");
-  const filename =
-    blob.type.includes("mp4") ? "talk.mp4" :
-    blob.type.includes("ogg") ? "talk.ogg" :
-    "talk.webm";
-  const file = await toFile(blob, filename, {
-    type: blob.type || "audio/webm",
-  });
-  const sttLang = sttLanguageFor(lang);
-  const t0 = Date.now();
-  // eslint-disable-next-line no-console
-  console.log(
-    `[stt openai ${STT_MODEL_OPENAI}${turnTag}] → ${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  lang=${sttLang || "auto"}`
-  );
-  const result = await openai.audio.transcriptions.create({
-    file,
-    model: STT_MODEL_OPENAI,
-    ...(sttLang ? { language: sttLang } : {}),
-  });
-  const text = (result.text ?? "").trim();
-  // eslint-disable-next-line no-console
-  console.log(
-    `[stt openai ${STT_MODEL_OPENAI}${turnTag}] ✓ ${Date.now() - t0}ms "${text.slice(0, 120)}${text.length > 120 ? "…" : ""}"`
-  );
-  return text;
-}
+// Server-side STT is gone. On-device Whisper (lib/whisper.ts) is the sole
+// transcription path; the client always ships a pre-transcribed `transcript`
+// field with the audio blob. Empty transcript → stock "hmm?" reply below.
 
 // Fast non-vision LLM for the conversation reply. Skipping vision is the big
 // win — the description string carries all the visual context this call
@@ -1730,10 +1686,9 @@ export async function converseWithObject(
       : lang;
   const rawDescription = String(formData.get("description") ?? "").trim();
   const description = rawDescription ? rawDescription.slice(0, 600) : null;
-  // Browser-side Web Speech API ships the transcript with the request when
-  // it's available. We use it directly and skip the server-side STT
-  // roundtrip entirely (~700–1300ms saved). Empty when the browser doesn't
-  // support SpeechRecognition (Firefox) or the user spoke too quietly.
+  // On-device Whisper transcribes client-side and ships the final transcript
+  // with the audio blob. Empty means the mic caught nothing intelligible —
+  // the turn falls through to the stock "hmm?" reply below.
   const clientTranscript = String(formData.get("transcript") ?? "")
     .trim()
     .slice(0, 1000);
@@ -1745,8 +1700,9 @@ export async function converseWithObject(
   );
   const tag = ` #${turnId}`;
 
-  // Audio is still required as a fallback. If client transcription failed
-  // we transcribe server-side from the blob.
+  // Audio is still accepted but never transcribed here — Whisper runs on
+  // the device and ships `transcript` alongside the blob. The audio is kept
+  // for size-bound validation and future server-side use if ever needed.
   if (!(audio instanceof Blob)) {
     // eslint-disable-next-line no-console
     console.log(`[converse${tag}] ✖ missing audio`);
@@ -1774,37 +1730,16 @@ export async function converseWithObject(
   // phrases embedded.
   const resolvedVoice = voiceId ?? getDefaultVoiceId(spokenLang);
 
-  // Use the client transcript when present; fall back to server STT.
-  let transcript: string;
-  let sttBackend: "client" | "openai";
-  const sttStart = Date.now();
-  if (clientTranscript) {
-    transcript = clientTranscript;
-    sttBackend = "client";
-    // eslint-disable-next-line no-console
-    console.log(
-      `[stt client${tag}] ✓ 0ms "${transcript.slice(0, 120)}${transcript.length > 120 ? "…" : ""}"`
-    );
-  } else {
-    try {
-      // STT hints the language the USER speaks (spokenLang), not the one
-      // the object replies in.
-      transcript = await transcribeAudio(audio, spokenLang, tag);
-    } catch (err) {
-      // Short/low-quality webm blobs occasionally come back from
-      // MediaRecorder without the headers OpenAI STT needs, yielding a
-      // 400 "Audio file might be corrupted or unsupported". Treat that as
-      // an empty transcript so the turn falls through to the "hmm?" reply
-      // instead of 500ing the whole server action.
-      // eslint-disable-next-line no-console
-      console.log(
-        `[stt openai${tag}] ✖ ${err instanceof Error ? err.message : String(err)} — falling back to empty transcript`
-      );
-      transcript = "";
-    }
-    sttBackend = "openai";
-  }
-  const sttMs = Date.now() - sttStart;
+  // Whisper-on-device already produced the transcript. Empty is a valid
+  // signal that the mic caught nothing intelligible — fall through to the
+  // stock "hmm?" reply below.
+  const transcript = clientTranscript;
+  const sttBackend = "whisper-client";
+  const sttMs = 0;
+  // eslint-disable-next-line no-console
+  console.log(
+    `[stt ${sttBackend}${tag}] ${transcript ? "✓" : "∅"} "${transcript.slice(0, 120)}${transcript.length > 120 ? "…" : ""}"`
+  );
   if (!transcript) {
     const fallbacksEn = [
       "hmm?",

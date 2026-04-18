@@ -446,6 +446,12 @@ function BookshelfGallery({
   // string and we surface a toast.
   const recognitionRef = useRef<GallerySRLike | null>(null);
   const lastTranscriptRef = useRef<string>("");
+  // Resolves on the SR's `onend`, so `stopWebSpeech` can wait for the
+  // recognizer to flush its in-progress segment as a final result before
+  // we read the transcript. Without this, releasing the mic right after
+  // speaking returns an empty string ~half the time on Chrome.
+  const speechFinishedRef = useRef<Promise<void> | null>(null);
+  const resolveSpeechFinishedRef = useRef<(() => void) | null>(null);
 
   const ensureAudioCtx = useCallback((): AudioContext | null => {
     if (typeof window === "undefined") return null;
@@ -592,41 +598,63 @@ function BookshelfGallery({
       rec.continuous = true;
       rec.maxAlternatives = 1;
       lastTranscriptRef.current = "";
+      speechFinishedRef.current = new Promise<void>((resolve) => {
+        resolveSpeechFinishedRef.current = resolve;
+      });
       rec.onresult = (e: GallerySREventLike) => {
-        // Stitch all finalized results into one transcript. Interim results
-        // are ignored so we only ship a stable string on release.
+        // Rebuild the full transcript every event (results array is
+        // cumulative). Interim segments are appended to finalized ones so
+        // the live caption updates word-by-word as the user speaks.
         let finalText = "";
+        let interim = "";
         for (let i = 0; i < e.results.length; i++) {
           const res = e.results[i];
-          if (res.isFinal) {
-            finalText += res[0]?.transcript ?? "";
-          }
+          const t = res[0]?.transcript ?? "";
+          if (!t) continue;
+          if (res.isFinal) finalText += (finalText ? " " : "") + t;
+          else interim += t;
         }
-        // Also keep the latest interim in case the user releases before
-        // Chrome decides the segment is "final" — better than nothing.
-        if (!finalText) {
-          const last = e.results[e.results.length - 1];
-          if (last) finalText = last[0]?.transcript ?? "";
+        const live = (finalText + (interim ? (finalText ? " " : "") + interim : "")).trim();
+        if (live) {
+          lastTranscriptRef.current = live;
+          setHeard(live);
         }
-        if (finalText) lastTranscriptRef.current = finalText.trim();
       };
       rec.onerror = () => {
         // Stay silent — onRelease will detect an empty transcript and
         // surface a toast.
       };
+      rec.onend = () => {
+        resolveSpeechFinishedRef.current?.();
+        resolveSpeechFinishedRef.current = null;
+      };
       rec.start();
       recognitionRef.current = rec;
     } catch {
       recognitionRef.current = null;
+      speechFinishedRef.current = null;
+      resolveSpeechFinishedRef.current = null;
     }
   }, []);
 
-  const stopWebSpeech = useCallback((): string => {
+  const stopWebSpeech = useCallback(async (): Promise<string> => {
     const rec = recognitionRef.current;
     recognitionRef.current = null;
     if (rec) {
       try { rec.stop(); } catch {}
     }
+    // Wait for the recognizer to flush its in-progress segment as a final
+    // result. Capped at 600ms so a stuck recognizer can't lock the UI; the
+    // last interim is still in lastTranscriptRef as a fallback.
+    const finished = speechFinishedRef.current;
+    if (finished) {
+      await Promise.race([
+        finished,
+        new Promise<void>((r) => setTimeout(r, 600)),
+      ]);
+    }
+    speechFinishedRef.current = null;
+    resolveSpeechFinishedRef.current = null;
     const text = lastTranscriptRef.current.trim();
     lastTranscriptRef.current = "";
     return text;
@@ -846,16 +874,17 @@ function BookshelfGallery({
     (cardId: string) => {
       const recorder = recorderRef.current;
       if (!recorder || recorder.state !== "recording") return;
-      recorder.onstop = () => {
+      recorder.onstop = async () => {
         const blob = new Blob(recordedChunksRef.current, {
           type: recorder.mimeType || "audio/webm",
         });
         recordedChunksRef.current = [];
         recorderRef.current = null;
         // Read the live transcript collected by the Web Speech recognizer
-        // while the user was holding. The blob is only used as a length
-        // heuristic — the teacher call is text-only.
-        const transcript = stopWebSpeech();
+        // while the user was holding. Awaits SR's `onend` so the
+        // in-progress segment finalizes before we read it. The blob is
+        // only used as a length heuristic — the teacher call is text-only.
+        const transcript = await stopWebSpeech();
         if (blob.size < 1024) {
           setStatus("idle");
           setActiveCardId(null);
@@ -1592,19 +1621,32 @@ function ConversationDrawer({
             </ul>
           </div>
 
-          {status === "recording" && (
-            <p className="text-center text-[11.5px] uppercase tracking-[0.22em] text-pink-200/90">
-              listening… release to send
-            </p>
-          )}
-          {heard && status === "idle" && (
-            <p className="truncate text-center text-[10.5px] uppercase tracking-[0.18em] text-white/40">
-              you said:{" "}
-              <span className="normal-case tracking-normal text-white/65">
-                {heard}
-              </span>
-            </p>
-          )}
+          {/* Fixed-height status slot above the mic. The slot is always
+              rendered (even when empty) so the button below it stays
+              pinned to the same y-coordinate across status changes —
+              otherwise "listening…" appearing would shove the mic down
+              and the user's finger off it mid-press. */}
+          <div className="flex min-h-[44px] flex-col items-center justify-center text-center">
+            {status === "recording" ? (
+              <>
+                <p className="text-[11.5px] uppercase tracking-[0.22em] text-pink-200/90">
+                  listening… release to send
+                </p>
+                {heard && (
+                  <p className="mt-1 line-clamp-2 px-2 text-[12.5px] italic text-white/85">
+                    {heard}
+                  </p>
+                )}
+              </>
+            ) : heard && (status === "idle" || status === "thinking") ? (
+              <p className="truncate px-2 text-[10.5px] uppercase tracking-[0.18em] text-white/40">
+                you said:{" "}
+                <span className="normal-case tracking-normal text-white/65">
+                  {heard}
+                </span>
+              </p>
+            ) : null}
+          </div>
 
           <div className="flex items-center justify-center pt-1">
             <HoldToTalkButton
@@ -1641,6 +1683,16 @@ function Dot({ delay }: { delay?: string }) {
 
 // --- Hold-to-talk -------------------------------------------------------
 
+// Max time we'll record before auto-releasing. A user holding for 30s
+// has either fallen asleep on the button or hit a stuck-event bug; either
+// way we should ship the audio rather than leak the mic forever.
+const MAX_RECORDING_MS = 30_000;
+// Sub-180ms presses on a SPEAKING object are treated as interrupt-only
+// taps, not zero-length recordings. The same threshold from idle still
+// commits the recording so a fast double-tap doesn't silently leak a
+// mic stream.
+const INTERRUPT_TAP_MS = 180;
+
 function HoldToTalkButton({
   cardId,
   status,
@@ -1658,46 +1710,195 @@ function HoldToTalkButton({
   const speaking = status === "speaking";
   const thinking = status === "thinking";
   const busy = thinking || speaking;
+
+  const buttonRef = useRef<HTMLButtonElement>(null);
   const pressStartRef = useRef<number>(0);
+  // What the status was at the instant the user pressed. Used by the
+  // release path so the interrupt-tap heuristic doesn't read a state
+  // that's already changed mid-press.
+  const pressStatusRef = useRef<CardStatus>("idle");
+  // Single source of truth for "is a press currently held". Gates the
+  // release path so onPointerUp/onPointerCancel/keyboardUp can't all
+  // each fire onRelease and double-stop the recorder.
+  const isHeldRef = useRef(false);
+  const safetyTimerRef = useRef<number | null>(null);
+  const [holdMs, setHoldMs] = useState(0);
+
+  const beginHold = useCallback(() => {
+    if (isHeldRef.current) return;
+    // While a reply is in flight we treat the press as a no-op so the
+    // returning audio doesn't race a fresh recording. The interrupt
+    // affordance (tap during speaking) is still honored below.
+    if (thinking) return;
+    isHeldRef.current = true;
+    pressStartRef.current = performance.now();
+    pressStatusRef.current = status;
+    setHoldMs(0);
+    // Confirm the press registered. iOS only honors vibrate inside a
+    // user-gesture handler, which this is.
+    if (typeof navigator.vibrate === "function") {
+      try { navigator.vibrate(8); } catch {}
+    }
+    if (speaking) onInterruptSpeaking();
+    onPress(cardId);
+    if (safetyTimerRef.current != null) {
+      window.clearTimeout(safetyTimerRef.current);
+    }
+    safetyTimerRef.current = window.setTimeout(() => {
+      // Auto-release at the cap. finishHold dedupes so a real release
+      // arriving moments later is a no-op.
+      finishHold();
+    }, MAX_RECORDING_MS);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cardId, onPress, onInterruptSpeaking, speaking, thinking, status]);
+
+  const finishHold = useCallback(() => {
+    if (!isHeldRef.current) return;
+    isHeldRef.current = false;
+    if (safetyTimerRef.current != null) {
+      window.clearTimeout(safetyTimerRef.current);
+      safetyTimerRef.current = null;
+    }
+    const held = performance.now() - pressStartRef.current;
+    // A short tap that began while the object was speaking is treated as
+    // interrupt-only — the playback was already stopped in beginHold and
+    // there's no recording to commit. Pressing from idle always commits,
+    // even on a fast tap, so the parent's "too short" toast can guide the
+    // user instead of silently leaking the mic stream we just opened.
+    if (held < INTERRUPT_TAP_MS && pressStatusRef.current === "speaking") {
+      return;
+    }
+    onRelease(cardId);
+    setHoldMs(0);
+  }, [cardId, onRelease]);
+
+  // Live duration counter while recording. Only spins the RAF when
+  // actually recording — idle button costs zero frames.
+  useEffect(() => {
+    if (!recording) {
+      setHoldMs(0);
+      return;
+    }
+    const start = pressStartRef.current || performance.now();
+    let raf = 0;
+    const tick = () => {
+      setHoldMs(performance.now() - start);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [recording]);
+
+  // Keyboard hold-to-talk on space/enter — only when the button itself is
+  // focused, so it doesn't hijack typing elsewhere on the page. e.repeat
+  // is filtered so OS key-repeat doesn't fire beginHold a hundred times.
+  useEffect(() => {
+    const target = () => document.activeElement === buttonRef.current;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if (!target()) return;
+      if (e.key !== " " && e.key !== "Enter") return;
+      e.preventDefault();
+      beginHold();
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (!target()) return;
+      if (e.key !== " " && e.key !== "Enter") return;
+      e.preventDefault();
+      finishHold();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [beginHold, finishHold]);
+
+  // If the tab is hidden mid-record, finish so we don't leak audio while
+  // the user is somewhere else. Same idea for window blur.
+  useEffect(() => {
+    const onHide = () => {
+      if (isHeldRef.current) finishHold();
+    };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("blur", onHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("blur", onHide);
+    };
+  }, [finishHold]);
+
+  // Tear down the safety timer if the component unmounts mid-hold.
+  useEffect(() => {
+    return () => {
+      if (safetyTimerRef.current != null) {
+        window.clearTimeout(safetyTimerRef.current);
+        safetyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const seconds = Math.floor(holdMs / 1000);
+  const remaining = Math.max(0, Math.ceil((MAX_RECORDING_MS - holdMs) / 1000));
+  const nearMax = recording && remaining <= 5;
 
   return (
     <button
+      ref={buttonRef}
       type="button"
+      aria-pressed={recording}
       aria-label={
         recording
           ? "release to send"
           : speaking
             ? "tap to interrupt or hold to talk"
-            : "hold to talk"
+            : thinking
+              ? "thinking"
+              : "hold to talk"
       }
       onPointerDown={(e) => {
+        // Ignore non-primary buttons (right/middle click on desktop).
+        if (e.pointerType === "mouse" && e.button !== 0) return;
         e.preventDefault();
         try { (e.currentTarget as Element).setPointerCapture(e.pointerId); } catch {}
-        pressStartRef.current = performance.now();
-        // If the object is currently speaking, interrupt the playback
-        // immediately so the user can hear themselves and not talk over it.
-        if (speaking) onInterruptSpeaking();
-        // Don't start recording while the thinking request is in flight —
-        // it would race the returning reply.
-        if (thinking) return;
-        onPress(cardId);
+        beginHold();
       }}
       onPointerUp={(e) => {
         e.preventDefault();
         try { (e.currentTarget as Element).releasePointerCapture(e.pointerId); } catch {}
-        const held = performance.now() - pressStartRef.current;
-        // A very short tap on a speaking object is an interrupt, not a
-        // zero-length recording. Bail before releasing the recorder.
-        if (held < 180 && !recording) return;
-        onRelease(cardId);
+        finishHold();
       }}
-      onPointerCancel={() => onRelease(cardId)}
-      onPointerLeave={(e) => {
-        if (e.buttons > 0) onRelease(cardId);
+      onPointerCancel={(e) => {
+        try { (e.currentTarget as Element).releasePointerCapture(e.pointerId); } catch {}
+        finishHold();
       }}
-      className={`group relative inline-flex items-center gap-2.5 rounded-full px-6 py-3 text-[13px] font-semibold tracking-wide transition-[transform,box-shadow] duration-150 ${
+      // Intentionally NO onPointerLeave: with setPointerCapture above,
+      // the element keeps receiving pointer events even when the finger
+      // drifts off the button's box. Treating leave as a release was
+      // killing recordings on tiny finger movement.
+      onContextMenu={(e) => e.preventDefault()}
+      // Native click handler can fire after pointerup on some Android
+      // browsers; we've already handled release in pointerup, so swallow
+      // it to avoid a phantom second release path.
+      onClick={(e) => e.preventDefault()}
+      // Prevent the browser's own keydown→click translation (which
+      // would fire onClick once on space/enter), so our keyboard hold
+      // handlers above are the only path.
+      onKeyDown={(e) => {
+        if (e.key === " " || e.key === "Enter") e.preventDefault();
+      }}
+      onKeyUp={(e) => {
+        if (e.key === " " || e.key === "Enter") e.preventDefault();
+      }}
+      className={`group relative inline-flex select-none items-center gap-2.5 rounded-full px-6 py-3 text-[13px] font-semibold tracking-wide transition-[box-shadow,background-color] duration-150 ${
         recording ? "mic-recording" : ""
-      }`}
+      } ${nearMax ? "animate-pulse" : ""}`}
+      // Drag/select on the button itself is also blocked at the
+      // attribute level — belt-and-braces with the CSS below — because
+      // some browsers honor draggable=false even when user-select isn't
+      // respected (e.g. Safari with images inside the button).
+      draggable={false}
       style={{
         background: recording
           ? "linear-gradient(135deg, #ff5aa0 0%, #ff86be 100%)"
@@ -1708,24 +1909,49 @@ function HoldToTalkButton({
         boxShadow: recording
           ? undefined
           : "0 14px 30px -12px rgba(255,111,174,0.55)",
-        transform: recording ? "scale(0.98)" : undefined,
+        // Intentionally NO transform on press: the button must read as a
+        // physical object that doesn't shift under the finger. Pulse ring
+        // + color swap are the press feedback.
+        // touchAction:none stops the browser from interpreting the press
+        // as a scroll/pan gesture and stealing the pointer away.
         touchAction: "none",
+        // Bulletproof selection prevention: kills iOS's long-press
+        // magnifier, the "copy/share" callout, the blue tap-highlight
+        // flash, and any caret that would land on the label text.
+        userSelect: "none",
+        WebkitUserSelect: "none",
+        MozUserSelect: "none",
+        msUserSelect: "none",
+        WebkitTouchCallout: "none",
+        WebkitTapHighlightColor: "transparent",
+        cursor: thinking ? "not-allowed" : recording ? "grabbing" : "pointer",
+        opacity: thinking ? 0.85 : 1,
       }}
     >
       <span
         aria-hidden
-        className="grid h-7 w-7 place-items-center rounded-full"
+        className="grid h-7 w-7 shrink-0 place-items-center rounded-full"
         style={{
           background: recording
             ? "rgba(255,255,255,0.28)"
             : "rgba(255,255,255,0.65)",
+          // Pointer events go to the button, never the inner chip — so a
+          // finger that lands on the icon edge doesn't get treated as a
+          // separate target.
+          pointerEvents: "none",
         }}
       >
         <MicIcon />
       </span>
-      <span className="min-w-[90px] text-left">
+      {/* Fixed-width label slot so the icon stays put as the text swaps
+          between "hold to talk" / "release · Ns" / "thinking…". Centered
+          so neither the longest nor shortest label nudges anything. */}
+      <span
+        className="block w-[120px] text-center tabular-nums"
+        style={{ pointerEvents: "none" }}
+      >
         {recording
-          ? "release to send"
+          ? `release · ${seconds}s`
           : status === "thinking"
             ? "thinking…"
             : status === "speaking"
