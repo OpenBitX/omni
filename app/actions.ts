@@ -1063,16 +1063,47 @@ export async function converseWithObject(
       `[stt client${tag}] ✓ 0ms "${transcript.slice(0, 120)}${transcript.length > 120 ? "…" : ""}"`
     );
   } else {
-    transcript = await transcribeAudio(audio, tag);
+    try {
+      transcript = await transcribeAudio(audio, tag);
+    } catch (err) {
+      // Short/low-quality webm blobs occasionally come back from
+      // MediaRecorder without the headers OpenAI STT needs, yielding a
+      // 400 "Audio file might be corrupted or unsupported". Treat that as
+      // an empty transcript so the turn falls through to the "hmm?" reply
+      // instead of 500ing the whole server action.
+      // eslint-disable-next-line no-console
+      console.log(
+        `[stt openai${tag}] ✖ ${err instanceof Error ? err.message : String(err)} — falling back to empty transcript`
+      );
+      transcript = "";
+    }
     sttBackend = "openai";
   }
   const sttMs = Date.now() - sttStart;
   if (!transcript) {
+    const fallbacks = [
+      "hmm?",
+      "huh?",
+      "what was that?",
+      "say that again?",
+      "wait, what?",
+      "come again?",
+      "speak up, buddy.",
+      "didn't catch that.",
+      "you gonna finish that thought?",
+      "mumble much?",
+      "one more time?",
+      "eh?",
+      "what?",
+      "sorry, drifted off.",
+      "run that back?",
+    ];
+    const reply = fallbacks[Math.floor(Math.random() * fallbacks.length)];
     // eslint-disable-next-line no-console
     console.log(
-      `[converse${tag}] ✓ TOTAL=${Date.now() - t0}ms ━ stt=${sttBackend}/${sttMs}ms (empty)  → reply="hmm?"`
+      `[converse${tag}] ✓ TOTAL=${Date.now() - t0}ms ━ stt=${sttBackend}/${sttMs}ms (empty)  → reply="${reply}"`
     );
-    return { transcript: "", reply: "hmm?", voiceId: resolvedVoice };
+    return { transcript: "", reply, voiceId: resolvedVoice };
   }
 
   // Fast text-only LLM. The visual context the reply needs lives in the
