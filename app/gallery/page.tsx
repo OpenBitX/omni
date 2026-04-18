@@ -13,11 +13,16 @@ import {
   cardDisplayName,
   clearSessionCards,
   removeSessionCard,
+  setCardGeneratedImage,
+  setCardImageStatus,
+  updateSessionCard,
   useSessionCards,
+  type AppLang,
   type ChatTurn,
   type SessionCard,
 } from "@/lib/session-cards";
-import { converseWithObject } from "@/app/actions";
+import { gallerizeCard, teacherSay } from "@/app/actions";
+import { useOnboardingPrefs } from "@/lib/onboarding";
 import {
   FACE_VOICE_HEIGHT,
   FACE_VOICE_WIDTH,
@@ -38,10 +43,62 @@ import {
 // conversation — history lives in `sessionStorage` via session-cards store,
 // so it survives route transitions.
 //
+// The gallery is reframed as a language-learning surface: each card is a
+// bilingual learning card, and tapping one opens a teacher conversation
+// where the object plays a native speaker of the user's LEARN language
+// (opposite of their onboarding `spokenLang`).
+//
 // All Web Audio + mic + MediaSource plumbing is self-contained here (no
 // imports from tracker.tsx). Only one card can speak at a time.
 
 type CardStatus = "idle" | "recording" | "thinking" | "speaking";
+
+// --- Web Speech API shims -------------------------------------------------
+//
+// The DOM lib doesn't always expose SpeechRecognition (it's a WebKit-origin
+// API still gated behind the `webkitSpeechRecognition` prefix in most TS
+// targets). We define a minimal structural type so this file typechecks
+// without pulling in lib.dom.iterable.d.ts additions. Mirrors the shims in
+// components/tracker.tsx.
+interface GallerySRResultLike {
+  0: { transcript: string };
+  isFinal: boolean;
+}
+interface GallerySRResultListLike {
+  readonly length: number;
+  [index: number]: GallerySRResultLike;
+}
+interface GallerySREventLike extends Event {
+  results: GallerySRResultListLike;
+}
+interface GallerySRLike {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives: number;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+  onresult: ((e: GallerySREventLike) => void) | null;
+  onerror: ((e: Event) => void) | null;
+  onend: (() => void) | null;
+}
+type GallerySRCtor = new () => GallerySRLike;
+
+function getGallerySRCtor(): GallerySRCtor | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as {
+    SpeechRecognition?: GallerySRCtor;
+    webkitSpeechRecognition?: GallerySRCtor;
+  };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+}
+
+// Flip the user's native → target. Kept pure so we can call it anywhere
+// without reading hooks.
+function oppositeLang(lang: AppLang): AppLang {
+  return lang === "zh" ? "en" : "zh";
+}
 
 // Shelf geometry — the bookshelf image has 4 shelves × 3 bays. Percentages
 // are the bottom-edge of each shelf slot, measured from the TOP of the
@@ -49,21 +106,85 @@ type CardStatus = "idle" | "recording" | "thinking" | "speaking";
 // on the shelf plank. Pillars run at roughly x=33% and x=67%; the bay
 // centers avoid them.
 const SHELF_ROWS_Y = [34, 52, 70, 89] as const; // % from top of bookshelf
-const BAY_X = [17, 50, 83] as const; // % from left of bookshelf
+const BAYS_THREE = [17, 50, 83] as const;
+const BAYS_TWO = [20, 80] as const;
+const BAYS_ONE = [50] as const;
 
-const MAX_VISIBLE_SLOTS = SHELF_ROWS_Y.length * BAY_X.length; // 12
+const MAX_VISIBLE_SLOTS = SHELF_ROWS_Y.length * BAYS_THREE.length; // 12
 
-type LensFilter = "all" | "play" | "language" | "history";
+// Given N cards, return N (x,y) slots distributed across as few shelves
+// as possible but still spread horizontally — a single card centers on
+// the top shelf instead of sliding into the top-left bay and leaving the
+// rest empty. Rows fill top-down so newest (index 0) always lands where
+// the eye goes first.
+function assignShelfSlots(n: number): { x: number; y: number }[] {
+  if (n <= 0) return [];
+  const clamped = Math.min(n, MAX_VISIBLE_SLOTS);
+  const rows = Math.min(SHELF_ROWS_Y.length, Math.ceil(clamped / 3));
+  const perRow: number[] = [];
+  let remaining = clamped;
+  for (let r = 0; r < rows; r++) {
+    const rowsLeft = rows - r;
+    const take = Math.min(3, Math.ceil(remaining / rowsLeft));
+    perRow.push(take);
+    remaining -= take;
+  }
+  const out: { x: number; y: number }[] = [];
+  for (let r = 0; r < rows; r++) {
+    const count = perRow[r];
+    const y = SHELF_ROWS_Y[r];
+    const bays =
+      count === 1 ? BAYS_ONE : count === 2 ? BAYS_TWO : BAYS_THREE;
+    for (const bx of bays) out.push({ x: bx, y });
+  }
+  return out;
+}
+
+// Inline SVG defs — referenced by .shelf-cutout via filter: url(#whiteToAlpha).
+// Maps near-white pixels to alpha=0, preserving edges on every other color.
+// Alpha = -1.2·r - 1.2·g - 1.2·b + 3.6 (clamped). White → 0. Gray+ → 1.
+function SvgFilters() {
+  return (
+    <svg
+      aria-hidden
+      width="0"
+      height="0"
+      style={{ position: "absolute", width: 0, height: 0 }}
+    >
+      <defs>
+        <filter
+          id="whiteToAlpha"
+          x="-10%"
+          y="-10%"
+          width="120%"
+          height="120%"
+          colorInterpolationFilters="sRGB"
+        >
+          <feColorMatrix
+            type="matrix"
+            values="1 0 0 0 0
+                    0 1 0 0 0
+                    0 0 1 0 0
+                    -1.2 -1.2 -1.2 0 3.6"
+          />
+        </filter>
+      </defs>
+    </svg>
+  );
+}
 
 export default function GalleryPage() {
   const cards = useSessionCards();
+  const prefs = useOnboardingPrefs();
   const hasCards = cards.length > 0;
-  const [filter, setFilter] = useState<LensFilter>("all");
 
-  const filteredCards = useMemo(() => {
-    if (filter === "all") return cards;
-    return cards.filter((c) => (c.mode ?? "play") === filter);
-  }, [cards, filter]);
+  // spokenLang comes from onboarding; learnLang is always the opposite.
+  // Gallery is a bilingual surface, so we derive both here and pass them
+  // down to the bookshelf / drawer so every call to teacherSay + /api/tts/stream
+  // reflects the user's CURRENT preference (not whatever was snapshotted
+  // onto the card at capture time).
+  const spokenLang: AppLang = prefs.spokenLang;
+  const learnLang: AppLang = oppositeLang(spokenLang);
 
   return (
     <div
@@ -83,128 +204,21 @@ export default function GalleryPage() {
             "radial-gradient(ellipse at 50% 20%, transparent 0%, rgba(8,4,20,0.35) 65%, rgba(8,4,20,0.75) 100%)",
         }}
       />
+      <SvgFilters />
       <div className="relative z-10">
         <Header hasCards={hasCards} />
         <main className="mx-auto w-full max-w-[1280px] px-4 pb-16 pt-4 sm:px-6">
           {hasCards ? (
-            <>
-              <LensFilterBar
-                cards={cards}
-                filter={filter}
-                onChange={setFilter}
-              />
-              {filteredCards.length === 0 ? (
-                <FilterEmptyState
-                  filter={filter}
-                  onReset={() => setFilter("all")}
-                />
-              ) : (
-                <BookshelfGallery cards={filteredCards} />
-              )}
-            </>
+            <BookshelfGallery
+              cards={cards}
+              spokenLang={spokenLang}
+              learnLang={learnLang}
+            />
           ) : (
             <EmptyState />
           )}
         </main>
       </div>
-    </div>
-  );
-}
-
-function LensFilterBar({
-  cards,
-  filter,
-  onChange,
-}: {
-  cards: readonly SessionCard[];
-  filter: LensFilter;
-  onChange: (next: LensFilter) => void;
-}) {
-  const counts = useMemo(() => {
-    const c: Record<LensFilter, number> = {
-      all: cards.length,
-      play: 0,
-      language: 0,
-      history: 0,
-    };
-    for (const card of cards) {
-      const m = (card.mode ?? "play") as LensFilter;
-      if (m === "play" || m === "language" || m === "history") c[m]++;
-    }
-    return c;
-  }, [cards]);
-
-  const opts: { value: LensFilter; label: string; glyph: string }[] = [
-    { value: "all", label: "all", glyph: "∗" },
-    { value: "play", label: "play", glyph: "✿" },
-    { value: "language", label: "language", glyph: "✦" },
-    { value: "history", label: "history", glyph: "♡" },
-  ];
-
-  return (
-    <div className="mx-auto mb-6 flex w-full max-w-[560px] flex-nowrap items-center justify-center gap-1 rounded-full bg-white/[0.06] p-1 ring-1 ring-white/15 backdrop-blur-2xl">
-      {opts.map((o) => {
-        const active = filter === o.value;
-        const n = counts[o.value];
-        return (
-          <button
-            key={o.value}
-            type="button"
-            onClick={() => onChange(o.value)}
-            aria-pressed={active}
-            className={
-              "inline-flex min-w-0 flex-1 flex-nowrap items-center justify-center gap-1 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11.5px] font-semibold tracking-wide transition " +
-              (active
-                ? "bg-white/85 text-[#c23a7a] shadow-sm"
-                : "text-white/75 hover:bg-white/[0.08] hover:text-white")
-            }
-          >
-            <span aria-hidden className="shrink-0 text-[12.5px] leading-none">
-              {o.glyph}
-            </span>
-            <span className="shrink-0 leading-none">{o.label}</span>
-            <span
-              className={
-                "shrink-0 rounded-full px-1.5 text-[9.5px] font-semibold leading-[1.35] tabular-nums tracking-wide " +
-                (active
-                  ? "bg-[#c23a7a]/15 text-[#c23a7a]"
-                  : "bg-white/10 text-white/55")
-              }
-            >
-              {n}
-            </span>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function FilterEmptyState({
-  filter,
-  onReset,
-}: {
-  filter: LensFilter;
-  onReset: () => void;
-}) {
-  const label = filter === "all" ? "" : filter;
-  return (
-    <div className="mx-auto mt-10 max-w-md rounded-[28px] bg-white/[0.05] p-8 text-center ring-1 ring-white/15 backdrop-blur-2xl">
-      <h2 className="serif-italic text-[20px] text-white/95">
-        nothing from the{" "}
-        <span className="text-[color:var(--accent)]">{label}</span> lens yet
-      </h2>
-      <p className="mt-2 text-[12.5px] text-white/55">
-        switch lenses on the camera and tap something — it&apos;ll land on
-        this shelf.
-      </p>
-      <button
-        type="button"
-        onClick={onReset}
-        className="btn-frost mt-5 px-4 py-2 text-[11.5px] font-medium"
-      >
-        show all
-      </button>
     </div>
   );
 }
@@ -309,7 +323,15 @@ function EmptyState() {
 
 // --- Bookshelf + drawer ---------------------------------------------------
 
-function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
+function BookshelfGallery({
+  cards,
+  spokenLang,
+  learnLang,
+}: {
+  cards: readonly SessionCard[];
+  spokenLang: AppLang;
+  learnLang: AppLang;
+}) {
   // Newest first, so fresh items land on the top-left slot — the most
   // visible spot. Slots beyond MAX_VISIBLE_SLOTS fall back to a secondary
   // row below the shelf.
@@ -324,6 +346,74 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
   const [heard, setHeard] = useState<string | null>(null);
   const [shape, setShape] = useState<MouthShape>("X");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // --- Lazy bilingual fill ---------------------------------------------
+  //
+  // On mount (and whenever the card list grows), fill missing
+  // bilingualIntro / translatedName via the `gallerizeCard` action. Bounded
+  // to 3 in flight at once so we don't blast the reply backend with ten
+  // simultaneous requests on a fresh-load of a busy session. Cards that
+  // already have both fields are skipped — work is persisted through
+  // updateSessionCard, so we only pay it once.
+  const hydratingRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    // Skip entirely when the user happens to speak both languages (never
+    // happens today since onboarding only offers en + zh, but guard
+    // anyway).
+    if (spokenLang === learnLang) return;
+
+    const missing = cards.filter(
+      (c) =>
+        !hydratingRef.current.has(c.id) &&
+        (!c.bilingualIntro ||
+          !c.bilingualIntro.learn ||
+          !c.bilingualIntro.spoken ||
+          !c.translatedName)
+    );
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+    const MAX_CONCURRENCY = 3;
+    const queue = missing.slice();
+
+    const runOne = async (): Promise<void> => {
+      while (!cancelled) {
+        const card = queue.shift();
+        if (!card) return;
+        if (hydratingRef.current.has(card.id)) continue;
+        hydratingRef.current.add(card.id);
+        try {
+          const result = await gallerizeCard({
+            description: card.description,
+            objectName: card.objectName ?? null,
+            className: card.className,
+            spokenLang,
+            learnLang,
+          });
+          if (cancelled) return;
+          updateSessionCard(card.id, {
+            bilingualIntro: result.bilingualIntro,
+            translatedName: result.translatedName,
+          });
+        } catch {
+          // Leave the card un-hydrated; the UI shows a skeleton and we'll
+          // retry next mount.
+        } finally {
+          hydratingRef.current.delete(card.id);
+        }
+      }
+    };
+
+    const workers: Promise<void>[] = [];
+    for (let i = 0; i < Math.min(MAX_CONCURRENCY, queue.length); i++) {
+      workers.push(runOne());
+    }
+    void Promise.all(workers);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [cards, spokenLang, learnLang]);
 
   // --- Audio graph (shared across cards) --------------------------------
 
@@ -343,6 +433,19 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const turnCounterRef = useRef(0);
+  // Teach mode latches on the first user utterance that asks to learn the
+  // OTHER language ("教我英文", "how do you say…"). Once latched, every
+  // subsequent turn in this gallery mount stays in teach mode — primarily
+  // spokenLang with one short learnLang teaching phrase embedded. Resets
+  // on unmount (i.e. when the user leaves /gallery).
+  const [teachModeLatched, setTeachModeLatched] = useState(false);
+  // Web Speech API for live transcription — runs in parallel with
+  // MediaRecorder. MediaRecorder is retained for the recording indicator
+  // UX, Web Speech is what actually produces the userText we send to
+  // teacherSay. Chrome + Safari back it; Firefox drops through with empty
+  // string and we surface a toast.
+  const recognitionRef = useRef<GallerySRLike | null>(null);
+  const lastTranscriptRef = useRef<string>("");
 
   const ensureAudioCtx = useCallback((): AudioContext | null => {
     if (typeof window === "undefined") return null;
@@ -476,6 +579,59 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
     }
   }, []);
 
+  const startWebSpeech = useCallback((lang: AppLang): void => {
+    const SR = getGallerySRCtor();
+    if (!SR) {
+      recognitionRef.current = null;
+      return;
+    }
+    try {
+      const rec = new SR();
+      rec.lang = lang === "zh" ? "zh-CN" : "en-US";
+      rec.interimResults = true;
+      rec.continuous = true;
+      rec.maxAlternatives = 1;
+      lastTranscriptRef.current = "";
+      rec.onresult = (e: GallerySREventLike) => {
+        // Stitch all finalized results into one transcript. Interim results
+        // are ignored so we only ship a stable string on release.
+        let finalText = "";
+        for (let i = 0; i < e.results.length; i++) {
+          const res = e.results[i];
+          if (res.isFinal) {
+            finalText += res[0]?.transcript ?? "";
+          }
+        }
+        // Also keep the latest interim in case the user releases before
+        // Chrome decides the segment is "final" — better than nothing.
+        if (!finalText) {
+          const last = e.results[e.results.length - 1];
+          if (last) finalText = last[0]?.transcript ?? "";
+        }
+        if (finalText) lastTranscriptRef.current = finalText.trim();
+      };
+      rec.onerror = () => {
+        // Stay silent — onRelease will detect an empty transcript and
+        // surface a toast.
+      };
+      rec.start();
+      recognitionRef.current = rec;
+    } catch {
+      recognitionRef.current = null;
+    }
+  }, []);
+
+  const stopWebSpeech = useCallback((): string => {
+    const rec = recognitionRef.current;
+    recognitionRef.current = null;
+    if (rec) {
+      try { rec.stop(); } catch {}
+    }
+    const text = lastTranscriptRef.current.trim();
+    lastTranscriptRef.current = "";
+    return text;
+  }, []);
+
   const onMicPress = useCallback(
     async (cardId: string) => {
       setErrorMsg(null);
@@ -504,120 +660,15 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
       setStatus("recording");
       setHeard(null);
       setLiveReply(null);
+      // Web Speech runs alongside MediaRecorder. We read its transcript on
+      // release; the blob is discarded (teacher is text-only).
+      startWebSpeech(spokenLang);
       recorder.start();
     },
-    [ensureAudioCtx, openMicStream, stopCurrentPlayback]
+    [ensureAudioCtx, openMicStream, stopCurrentPlayback, startWebSpeech, spokenLang]
   );
 
-  const onMicRelease = useCallback(
-    (cardId: string) => {
-      const recorder = recorderRef.current;
-      if (!recorder || recorder.state !== "recording") return;
-      recorder.onstop = () => {
-        const blob = new Blob(recordedChunksRef.current, {
-          type: recorder.mimeType || "audio/webm",
-        });
-        recordedChunksRef.current = [];
-        recorderRef.current = null;
-        if (blob.size < 1024) {
-          setStatus("idle");
-          setActiveCardId(null);
-          setErrorMsg("too short — hold the button longer");
-          return;
-        }
-        const card = cards.find((c) => c.id === cardId);
-        if (!card) {
-          setStatus("idle");
-          setActiveCardId(null);
-          return;
-        }
-        setStatus("thinking");
-        void runSpeakTurn(card, blob);
-      };
-      try { recorder.stop(); } catch {}
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [cards]
-  );
-
-  // --- Conversation turn -------------------------------------------------
-
-  const runSpeakTurn = useCallback(
-    async (card: SessionCard, blob: Blob) => {
-      const ctx = ensureAudioCtx();
-      if (!ctx) {
-        setStatus("idle");
-        setActiveCardId(null);
-        setErrorMsg("Web Audio unavailable");
-        return;
-      }
-      const callGen = ++speakGenRef.current;
-      const turnId = String(++turnCounterRef.current);
-      const history: ChatTurn[] =
-        card.history && card.history.length > 0
-          ? card.history.slice()
-          : [{ role: "assistant", content: card.line }];
-
-      try {
-        const form = new FormData();
-        const filename = blob.type.includes("mp4")
-          ? "talk.mp4"
-          : blob.type.includes("ogg")
-            ? "talk.ogg"
-            : "talk.webm";
-        form.append("audio", blob, filename);
-        form.append("className", card.objectName?.trim() || card.className);
-        form.append("voiceId", card.voiceId);
-        form.append("description", card.description);
-        form.append("history", JSON.stringify(history.slice(-32)));
-        form.append("turnId", turnId);
-        form.append("lang", card.learnLang ?? card.spokenLang ?? "zh");
-        if (card.spokenLang) form.append("spokenLang", card.spokenLang);
-        if (card.learnLang) form.append("learnLang", card.learnLang);
-
-        const { transcript, reply, voiceId: replyVoiceId } =
-          await converseWithObject(form);
-        if (callGen !== speakGenRef.current) return;
-
-        if (transcript) setHeard(transcript);
-        if (!reply) {
-          setStatus("idle");
-          setActiveCardId(null);
-          setErrorMsg("no reply");
-          return;
-        }
-
-        // Persist the turn to the session card store so the conversation
-        // survives a route transition. appendCardHistory dedupes consecutive
-        // identical assistant messages so opening-line + first reply don't
-        // double up.
-        const turns: ChatTurn[] = [];
-        if (transcript) turns.push({ role: "user", content: transcript });
-        turns.push({ role: "assistant", content: reply });
-        appendCardHistory({ cardId: card.id }, turns);
-
-        setLiveReply(reply);
-        setStatus("speaking");
-        await streamTTS({
-          ctx,
-          text: reply,
-          voiceId: replyVoiceId ?? card.voiceId,
-          turnId,
-          callGen,
-        });
-        if (callGen !== speakGenRef.current) return;
-        setStatus("idle");
-        setActiveCardId(null);
-      } catch (e) {
-        if (callGen !== speakGenRef.current) return;
-        setErrorMsg(e instanceof Error ? e.message : "talk failed");
-        setStatus("idle");
-        setActiveCardId(null);
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [ensureAudioCtx]
-  );
+  // --- Conversation: TTS + teacher turn ---------------------------------
 
   const streamTTS = useCallback(
     async (args: {
@@ -626,8 +677,9 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
       voiceId: string;
       turnId: string;
       callGen: number;
+      ttsLang: AppLang;
     }): Promise<void> => {
-      const { ctx, text, voiceId, turnId, callGen } = args;
+      const { ctx, text, voiceId, turnId, callGen, ttsLang } = args;
       const resp = await fetch("/api/tts/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -635,7 +687,10 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
           text,
           voiceId,
           turnId,
-          lang: "en",
+          // Always the CURRENT learnLang — the card's snapshot is ignored on
+          // purpose so a user who switches their learn language in
+          // onboarding retroactively hears the new language.
+          lang: ttsLang,
           emotion: [],
           speed: null,
         }),
@@ -702,6 +757,133 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
     [ensureAnalyser, startLipSyncLoop, stopLipSyncLoop]
   );
 
+  // Runs a teacher turn on mic release. userText is ALWAYS non-empty here
+  // (null path removed — no auto-intro). Passes the latched teach flag
+  // through to the server; server re-checks detectTeachMode on the fresh
+  // utterance so the latch can flip on a "teach me" ask we haven't seen
+  // yet. When the server resolves teachMode=true, we latch it locally.
+  const runTeacherTurn = useCallback(
+    async (card: SessionCard, userText: string) => {
+      const ctx = ensureAudioCtx();
+      if (!ctx) {
+        setStatus("idle");
+        setActiveCardId(null);
+        setErrorMsg("Web Audio unavailable");
+        return;
+      }
+      const callGen = ++speakGenRef.current;
+      const turnId = String(++turnCounterRef.current);
+      const history: ChatTurn[] = card.history ? card.history.slice() : [];
+
+      try {
+        setStatus("thinking");
+        setActiveCardId(card.id);
+        const {
+          line,
+          voiceId: replyVoiceId,
+          teachMode: resolvedTeachMode,
+        } = await teacherSay({
+          description: card.description,
+          className: card.className,
+          objectName: card.objectName ?? null,
+          spokenLang,
+          learnLang,
+          userText,
+          history,
+          voiceId: card.voiceId,
+          turnId,
+          teachMode: teachModeLatched,
+        });
+        if (callGen !== speakGenRef.current) return;
+        if (!line) {
+          setStatus("idle");
+          setActiveCardId(null);
+          setErrorMsg("no reply");
+          return;
+        }
+
+        // Latch teach mode on the first turn the server resolves to true.
+        // Stays on for the rest of this gallery mount (natural reset on
+        // navigation away).
+        if (resolvedTeachMode && !teachModeLatched) {
+          setTeachModeLatched(true);
+        }
+
+        // Persist both turns (user then assistant).
+        appendCardHistory({ cardId: card.id }, [
+          { role: "user", content: userText },
+          { role: "assistant", content: line },
+        ]);
+
+        setLiveReply(line);
+        setStatus("speaking");
+        await streamTTS({
+          ctx,
+          text: line,
+          voiceId: replyVoiceId,
+          turnId,
+          callGen,
+          // TTS always renders in spokenLang — even in teach mode the
+          // reply is primarily spokenLang, with at most one embedded
+          // learnLang phrase that Cartesia's monolingual voice can
+          // handle with mild accent.
+          ttsLang: spokenLang,
+        });
+        if (callGen !== speakGenRef.current) return;
+        setStatus("idle");
+        setActiveCardId(null);
+      } catch (e) {
+        if (callGen !== speakGenRef.current) return;
+        setErrorMsg(e instanceof Error ? e.message : "talk failed");
+        setStatus("idle");
+        setActiveCardId(null);
+      }
+    },
+    [ensureAudioCtx, streamTTS, spokenLang, learnLang, teachModeLatched]
+  );
+
+  const onMicRelease = useCallback(
+    (cardId: string) => {
+      const recorder = recorderRef.current;
+      if (!recorder || recorder.state !== "recording") return;
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        recordedChunksRef.current = [];
+        recorderRef.current = null;
+        // Read the live transcript collected by the Web Speech recognizer
+        // while the user was holding. The blob is only used as a length
+        // heuristic — the teacher call is text-only.
+        const transcript = stopWebSpeech();
+        if (blob.size < 1024) {
+          setStatus("idle");
+          setActiveCardId(null);
+          setErrorMsg("too short — hold the button longer");
+          return;
+        }
+        if (!transcript) {
+          setStatus("idle");
+          setActiveCardId(null);
+          setErrorMsg("didn't catch that — try again");
+          return;
+        }
+        const card = cards.find((c) => c.id === cardId);
+        if (!card) {
+          setStatus("idle");
+          setActiveCardId(null);
+          return;
+        }
+        setHeard(transcript);
+        setStatus("thinking");
+        void runTeacherTurn(card, transcript);
+      };
+      try { recorder.stop(); } catch {}
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [cards, stopWebSpeech]
+  );
+
   // --- Selection ---------------------------------------------------------
 
   const selectedCard = useMemo(
@@ -731,6 +913,109 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
     [stopCurrentPlayback]
   );
 
+  // No auto-intro: the drawer opens silently and waits for the user to
+  // press hold-to-talk. The teacher only speaks in response to the user.
+
+  // --- Paint-on-demand --------------------------------------------------
+  //
+  // Cards with no generated image, or whose previous generation failed,
+  // get a small "paint" button (on the shelf tile and in the drawer).
+  // Fires `/api/runware/generate` off the client, flipping the card's
+  // status through the session-cards store so every consumer — bookshelf
+  // tile, drawer portrait, tracker if it's open in another tab — updates
+  // in lockstep.
+  const paintingRef = useRef(new Set<string>());
+  const onPaint = useCallback(async (card: SessionCard) => {
+    if (paintingRef.current.has(card.id)) return;
+    paintingRef.current.add(card.id);
+    setCardImageStatus(card.id, "pending");
+    try {
+      const resp = await fetch("/api/runware/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cardId: card.id,
+          className: card.objectName?.trim() || card.className,
+          description: card.description,
+          history: (card.history ?? []).slice(-8),
+          spokenLang: card.spokenLang,
+          learnLang: card.learnLang,
+          imageDataUrl: card.imageDataUrl,
+        }),
+      });
+      if (!resp.ok) {
+        const err = await resp.text().catch(() => "");
+        setCardImageStatus(card.id, "failed", {
+          error: err.slice(0, 160) || `paint failed (${resp.status})`,
+        });
+        return;
+      }
+      const j = (await resp.json()) as {
+        imageUrl?: string;
+        prompt?: string;
+      };
+      if (!j.imageUrl) {
+        setCardImageStatus(card.id, "failed", { error: "no image url" });
+        return;
+      }
+      setCardGeneratedImage(card.id, j.imageUrl, j.prompt ?? "");
+    } catch (e) {
+      setCardImageStatus(card.id, "failed", {
+        error: e instanceof Error ? e.message : "paint failed",
+      });
+    } finally {
+      paintingRef.current.delete(card.id);
+    }
+  }, []);
+
+  // Drop selection if the card is removed. Keeps the drawer from pointing
+  // at nothing.
+  useEffect(() => {
+    if (!selectedId) return;
+    if (!ordered.some((c) => c.id === selectedId)) {
+      setSelectedId(null);
+      stopCurrentPlayback();
+      setStatus("idle");
+      setActiveCardId(null);
+    }
+  }, [ordered, selectedId, stopCurrentPlayback]);
+
+  // Esc closes the drawer or cancels an in-flight recording.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (recorderRef.current && recorderRef.current.state === "recording") {
+        try { recorderRef.current.stop(); } catch {}
+        recorderRef.current = null;
+        recordedChunksRef.current = [];
+        setStatus("idle");
+        setActiveCardId(null);
+        return;
+      }
+      if (selectedId) {
+        setSelectedId(null);
+        stopCurrentPlayback();
+        setStatus("idle");
+        setActiveCardId(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedId, stopCurrentPlayback]);
+
+  // When a card is selected, ease the drawer into view so the mic is
+  // reachable without a hunt-scroll.
+  const drawerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!selectedId) return;
+    const el = drawerRef.current;
+    if (!el) return;
+    const t = window.setTimeout(() => {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 120);
+    return () => window.clearTimeout(t);
+  }, [selectedId]);
+
   return (
     <>
       {errorMsg && (
@@ -749,6 +1034,7 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
           activeCardId={activeCardId}
           status={status}
           onSelect={onSelect}
+          onPaint={onPaint}
         />
       </section>
 
@@ -768,6 +1054,7 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
 
       {selectedCard && (
         <section
+          ref={drawerRef}
           className="mx-auto mt-8 w-full max-w-[960px] drawer-in"
           key={selectedCard.id}
         >
@@ -783,6 +1070,8 @@ function BookshelfGallery({ cards }: { cards: readonly SessionCard[] }) {
             liveReply={liveReply}
             onMicPress={onMicPress}
             onMicRelease={onMicRelease}
+            onInterruptSpeaking={stopCurrentPlayback}
+            onPaint={() => onPaint(selectedCard)}
             onRemove={() => {
               removeSessionCard(selectedCard.id);
               setSelectedId(null);
@@ -809,13 +1098,16 @@ function Bookshelf({
   activeCardId,
   status,
   onSelect,
+  onPaint,
 }: {
   cards: readonly SessionCard[];
   selectedId: string | null;
   activeCardId: string | null;
   status: CardStatus;
   onSelect: (cardId: string) => void;
+  onPaint: (card: SessionCard) => void;
 }) {
+  const slots = useMemo(() => assignShelfSlots(cards.length), [cards.length]);
   return (
     <div className="shelf-frame">
       {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -826,10 +1118,8 @@ function Bookshelf({
         draggable={false}
       />
       {cards.map((card, i) => {
-        const row = Math.floor(i / BAY_X.length);
-        const col = i % BAY_X.length;
-        const y = SHELF_ROWS_Y[row];
-        const x = BAY_X[col];
+        const slot = slots[i];
+        if (!slot) return null;
         // Tiny per-card jitter so things don't look mechanically aligned.
         const seed = hashSeed(card.id);
         const jitterX = ((seed % 100) / 100 - 0.5) * 3.2; // ±1.6%
@@ -841,11 +1131,12 @@ function Bookshelf({
             card={card}
             // Stagger the enter animation so they pop in shelf-by-shelf.
             enterDelayMs={Math.min(i, 11) * 55}
-            x={x + jitterX}
-            yFromTop={y}
+            x={slot.x + jitterX}
+            yFromTop={slot.y}
             isSelected={isSelected}
             isActive={isActive}
             onSelect={onSelect}
+            onPaint={onPaint}
           />
         );
       })}
@@ -861,6 +1152,7 @@ function ShelfItem({
   isSelected,
   isActive,
   onSelect,
+  onPaint,
 }: {
   card: SessionCard;
   enterDelayMs: number;
@@ -869,6 +1161,7 @@ function ShelfItem({
   isSelected: boolean;
   isActive: boolean;
   onSelect: (cardId: string) => void;
+  onPaint: (card: SessionCard) => void;
 }) {
   const [genLoaded, setGenLoaded] = useState(false);
   const [genFailed, setGenFailed] = useState(false);
@@ -880,6 +1173,10 @@ function ShelfItem({
   const genStatus = card.generatedImageStatus;
   const hasGen = !!card.generatedImageUrl && genStatus === "done" && !genFailed;
   const isPending = genStatus === "pending";
+  const canPaint = !hasGen && !isPending; // includes "idle", "failed", undefined
+  const displayName = cardDisplayName(card);
+  const translated = (card.translatedName ?? "").trim();
+  const intro = card.bilingualIntro;
 
   return (
     <button
@@ -887,7 +1184,7 @@ function ShelfItem({
       className="shelf-slot focus-visible:outline-none"
       data-selected={isSelected ? "true" : "false"}
       data-active={isActive ? "true" : "false"}
-      aria-label={`${cardDisplayName(card)} — tap to talk`}
+      aria-label={`${displayName} — tap to talk`}
       onClick={() => onSelect(card.id)}
       style={{
         left: `${x}%`,
@@ -900,7 +1197,7 @@ function ShelfItem({
         // eslint-disable-next-line @next/next/no-img-element
         <img
           src={card.generatedImageUrl}
-          alt={cardDisplayName(card)}
+          alt={displayName}
           className="shelf-cutout"
           data-loaded={genLoaded ? "true" : "false"}
           draggable={false}
@@ -915,10 +1212,98 @@ function ShelfItem({
         // eslint-disable-next-line @next/next/no-img-element
         <img
           src={card.imageDataUrl}
-          alt={cardDisplayName(card)}
+          alt={displayName}
           className="shelf-fallback"
           draggable={false}
         />
+      )}
+      {/* Bilingual label + intro chip under the cutout. Pointer-events
+          disabled so the whole tile still registers a tap through to the
+          button. */}
+      <span
+        aria-hidden
+        className="shelf-label"
+        style={{
+          position: "absolute",
+          left: "50%",
+          bottom: -4,
+          transform: "translate(-50%, 100%)",
+          width: "min(220px, 160%)",
+          pointerEvents: "none",
+        }}
+      >
+        <span
+          className="block truncate text-center font-semibold"
+          style={{
+            fontSize: 11.5,
+            lineHeight: 1.15,
+            color: "rgba(255,255,255,0.95)",
+            textShadow: "0 1px 2px rgba(0,0,0,0.55)",
+          }}
+          title={translated ? `${displayName} · ${translated}` : displayName}
+        >
+          {displayName}
+          {translated ? (
+            <>
+              {" "}
+              <span style={{ color: "rgba(255,200,225,0.85)" }}>· {translated}</span>
+            </>
+          ) : null}
+        </span>
+        {intro ? (
+          <span
+            className="mt-0.5 block text-center"
+            style={{
+              fontSize: 10,
+              lineHeight: 1.25,
+              color: "rgba(255,255,255,0.85)",
+              textShadow: "0 1px 2px rgba(0,0,0,0.55)",
+            }}
+          >
+            <span className="block truncate" title={intro.learn}>
+              {intro.learn}
+            </span>
+            <span
+              className="block truncate"
+              style={{ color: "rgba(255,255,255,0.55)" }}
+              title={intro.spoken}
+            >
+              {intro.spoken}
+            </span>
+          </span>
+        ) : (
+          <span
+            className="mt-0.5 block text-center"
+            style={{
+              fontSize: 10,
+              color: "rgba(255,255,255,0.55)",
+              textShadow: "0 1px 2px rgba(0,0,0,0.55)",
+            }}
+          >
+            <span className="inline-block h-2 w-16 animate-pulse rounded-full bg-white/20" />
+          </span>
+        )}
+      </span>
+      {canPaint && (
+        <span
+          role="button"
+          aria-label="repaint cartoon"
+          title={
+            genStatus === "failed"
+              ? card.generatedImageError ?? "paint failed — retry"
+              : "paint a cartoon"
+          }
+          className="shelf-chip"
+          style={{ right: 2, top: 2 }}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onPaint(card);
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          ✦ paint
+        </span>
       )}
     </button>
   );
@@ -945,6 +1330,8 @@ function OverflowRow({
             ? card.generatedImageUrl
             : card.imageDataUrl;
         const selected = card.id === selectedId;
+        const displayName = cardDisplayName(card);
+        const translated = (card.translatedName ?? "").trim();
         return (
           <li key={card.id} className="shrink-0">
             <button
@@ -955,12 +1342,21 @@ function OverflowRow({
                   : "ring-white/15 hover:ring-white/35"
               }`}
               onClick={() => onSelect(card.id)}
-              aria-label={cardDisplayName(card)}
+              aria-label={
+                translated
+                  ? `${displayName} · ${translated}`
+                  : displayName
+              }
+              title={
+                translated
+                  ? `${displayName} · ${translated}`
+                  : displayName
+              }
             >
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={src}
-                alt={cardDisplayName(card)}
+                alt={displayName}
                 className="absolute inset-0 h-full w-full object-cover"
                 draggable={false}
               />
@@ -993,6 +1389,8 @@ function ConversationDrawer({
   liveReply,
   onMicPress,
   onMicRelease,
+  onInterruptSpeaking,
+  onPaint,
   onRemove,
   onClose,
 }: {
@@ -1003,17 +1401,24 @@ function ConversationDrawer({
   liveReply: string | null;
   onMicPress: (cardId: string) => void;
   onMicRelease: (cardId: string) => void;
+  onInterruptSpeaking: () => void;
+  onPaint: () => void;
   onRemove: () => void;
   onClose: () => void;
 }) {
   const isSpeaking = status === "speaking";
+  const genStatus = card.generatedImageStatus;
+  const genPending = genStatus === "pending";
+  const genFailed = genStatus === "failed";
+  const hasGen =
+    !!card.generatedImageUrl && genStatus === "done";
 
   const history = card.history ?? [];
-  // Opening line always shown first even when history is empty.
-  const transcript: ChatTurn[] =
-    history.length > 0
-      ? history
-      : [{ role: "assistant", content: card.line }];
+  // The drawer always walks the persisted history. Intro turns are pushed
+  // into history by runTeacherTurn, so there's no "virtual opening line"
+  // to inject — empty history means we haven't greeted yet (intro is
+  // about to fire).
+  const transcript: ChatTurn[] = history;
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -1023,6 +1428,8 @@ function ConversationDrawer({
   }, [transcript.length, liveReply]);
 
   const displayName = cardDisplayName(card);
+  const translated = (card.translatedName ?? "").trim();
+  const intro = card.bilingualIntro;
   const portraitSrc =
     card.generatedImageStatus === "done" && card.generatedImageUrl
       ? card.generatedImageUrl
@@ -1084,26 +1491,63 @@ function ConversationDrawer({
           <header className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <p className="text-[10px] uppercase tracking-[0.3em] text-white/45">
-                still talking · {formatRelativeTime(card.createdAt)}
+                learning · {formatRelativeTime(card.createdAt)}
               </p>
               <h2
                 className="serif-italic mt-1 truncate text-[28px] leading-[1.05] text-white/95"
-                title={displayName}
+                title={
+                  translated
+                    ? `${displayName} · ${translated}`
+                    : displayName
+                }
                 style={{ textShadow: "0 0 22px rgba(255,182,214,0.22)" }}
               >
                 {displayName}
+                {translated ? (
+                  <span className="ml-2 text-[18px] not-italic text-pink-200/85">
+                    · {translated}
+                  </span>
+                ) : null}
               </h2>
-              <p className="mt-1 line-clamp-2 text-[12px] italic text-white/55">
-                {card.description}
-              </p>
+              {intro ? (
+                <div className="mt-1 space-y-0.5 text-[12.5px] leading-snug">
+                  <p className="text-white/90">{intro.learn}</p>
+                  <p className="italic text-white/55">{intro.spoken}</p>
+                </div>
+              ) : (
+                <p className="mt-1 line-clamp-2 text-[12px] italic text-white/55">
+                  {card.description}
+                </p>
+              )}
             </div>
-            <button
-              type="button"
-              onClick={onRemove}
-              className="shrink-0 rounded-full bg-white/[0.05] px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-white/60 ring-1 ring-white/10 transition hover:bg-rose-500/20 hover:text-rose-100 hover:ring-rose-300/30"
-            >
-              remove
-            </button>
+            <div className="flex shrink-0 items-center gap-2">
+              {(!hasGen || genFailed) && !genPending && (
+                <button
+                  type="button"
+                  onClick={onPaint}
+                  title={
+                    genFailed
+                      ? card.generatedImageError ?? "paint failed — retry"
+                      : "paint a cartoon"
+                  }
+                  className="rounded-full bg-pink-400/20 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-pink-100 ring-1 ring-pink-300/30 transition hover:bg-pink-400/35"
+                >
+                  ✦ paint
+                </button>
+              )}
+              {genPending && (
+                <span className="rounded-full bg-white/[0.08] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-white/70 ring-1 ring-white/10">
+                  painting…
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={onRemove}
+                className="rounded-full bg-white/[0.05] px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-white/60 ring-1 ring-white/10 transition hover:bg-rose-500/20 hover:text-rose-100 hover:ring-rose-300/30"
+              >
+                remove
+              </button>
+            </div>
           </header>
 
           <div
@@ -1168,6 +1612,7 @@ function ConversationDrawer({
               status={status}
               onPress={onMicPress}
               onRelease={onMicRelease}
+              onInterruptSpeaking={onInterruptSpeaking}
             />
           </div>
         </div>
@@ -1201,27 +1646,49 @@ function HoldToTalkButton({
   status,
   onPress,
   onRelease,
+  onInterruptSpeaking,
 }: {
   cardId: string;
   status: CardStatus;
   onPress: (cardId: string) => void;
   onRelease: (cardId: string) => void;
+  onInterruptSpeaking: () => void;
 }) {
   const recording = status === "recording";
-  const busy = status === "thinking" || status === "speaking";
+  const speaking = status === "speaking";
+  const thinking = status === "thinking";
+  const busy = thinking || speaking;
+  const pressStartRef = useRef<number>(0);
 
   return (
     <button
       type="button"
-      aria-label={recording ? "release to send" : "hold to talk"}
+      aria-label={
+        recording
+          ? "release to send"
+          : speaking
+            ? "tap to interrupt or hold to talk"
+            : "hold to talk"
+      }
       onPointerDown={(e) => {
         e.preventDefault();
         try { (e.currentTarget as Element).setPointerCapture(e.pointerId); } catch {}
+        pressStartRef.current = performance.now();
+        // If the object is currently speaking, interrupt the playback
+        // immediately so the user can hear themselves and not talk over it.
+        if (speaking) onInterruptSpeaking();
+        // Don't start recording while the thinking request is in flight —
+        // it would race the returning reply.
+        if (thinking) return;
         onPress(cardId);
       }}
       onPointerUp={(e) => {
         e.preventDefault();
         try { (e.currentTarget as Element).releasePointerCapture(e.pointerId); } catch {}
+        const held = performance.now() - pressStartRef.current;
+        // A very short tap on a speaking object is an interrupt, not a
+        // zero-length recording. Bail before releasing the recorder.
+        if (held < 180 && !recording) return;
         onRelease(cardId);
       }}
       onPointerCancel={() => onRelease(cardId)}

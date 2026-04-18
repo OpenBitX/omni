@@ -14,7 +14,6 @@
     "postinstall": "node scripts/setup-ort.mjs"
   },
   "dependencies": {
-    "@google/genai": "^1.50.1",
     "@huggingface/transformers": "^4.1.0",
     "geist": "^1.7.0",
     "next": "^15.1.6",

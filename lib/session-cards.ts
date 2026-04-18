@@ -63,6 +63,19 @@ export type SessionCard = {
   // Lens at capture time. Absent for cards from before the multi-lens
   // release — treat those as "play" when filtering.
   mode?: CardMode;
+
+  // Bilingual card-face blurb shown on /gallery. Filled lazily on gallery
+  // mount via `gallerizeCard` once per card. Not set at capture time.
+  // `learn` is in the user's learn language; `spoken` is the same sentence
+  // in their native. Both are short — roughly one sentence each — so the
+  // card stays readable at shelf size.
+  bilingualIntro?: { learn: string; spoken: string };
+
+  // The object's name translated into the OPPOSITE language of
+  // `objectName`. If `objectName` is English, this holds the Chinese
+  // rendering, and vice-versa. Used to render the `<objectName> · <translatedName>`
+  // bilingual label on the card face.
+  translatedName?: string;
 };
 
 const STORAGE_KEY = "omni.sessionCards.v2";
@@ -149,6 +162,30 @@ export function addSessionCard(card: SessionCard): void {
   cards = [...cards, card].slice(-MAX_CARDS);
   persist();
   emit();
+}
+
+// Generic shallow-merge updater. Used by gallery to write lazily-fetched
+// bilingual fields without needing a bespoke setter per field. Preserves
+// existing values that aren't explicitly in `patch`.
+export function updateSessionCard(
+  id: string,
+  patch: Partial<SessionCard>
+): boolean {
+  return updateCard(
+    (c) => c.id === id,
+    (c) => {
+      // Fast-path — nothing to change.
+      let dirty = false;
+      for (const k of Object.keys(patch) as (keyof SessionCard)[]) {
+        if (patch[k] !== undefined && patch[k] !== c[k]) {
+          dirty = true;
+          break;
+        }
+      }
+      if (!dirty) return c;
+      return { ...c, ...patch };
+    }
+  );
 }
 
 export function removeSessionCard(id: string): void {

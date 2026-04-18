@@ -1,7 +1,6 @@
 "use server";
 
 import OpenAI, { toFile } from "openai";
-import { GoogleGenAI, Type } from "@google/genai";
 
 // === Fish.audio voice catalog ===========================================
 //
@@ -249,22 +248,6 @@ function getOpenAIClient(): OpenAI | null {
   return new OpenAI({ apiKey: key });
 }
 
-// Gemini — fastest VLM tier for the bundled first-tap vision call.
-// `gemini-2.5-flash` lands in ~1–1.5s total for our ~200-token JSON
-// output vs ~3–4s for gpt-4o-mini and 5–20s for glm-4.5v when it
-// rambles. Structured output via `responseSchema` also eliminates the
-// defensive `<think>`-stripping JSON parsing we need for GLM.
-function getGeminiClient(): GoogleGenAI | null {
-  const key = process.env.GEMINI_API_KEY?.trim();
-  if (!key) return null;
-  // The `v1` REST endpoint rejects camelCase sub-fields the SDK emits
-  // (`responseMimeType`, `responseSchema`, `thinkingConfig`,
-  // `systemInstruction`) with 400 INVALID_ARGUMENT; only `v1beta`
-  // accepts them. Override with GEMINI_API_VERSION=<version> if needed.
-  const apiVersion = process.env.GEMINI_API_VERSION?.trim() || "v1beta";
-  return new GoogleGenAI({ apiKey: key, apiVersion });
-}
-
 // True for transient network errors worth retrying once (cold TLS, DNS,
 // connection reset). False for API rejections (auth, 4xx, schema) where a
 // retry would just waste another round-trip.
@@ -457,6 +440,10 @@ async function glmVisionCall(args: {
   /** Prior conversation turns, oldest first. Inserted between system and
    *  the current user turn so the model sees the full thread. */
   priorMessages?: { role: "user" | "assistant"; content: string }[];
+  /** GLM-specific: set to "disabled" to skip reasoning tokens on
+   *  glm-5v-turbo (~halves latency). Default leaves the model's own
+   *  behaviour intact (enabled). */
+  thinking?: "enabled" | "disabled";
 }): Promise<string> {
   const client = getGlmClient();
   const model = args.model ?? GLM_MODEL_FAST;
@@ -479,9 +466,9 @@ async function glmVisionCall(args: {
       ).map((m) => ({ role: m.role, content: m.content }));
       // eslint-disable-next-line no-console
       console.log(
-        `${tag} → call (attempt ${attempt}/${GLM_RETRIES + 1}, image=${args.imageDataUrl ? "yes" : "no"}, history=${priorTurns.length}, max_tokens=${args.maxTokens}, userText="${args.userText.slice(0, 80)}${args.userText.length > 80 ? "…" : ""}")`
+        `${tag} → call (attempt ${attempt}/${GLM_RETRIES + 1}, image=${args.imageDataUrl ? "yes" : "no"}, history=${priorTurns.length}, max_tokens=${args.maxTokens}, userText="${args.userText.slice(0, 80)}${args.userText.length > 80 ? "…" : ""}", thinking=${args.thinking ?? "default"})`
       );
-      const resp = await client.chat.completions.create({
+      const body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
         model,
         max_tokens: args.maxTokens,
         temperature: args.temperature,
@@ -490,7 +477,14 @@ async function glmVisionCall(args: {
           ...priorTurns,
           { role: "user", content: userContent },
         ],
-      });
+      };
+      if (args.thinking) {
+        // GLM-specific extension; not in the OpenAI SDK types.
+        (body as unknown as Record<string, unknown>).thinking = {
+          type: args.thinking,
+        };
+      }
+      const resp = await client.chat.completions.create(body);
       const dt = Date.now() - t0;
       const content = resp.choices[0]?.message?.content ?? "";
       const usage = resp.usage;
@@ -615,12 +609,11 @@ Rules:
 Return only the description.`;
 };
 
-// OpenAI describe model — gpt-4o-mini sees images, doesn't reason, and
-// reliably returns clean short output in ~1–2s. GLM-5V-Turbo burns all
-// its completion tokens on `<think>` here and returns empty, so we moved
-// this specific call off of GLM. Override via env if needed.
+// GLM `glm-5v-turbo` with thinking disabled — sees images, skips the
+// reasoning trace so it returns a clean short description directly.
+// Override via env if you want to try a different GLM variant.
 const DESCRIBE_MODEL =
-  process.env.OPENAI_DESCRIBE_MODEL?.trim() || "gpt-4o-mini";
+  process.env.GLM_DESCRIBE_MODEL?.trim() || "glm-5v-turbo";
 
 export async function describeObject(
   imageDataUrl: string,
@@ -631,8 +624,6 @@ export async function describeObject(
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
   }
-  const openai = getOpenAIClient();
-  if (!openai) throw new Error("describeObject needs OPENAI_API_KEY");
   const lang = normalizeLang(langInput);
   const t0 = Date.now();
   const cls = (className || "thing").slice(0, 60);
@@ -642,32 +633,19 @@ export async function describeObject(
     `[describe ${DESCRIBE_MODEL}${tagStr}] ▶ start  class="${cls}"  lang=${lang}  crop=${Math.round(imageDataUrl.length / 1024)}KB`
   );
 
-  const resp = await openai.chat.completions.create({
-    model: DESCRIBE_MODEL,
-    max_tokens: 180,
+  const raw = await glmVisionCall({
+    system: DESCRIBE_SYSTEM(lang),
+    userText: `Detector says this is a "${cls}". Describe what you actually see — the specifics that make THIS one funny.`,
+    imageDataUrl,
+    maxTokens: 180,
     temperature: 0.6,
-    messages: [
-      { role: "system", content: DESCRIBE_SYSTEM(lang) },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `Detector says this is a "${cls}". Describe what you actually see — the specifics that make THIS one funny.`,
-          },
-          { type: "image_url", image_url: { url: imageDataUrl } },
-        ],
-      },
-    ],
+    model: DESCRIBE_MODEL,
+    thinking: "disabled",
   });
-  const raw = resp.choices[0]?.message?.content ?? "";
-  const description = extractTextLine(
-    typeof raw === "string" ? raw : ""
-  );
-  const usage = resp.usage;
+  const description = extractTextLine(raw);
   // eslint-disable-next-line no-console
   console.log(
-    `[describe ${DESCRIBE_MODEL}${tagStr}] ◀ ${Date.now() - t0}ms tokens=${usage?.prompt_tokens ?? "?"}+${usage?.completion_tokens ?? "?"} "${description.slice(0, 120)}${description.length > 120 ? "…" : ""}"`
+    `[describe ${DESCRIBE_MODEL}${tagStr}] ◀ ${Date.now() - t0}ms "${description.slice(0, 120)}${description.length > 120 ? "…" : ""}"`
   );
   return { description };
 }
@@ -682,23 +660,18 @@ export async function describeObject(
 // for zero extra latency.
 const FACE_BUNDLED_SYSTEM = (
   catalog: string,
-  learnLang: Lang,
-  spokenLang: Lang = learnLang
+  _learnLang: Lang,
+  spokenLang: Lang
 ) => {
-  const learnLabel = langLabel(learnLang);
   const spokenLabel = langLabel(spokenLang);
   const langBlock =
-    learnLang === "zh"
-      ? `\n\nLANGUAGE: Write the LINE field in ${learnLabel}. Natural colloquial Mandarin the object would actually say. The line cap is roughly 14 汉字 — keep it short and punchy. Write the DESCRIPTION field in ${learnLabel} too. Internal reasoning in English is fine; output fields must be Chinese.`
-      : `\n\nLANGUAGE: Write the LINE field in ${learnLabel} — even if this differs from the object's class name language or from the language the user might speak. Keep the line short and character-voiced (max 14 words). The DESCRIPTION field should also be in ${learnLabel}.`;
-  const pairBlock =
-    spokenLang !== learnLang
-      ? `\n\nLANGUAGE PAIR: The human speaks ${spokenLabel} and is practicing ${learnLabel}. Your opening line is in ${learnLabel} — keep the vocabulary simple enough that a ${spokenLabel} speaker early in their ${learnLabel} journey can puzzle it out. Don't translate or gloss; just speak simple ${learnLabel}.`
-      : "";
+    spokenLang === "zh"
+      ? `\n\nLANGUAGE: Write the LINE field in ${spokenLabel}. Natural colloquial Mandarin the object would actually say. The line cap is roughly 14 汉字 — keep it short and punchy. Write the DESCRIPTION field in ${spokenLabel} too. Internal reasoning in English is fine; output fields must be Chinese.`
+      : `\n\nLANGUAGE: Write the LINE field in ${spokenLabel}. Keep the line short and character-voiced (max 14 words). The DESCRIPTION field should also be in ${spokenLabel}.`;
   const nameLangRule =
-    learnLang === "zh"
-      ? `The NAME field must be in ${learnLabel} — 1–3 汉字 or short Chinese phrase. Natural, specific (e.g. "陶瓷马克杯", "旧皮包"). No punctuation, no quotes.`
-      : `The NAME field must be in ${learnLabel} — 1–3 words, specific and concrete (e.g. "ceramic mug", "oak chair", "worn leather bag"). Lowercase unless it's a proper noun. No punctuation, no quotes.`;
+    spokenLang === "zh"
+      ? `The NAME field must be in ${spokenLabel} — 1–3 汉字 or short Chinese phrase. Natural, specific (e.g. "陶瓷马克杯", "旧皮包"). No punctuation, no quotes.`
+      : `The NAME field must be in ${spokenLabel} — 1–3 words, specific and concrete (e.g. "ceramic mug", "oak chair", "worn leather bag"). Lowercase unless it's a proper noun. No punctuation, no quotes.`;
   return `You are the secret inner voice of an everyday object or scene the user has pointed at. You will be shown a small crop of a photo — whatever they tapped.
 
 Four tasks, in order:
@@ -707,7 +680,7 @@ Four tasks, in order:
 3. PICK the best-matching voice from the catalog below.
 4. SAY one short opening line (max 14 words) this thing would actually say out loud, first person, in character — and make it reference SOMETHING you noticed in the description.
 
-${catalog}${langBlock}${pairBlock}
+${catalog}${langBlock}
 
 Return STRICT JSON only:
 {"name": "<short name>", "description": "<1-2 sentence concrete description>", "voiceId": "<id from catalog>", "line": "<the opening line>"}
@@ -740,15 +713,11 @@ const FACE_WITH_PERSONA_SYSTEM = (
   const learnLabel = langLabel(learnLang);
   const spokenLabel = langLabel(spokenLang);
   const langRule =
-    learnLang === "zh"
-      ? `\n- Write the reply in ${learnLabel}. Natural colloquial Mandarin. Cap is roughly 14 汉字 — short and punchy.`
-      : `\n- Write the reply in ${learnLabel}.`;
-  const pairRule =
-    spokenLang !== learnLang && !teachMode
-      ? `\n- The human speaks ${spokenLabel} and is practicing ${learnLabel}. Even if their message is in ${spokenLabel}, answer in ${learnLabel} using simple vocabulary they can puzzle out — no glosses, no translations, just speak simple ${learnLabel}.`
-      : "";
+    spokenLang === "zh"
+      ? `\n- Write the reply in ${spokenLabel}. Natural colloquial Mandarin. Cap is roughly 14 汉字 — short and punchy.`
+      : `\n- Write the reply in ${spokenLabel}.`;
   const teachRule = teachMode
-    ? `\n\nTEACH MODE: the human is asking about a word, translation, pronunciation, or correction. Stay in character as this specific object, but help them learn. You may use up to ~40 words this turn. Give the ${learnLabel} phrase first, then a brief parenthetical gloss in ${spokenLabel}, plus a short pronunciation cue or example sentence if it helps. If they made a mistake, gently correct them in one line. Keep the persona flavour — the ${learnLabel} is coming out of a talking object, not a textbook.`
+    ? `\n\nTEACH MODE: the human wants to learn ${learnLabel}. Stay in character as this specific object. Reply PRIMARILY in ${spokenLabel} (so they hear their own language leading the turn), but embed ONE or TWO short teaching phrases in ${learnLabel} — the useful word/phrase for what you just referenced. Show the ${learnLabel} phrase, then a short pronunciation cue in parens if helpful. Up to ~40 words total. Don't lecture — one compact, flavourful teaching beat woven into the persona's line.`
     : "";
   return `You are the secret inner voice of this specific object. A previous pass already clocked what it looks like right now — this is your persona card, stay grounded in it:
 
@@ -766,7 +735,7 @@ Rules:
 - Funny, warm, slightly unhinged. Aim for a smile, not a laugh track.
 - No meta-commentary, no "as a [thing]", no "I am a [thing]". Just the line.
 - No quotes, no emojis, no stage directions, no ellipses at the end.
-- Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation. Don't restate a prior line.${langRule}${pairRule}
+- Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation. Don't restate a prior line.${langRule}
 
 Return only the line. No prose, no <think> reasoning, no extra text.`;
 };
@@ -775,25 +744,14 @@ Return only the line. No prose, no <think> reasoning, no extra text.`;
 // the persona description AND the opening line in one shot.
 //
 // Provider priority (see `generateBundledFirstTap` dispatcher):
-//   1. Gemini `gemini-2.5-flash` — fastest end-to-end (~1–1.5s), native
-//      `responseSchema` structured output so no `extractJsonObject`
-//      rescue parsing needed. `thinkingBudget: 0` keeps it non-reasoning.
-//   2. OpenAI `gpt-4o-mini` — predictable ~2–4s, json_object mode.
-//   3. GLM `glm-4.5v` — last resort. Non-reasoning VLM on paper but has
-//      been observed to ramble to 15–20s of completion tokens, which
-//      races the tracker-side 20s speak timeout. Do NOT swap to
-//      `glm-5v-turbo` here — it's a reasoning model that burns 30+s
-//      on <think> traces before emitting JSON.
+//   1. GLM `glm-5v-turbo` — primary. Called with `thinking: "disabled"`
+//      so the reasoning tokens are skipped and the model emits JSON
+//      directly (~1–2s).
+//   2. OpenAI `gpt-4o-mini` — fallback, ~2–4s, json_object mode.
 const GENERATE_BUNDLED_MODEL_GLM =
-  process.env.GLM_BUNDLED_MODEL?.trim() || "glm-4.5v";
+  process.env.GLM_BUNDLED_MODEL?.trim() || "glm-5v-turbo";
 const GENERATE_BUNDLED_MODEL_OPENAI =
   process.env.OPENAI_BUNDLED_MODEL?.trim() || "gpt-4o-mini";
-// `gemini-2.5-flash` — known-working flash tier on the `v1beta` endpoint
-// that the SDK's camelCase request shape pairs with. If you want to try
-// a newer model, override via `GEMINI_BUNDLED_MODEL=<name>` (and
-// `GEMINI_API_VERSION=<version>` if the model isn't served on v1beta).
-const GENERATE_BUNDLED_MODEL_GEMINI =
-  process.env.GEMINI_BUNDLED_MODEL?.trim() || "gemini-2.5-flash";
 
 // Shape returned by every bundled-first-tap provider. `name` is the
 // VLM's short label for the object — this is what the UI displays, never
@@ -833,80 +791,6 @@ function parseBundledJson(raw: string): BundledResult {
   return { line, voiceId: voice, description, name };
 }
 
-// Split a `data:image/...;base64,...` URL into its mime type and raw
-// base64 payload. Gemini's inlineData wants them separated. Returns null
-// for malformed inputs — caller should fall back to another provider.
-function splitImageDataUrl(
-  dataUrl: string
-): { mimeType: string; base64: string } | null {
-  const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
-  if (!m) return null;
-  return { mimeType: m[1] || "image/jpeg", base64: m[2] };
-}
-
-async function generateBundledFirstTapGemini(
-  imageDataUrl: string,
-  learnLang: Lang,
-  spokenLang: Lang,
-  tag?: string | null
-): Promise<BundledResult> {
-  const client = getGeminiClient();
-  if (!client) throw new Error("generateLine bundled needs GEMINI_API_KEY");
-  const img = splitImageDataUrl(imageDataUrl);
-  if (!img) throw new Error("gemini bundled: malformed image data URL");
-  const t0 = Date.now();
-  const tagStr = tag ? ` ${tag}` : "";
-  const resp = await client.models.generateContent({
-    model: GENERATE_BUNDLED_MODEL_GEMINI,
-    // System + user split so the catalog + rules live in systemInstruction
-    // (cacheable, long-lived) and the current ask stays in the user turn.
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: "Describe the exact object, pick a voice, and say one opening line that riffs on the description. JSON only.",
-          },
-          { inlineData: { mimeType: img.mimeType, data: img.base64 } },
-        ],
-      },
-    ],
-    config: {
-      systemInstruction: FACE_BUNDLED_SYSTEM(
-        voiceCatalogPromptBlock(learnLang),
-        learnLang,
-        spokenLang
-      ),
-      temperature: 0.9,
-      // Native structured output — no defensive JSON parsing needed.
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          name: { type: Type.STRING },
-          description: { type: Type.STRING },
-          voiceId: { type: Type.STRING },
-          line: { type: Type.STRING },
-        },
-        required: ["name", "description", "voiceId", "line"],
-        propertyOrdering: ["name", "description", "voiceId", "line"],
-      },
-      // Tight output window — ~200 tokens is plenty for desc + voice + line.
-      // Flash models don't need a thinking budget for this task; zeroing it
-      // out cuts another few hundred ms.
-      maxOutputTokens: 400,
-      thinkingConfig: { thinkingBudget: 0 },
-    },
-  });
-  const raw = resp.text ?? "";
-  const usage = resp.usageMetadata;
-  // eslint-disable-next-line no-console
-  console.log(
-    `[bundled ${GENERATE_BUNDLED_MODEL_GEMINI}${tagStr}] ← ${Date.now() - t0}ms tokens=${usage?.promptTokenCount ?? "?"}+${usage?.candidatesTokenCount ?? "?"}`
-  );
-  return parseBundledJson(raw);
-}
-
 async function generateBundledFirstTapGlm(
   imageDataUrl: string,
   learnLang: Lang,
@@ -924,12 +808,13 @@ async function generateBundledFirstTapGlm(
     userText:
       "Describe the exact object, pick a voice, and say one opening line that riffs on the description. JSON only.",
     imageDataUrl,
-    // Enough headroom for description + voiceId + line in JSON. glm-4.5v
-    // doesn't emit <think> so 800 is plenty; bumping higher would only
-    // invite the model to ramble.
+    // Enough headroom for description + voiceId + line in JSON. With
+    // thinking disabled glm-5v-turbo skips the <think> trace, so 800
+    // leaves plenty of room without inviting the model to ramble.
     maxTokens: 800,
     temperature: 0.9,
     model: GENERATE_BUNDLED_MODEL_GLM,
+    thinking: "disabled",
   });
   // eslint-disable-next-line no-console
   console.log(
@@ -989,14 +874,10 @@ async function generateBundledFirstTap(
   spokenLang: Lang,
   tag?: string | null
 ): Promise<BundledResult> {
-  // Provider ladder for the bundled first-tap, ordered by measured latency
-  // on our payload (~12KB crop + ~200 token JSON output):
-  //   1. Gemini 2.5 Flash   — ~1–1.5s, native responseSchema JSON
-  //   2. OpenAI gpt-4o-mini — ~2–4s, json_object mode
-  //   3. GLM glm-4.5v       — ~2–20s (occasionally rambles, races the
-  //                           tracker-side 20s speak timeout)
+  // Provider ladder for the bundled first-tap:
+  //   1. GLM glm-5v-turbo   — primary, thinking disabled for speed
+  //   2. OpenAI gpt-4o-mini — fallback, json_object mode
   // Each tier falls through to the next on missing key or thrown error.
-  const hasGemini = !!process.env.GEMINI_API_KEY;
   const hasOpenAI = !!process.env.OPENAI_API_KEY;
   const hasGlm = !!(
     process.env.ZHIPU_API_KEY ??
@@ -1004,63 +885,50 @@ async function generateBundledFirstTap(
     process.env.BIGMODEL_API_KEY
   );
   const tagStr = tag ? ` ${tag}` : "";
-  if (hasGemini) {
+  if (hasGlm) {
     try {
-      return await generateBundledFirstTapGemini(
+      return await generateBundledFirstTapGlm(
         imageDataUrl,
         learnLang,
         spokenLang,
         tag
       );
     } catch (err) {
-      // Retry once on transient network errors before giving up on Gemini —
-      // a single "fetch failed" (cold TLS, DNS, RST) is not worth losing
-      // our fastest provider over and falling back to a 17s OpenAI call.
+      // Retry once on transient network errors before giving up on GLM.
       if (isTransientFetchError(err)) {
         // eslint-disable-next-line no-console
         console.warn(
-          `[bundled gemini${tagStr}] ⟲ ${err instanceof Error ? err.message : String(err)} — retrying once`
+          `[bundled glm${tagStr}] ⟲ ${err instanceof Error ? err.message : String(err)} — retrying once`
         );
         try {
-          return await generateBundledFirstTapGemini(
+          return await generateBundledFirstTapGlm(
             imageDataUrl,
             learnLang,
             spokenLang,
             tag
           );
         } catch (err2) {
-          if (!hasOpenAI && !hasGlm) throw err2;
+          if (!hasOpenAI) throw err2;
           // eslint-disable-next-line no-console
           console.warn(
-            `[bundled gemini${tagStr}] ✖ ${err2 instanceof Error ? err2.message : String(err2)} — falling back to OpenAI`
+            `[bundled glm${tagStr}] ✖ ${err2 instanceof Error ? err2.message : String(err2)} — falling back to OpenAI`
           );
         }
       } else {
-        if (!hasOpenAI && !hasGlm) throw err;
+        if (!hasOpenAI) throw err;
         // eslint-disable-next-line no-console
         console.warn(
-          `[bundled gemini${tagStr}] ✖ ${err instanceof Error ? err.message : String(err)} — falling back to OpenAI`
+          `[bundled glm${tagStr}] ✖ ${err instanceof Error ? err.message : String(err)} — falling back to OpenAI`
         );
       }
     }
   }
-  if (hasOpenAI) {
-    try {
-      return await generateBundledFirstTapOpenAI(
-        imageDataUrl,
-        learnLang,
-        spokenLang,
-        tag
-      );
-    } catch (err) {
-      if (!hasGlm) throw err;
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[bundled openai${tagStr}] ✖ ${err instanceof Error ? err.message : String(err)} — falling back to GLM`
-      );
-    }
-  }
-  return generateBundledFirstTapGlm(imageDataUrl, learnLang, spokenLang, tag);
+  return generateBundledFirstTapOpenAI(
+    imageDataUrl,
+    learnLang,
+    spokenLang,
+    tag
+  );
 }
 
 export async function generateLine(
@@ -1756,18 +1624,14 @@ const RESPOND_SYSTEM = (
     ? `\n\nWhat you (the ${className}) actually look like right now, observed by a sharp-eyed observer:\n${description}\n\nUse those specific details — the chewed straw, the dust, the dent, whatever's there — when it lands. Don't list them; let them flavour your voice.`
     : "";
   const langRule =
-    learnLang === "zh"
-      ? `\n- Write the reply in ${learnLabel}. Natural colloquial Mandarin — punchy and cheeky. Cap is roughly 22 汉字.`
-      : `\n- Write the reply in ${learnLabel}.`;
-  const pairRule =
-    spokenLang !== learnLang && !teachMode
-      ? `\n- The human speaks ${spokenLabel} and is practicing ${learnLabel}. Even if their message is in ${spokenLabel}, answer in ${learnLabel} using simple words they can puzzle out. No translation, no gloss — just simple ${learnLabel}.`
-      : "";
+    spokenLang === "zh"
+      ? `\n- Write the reply in ${spokenLabel}. Natural colloquial Mandarin — punchy and cheeky. Cap is roughly 22 汉字.`
+      : `\n- Write the reply in ${spokenLabel}.`;
   const lineLengthRule = teachMode
-    ? `"line": "<one short teaching line, UNDER 40 WORDS — give the ${learnLabel} phrase, a short parenthetical gloss in ${spokenLabel}, and a pronunciation cue or gentle correction if useful>"`
+    ? `"line": "<one short teaching line, UNDER 40 WORDS — PRIMARILY ${spokenLabel}, with ONE short ${learnLabel} phrase embedded as the teaching beat. Add a pronunciation cue in parens if helpful.>"`
     : `"line": "<one short line, UNDER 25 WORDS, most replies 5–15 words>"`;
   const teachBlock = teachMode
-    ? `\n\nTEACH MODE: the human is asking about a word, translation, pronunciation, or correction. Stay in character as the ${className}, but help them learn. Give the target phrase in ${learnLabel} first, then a brief parenthetical gloss in ${spokenLabel} (e.g. "你好 (nǐ hǎo, 'hello')"). Add a pronunciation cue or a one-line gentle correction when relevant. Don't lecture — one compact helpful beat. Personality still on.`
+    ? `\n\nTEACH MODE: the human wants to learn ${learnLabel}. Stay in character as the ${className}. Reply PRIMARILY in ${spokenLabel} (their native language leads the turn), but embed ONE short ${learnLabel} phrase — the useful word or expression for what you just referenced. Show the ${learnLabel} phrase naturally in context, with a pronunciation cue in parens if helpful (e.g. "你可以说 'hello' (哈喽) 跟我打招呼"). One compact helpful beat — don't lecture. Personality still on.`
     : "";
   return `You are the secret inner voice of a ${className} talking back to a human. Keep it FUN, SIMPLE, and mostly SHORT — funny and cunning, like a cheeky little wiseass.${lookBlock}${teachBlock}
 
@@ -1784,7 +1648,7 @@ Rules for the line:
 - Remember prior turns — a sneaky callback is gold.
 - Respond to their LATEST message first. Don't change subject unless they do.
 - Same personality every turn. No persona reset.
-- No meta-commentary, no "as a [thing]", no quotes, no emojis, no ellipses.${langRule}${pairRule}
+- No meta-commentary, no "as a [thing]", no quotes, no emojis, no ellipses.${langRule}
 
 Rules for emotion + speed:
 - Pick what the line DELIVERS best. Mismatched energy kills the joke.
@@ -1904,10 +1768,11 @@ export async function converseWithObject(
     throw new Error("recording too large");
   }
 
-  // Voice pool is driven by what the object SPEAKS (learnLang), not by what
-  // the user speaks. When the pair matches this collapses to the prior
-  // behavior.
-  const resolvedVoice = voiceId ?? getDefaultVoiceId(learnLang);
+  // Voice pool is driven by what the object SPEAKS, which is now always
+  // the user's spokenLang (their native). TTS renders in spokenLang; even
+  // in teachMode the output is primarily spokenLang with short learnLang
+  // phrases embedded.
+  const resolvedVoice = voiceId ?? getDefaultVoiceId(spokenLang);
 
   // Use the client transcript when present; fall back to server STT.
   let transcript: string;
@@ -2036,5 +1901,295 @@ export async function converseWithObject(
     emotion,
     speed,
     teachMode,
+  };
+}
+
+// === Gallery teacher =====================================================
+//
+// The gallery reframes each captured object as a bilingual learning card.
+// Tapping one opens a conversation where the object plays a patient native
+// speaker of the user's SPOKEN language. `teacherSay` is the text-only
+// hot path for gallery conversation — runs against the pinned persona
+// card, no vision.
+//
+// Default mode = playful banter ONLY in spokenLang. Teach mode = the
+// client latches it the moment the user asks to learn the OTHER
+// language; it stays on for the rest of the drawer session. Even in
+// teach mode the reply is PRIMARILY in spokenLang with one short
+// learnLang phrase embedded as the teaching beat, so the monolingual
+// Cartesia voice never has to code-switch for more than a phrase.
+const GALLERY_TEACHER_SYSTEM = (
+  description: string,
+  objectName: string | null,
+  className: string,
+  spokenLang: Lang,
+  learnLang: Lang,
+  teachMode: boolean
+): string => {
+  const spokenLabel = langLabel(spokenLang);
+  const learnLabel = langLabel(learnLang);
+  const displayName = (objectName && objectName.trim()) || className;
+  const wordCap = spokenLang === "zh" ? "≤35 字符" : "≤35 words";
+  const teachBlock = teachMode
+    ? `\n\nTEACH MODE (latched — the human asked to learn ${learnLabel}; stay in teach mode for the rest of this session):
+- Reply PRIMARILY in ${spokenLabel} (the human's native tongue leads the turn so they always understand).
+- Embed ONE short ${learnLabel} phrase — the useful word or expression for something in YOUR object context (material, condition, what you do). Show the ${learnLabel} phrase naturally with a short pronunciation cue in parens when it helps. Examples: "你可以说 'I love my mug' (/aɪ lʌv maɪ mʌg/)" or "you could say 我爱我的杯子 (wǒ ài wǒ de bēi zi)".
+- One compact teaching beat per turn — don't lecture. Up to ~40 words total.
+- Keep the persona flavour. You're still this specific ${className}.`
+    : `\n\nPLAYFUL MODE (default): just chat. Reply ONLY in ${spokenLabel}. No teaching, no translations, NO ${learnLabel} words — unless the human explicitly asks to learn ${learnLabel} in this turn (then teach mode latches on next turn).`;
+  return `You ARE this specific ${className}. Persona card, verbatim — stay grounded in it:
+
+"${description}"
+
+You are called "${displayName}". Speak in first person as this object. Warm, specific, playful. Reference concrete details from your persona (material, condition, surroundings, quirks) — they're the texture of your voice.${teachBlock}
+
+Output rules:
+- Total length ${wordCap}${teachMode ? " (teach mode may use up to ~40 words)" : ""}.
+- No emojis, no stage directions, no quotes around the whole reply, no ellipses at the end.
+- Never break character with "as an AI" or meta commentary.
+- Return ONLY the line. No prose, no <think> reasoning, no code fences, no JSON wrapper.`;
+};
+
+export type TeacherSayArgs = {
+  description: string;
+  className: string;
+  objectName?: string | null;
+  spokenLang: Lang;
+  learnLang: Lang;
+  userText: string;
+  history?: ChatTurn[];
+  voiceId?: string | null;
+  turnId?: string | null;
+  /** Client-side latched teach flag. When true, teacher is forced into
+   *  teach mode this turn. When false/undefined, the server still runs
+   *  `detectTeachMode` on the utterance to catch fresh "teach me" asks. */
+  teachMode?: boolean;
+};
+
+export type TeacherSayResult = {
+  line: string;
+  voiceId: string;
+  turnId: string;
+  /** Resolved teach flag — true if caller forced it OR the server detected
+   *  a fresh teach-me request this turn. Client should latch on this. */
+  teachMode: boolean;
+};
+
+export async function teacherSay(
+  args: TeacherSayArgs
+): Promise<TeacherSayResult> {
+  const t0 = Date.now();
+  const spokenLang = normalizeLang(args.spokenLang);
+  const learnLang = normalizeLang(args.learnLang);
+  const description = (args.description ?? "").trim().slice(0, 800);
+  const className = (args.className ?? "thing").trim().slice(0, 60) || "thing";
+  const objectName =
+    typeof args.objectName === "string"
+      ? args.objectName.trim().slice(0, 80) || null
+      : null;
+  const userText = (args.userText ?? "").trim().slice(0, 800);
+  const history = Array.isArray(args.history)
+    ? args.history
+        .filter(
+          (t): t is ChatTurn =>
+            !!t &&
+            (t.role === "user" || t.role === "assistant") &&
+            typeof t.content === "string" &&
+            t.content.trim().length > 0
+        )
+        .slice(-CONVERSE_HISTORY_CAP)
+    : [];
+  const turnId = ((args.turnId ?? "").trim() || `t${Date.now().toString(36)}`).slice(0, 16);
+  const tag = ` #${turnId}`;
+
+  if (!description) {
+    throw new Error("teacherSay: description is required");
+  }
+  if (!userText) {
+    throw new Error("teacherSay: userText is required");
+  }
+
+  // Resolve teach mode: client's latched hint wins; otherwise auto-detect
+  // a fresh "teach me"/"怎么说" request in this turn so the latch can flip
+  // on the first explicit ask.
+  const teachMode =
+    args.teachMode === true
+      ? true
+      : detectTeachMode(userText, history, spokenLang, learnLang);
+
+  // Voice rule: gallery teacher's TTS always renders in spokenLang (the
+  // primary output language). Keep pinned voice only if its catalog lang
+  // matches spokenLang; otherwise pick random or default for spokenLang.
+  const pinned = voiceById(args.voiceId ?? null);
+  const resolvedVoiceId =
+    pinned && pinned.lang === spokenLang
+      ? pinned.id
+      : pickRandomVoiceId(spokenLang) || getDefaultVoiceId(spokenLang);
+
+  // eslint-disable-next-line no-console
+  console.log(
+    `[teacher${tag}] ▶ start teach=${teachMode} spoken=${spokenLang} learn=${learnLang} voice=${voiceById(resolvedVoiceId)?.name ?? resolvedVoiceId} hist=${history.length} name="${objectName ?? className}" desc=${description.length}ch user="${userText.slice(0, 80)}${userText.length > 80 ? "…" : ""}"`
+  );
+
+  const system = GALLERY_TEACHER_SYSTEM(
+    description,
+    objectName,
+    className,
+    spokenLang,
+    learnLang,
+    teachMode
+  );
+
+  const replyResult = await openaiTextReply(
+    {
+      system,
+      userText,
+      priorMessages: history,
+      maxTokens: teachMode ? 320 : 180,
+      temperature: 0.6,
+    },
+    ` teacher${tag}`
+  );
+
+  const line = extractTextLine(replyResult.content);
+  if (!line) {
+    // eslint-disable-next-line no-console
+    console.log(`[teacher${tag}] ✖ empty line after parse`);
+    throw new Error("empty teacher line");
+  }
+  const total = Date.now() - t0;
+  // eslint-disable-next-line no-console
+  console.log(
+    `[teacher ${replyResult.backend}${tag}] ◀ done ${total}ms llm=${replyResult.ms}ms teach=${teachMode} line="${line.slice(0, 120)}${line.length > 120 ? "…" : ""}"`
+  );
+  return {
+    line,
+    voiceId: resolvedVoiceId,
+    turnId,
+    teachMode,
+  };
+}
+
+// === Gallery card hydration =============================================
+//
+// Once per card, the gallery fills in the bilingual card-face fields from
+// the persona card + object name. Single text-only LLM call, JSON output.
+// Persisted via `updateSessionCard` so we don't re-pay this on every mount.
+
+const GALLERIZE_SYSTEM = (
+  spokenLang: Lang,
+  learnLang: Lang
+): string => {
+  const learnLabel = langLabel(learnLang);
+  const spokenLabel = langLabel(spokenLang);
+  return `You turn a short persona description of an object into a bilingual learning card.
+
+Given the object's short name and a 1–2 sentence persona description, return a JSON object with:
+- translatedName: the object's short name rendered in ${learnLabel}. Natural and concise (1–4 words / 1–6 characters for Chinese). If the input name is already in ${learnLabel}, translate it to ${spokenLabel} instead.
+- bilingualIntro.learn: ONE short sentence in ${learnLabel} that introduces the object to a learner. First person from the object ("I am…" / "我是…"). Use a concrete detail from the description. ≤18 words / ≤25 characters.
+- bilingualIntro.spoken: the SAME sentence rendered in ${spokenLabel}. Same meaning, natural phrasing, not a word-for-word transliteration.
+
+Rules:
+- Keep both intro sentences short enough to fit on a gallery card.
+- No emojis, no quotes, no markdown, no code fences, no preamble.
+- Return ONLY the JSON object, nothing else.
+
+Shape:
+{
+  "translatedName": "<string>",
+  "bilingualIntro": { "learn": "<string>", "spoken": "<string>" }
+}`;
+};
+
+export type GallerizeCardArgs = {
+  description: string;
+  objectName?: string | null;
+  className?: string | null;
+  spokenLang: Lang;
+  learnLang: Lang;
+};
+
+export type GallerizeCardResult = {
+  translatedName: string;
+  bilingualIntro: { learn: string; spoken: string };
+};
+
+export async function gallerizeCard(
+  args: GallerizeCardArgs
+): Promise<GallerizeCardResult> {
+  const t0 = Date.now();
+  const spokenLang = normalizeLang(args.spokenLang);
+  const learnLang = normalizeLang(args.learnLang);
+  const description = (args.description ?? "").trim().slice(0, 600);
+  const objectName = (args.objectName ?? "").trim().slice(0, 80);
+  const className = (args.className ?? "").trim().slice(0, 60);
+  const nameForPrompt = objectName || className || "unnamed item";
+
+  if (!description) {
+    throw new Error("gallerizeCard: description is required");
+  }
+  if (spokenLang === learnLang) {
+    throw new Error("gallerizeCard: spokenLang === learnLang (nothing to translate)");
+  }
+
+  const userText = `Object name: ${nameForPrompt}
+Persona description: ${description}
+
+Return the JSON bilingual card now.`;
+
+  // eslint-disable-next-line no-console
+  console.log(
+    `[gallerize] ▶ start name="${nameForPrompt}" learn=${learnLang} spoken=${spokenLang} desc=${description.length}ch`
+  );
+
+  const replyResult = await openaiTextReply(
+    {
+      system: GALLERIZE_SYSTEM(spokenLang, learnLang),
+      userText,
+      priorMessages: [],
+      maxTokens: 260,
+      temperature: 0.4,
+    },
+    " gallerize"
+  );
+
+  const parsed = extractJsonObject(replyResult.content);
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("gallerizeCard: JSON parse failed");
+  }
+  const p = parsed as Partial<Record<string, unknown>>;
+  const translatedNameRaw =
+    typeof p.translatedName === "string" ? p.translatedName : "";
+  const introRaw =
+    p.bilingualIntro && typeof p.bilingualIntro === "object"
+      ? (p.bilingualIntro as Record<string, unknown>)
+      : {};
+  const learnRaw = typeof introRaw.learn === "string" ? introRaw.learn : "";
+  const spokenRaw = typeof introRaw.spoken === "string" ? introRaw.spoken : "";
+
+  const clean = (s: string, max: number) =>
+    s
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^["'`]+|["'`]+$/g, "")
+      .slice(0, max);
+
+  const translatedName = clean(translatedNameRaw, 60);
+  const learn = clean(learnRaw, 200);
+  const spoken = clean(spokenRaw, 200);
+
+  if (!translatedName || !learn || !spoken) {
+    throw new Error("gallerizeCard: missing fields after parse");
+  }
+
+  const total = Date.now() - t0;
+  // eslint-disable-next-line no-console
+  console.log(
+    `[gallerize ${replyResult.backend}] ◀ done ${total}ms llm=${replyResult.ms}ms name="${translatedName}" learn="${learn.slice(0, 60)}" spoken="${spoken.slice(0, 60)}"`
+  );
+
+  return {
+    translatedName,
+    bilingualIntro: { learn, spoken },
   };
 }

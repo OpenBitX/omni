@@ -677,65 +677,32 @@ export function Tracker() {
   //   - SpeechRecognition.lang (browser Web Speech) + server STT `language`
   // Mirrored into a ref so async handlers (tap → describe → generateLine →
   // TTS) always read the current value without going stale on re-renders.
-  const [lang, setLang] = useState<"en" | "zh">("zh");
-  const langRef = useRef<"en" | "zh">("zh");
-  useEffect(() => {
-    langRef.current = lang;
-  }, [lang]);
-
-  // Spoken / learn language pair. The user speaks Chinese (hardcoded; the
-  // product is aimed at a ZH-native audience). The existing top-right
-  // toggle controls `learnLang`: when it matches spokenLang (zh), the
-  // object replies in Chinese and teach-mode stays off; when flipped to
-  // EN, the object introduces itself + replies in English and teach-mode
-  // engages the moment the user asks how to say something.
+  // Spoken / learn language pair. The user speaks whatever `spokenLang`
+  // says; `learnLang` is always the opposite (zh ↔ en). The LEARN toggle
+  // that used to flip `learnLang` independently is gone — one SPEAK
+  // control now drives both, and downstream code reads refs that are
+  // kept in sync here.
   //
-  // Navigator detection is intentionally gone — we commit to a language
-  // default rather than guessing. The STT path still uses spokenLang, so
-  // audio routes correctly regardless of UI toggle state.
+  // After the global output-language flip (default reply language =
+  // spokenLang), all downstream reads that used to consume `langRef.current`
+  // (TTS lang, groupLine lang, generateLine lang arg, converse lang field)
+  // have been redirected to `spokenLangRef.current`. learnLangRef stays
+  // for the teach-mode branches that still need the target language.
   const [spokenLang, setSpokenLang] = useState<AppLang>("zh");
-  const [learnLang, setLearnLang] = useState<AppLang>(lang as AppLang);
+  const learnLang: AppLang = spokenLang === "zh" ? "en" : "zh";
   const spokenLangRef = useRef<AppLang>("zh");
-  const learnLangRef = useRef<AppLang>(lang as AppLang);
+  const learnLangRef = useRef<AppLang>("en");
   useEffect(() => {
     spokenLangRef.current = spokenLang;
-  }, [spokenLang]);
-  useEffect(() => {
     learnLangRef.current = learnLang;
-  }, [learnLang]);
-  // The top-right EN/中 toggle drives `lang`; mirror it to learnLang so
-  // one control is responsible for the learn-target. spokenLang stays zh.
-  useEffect(() => {
-    setLearnLang(lang as AppLang);
-  }, [lang]);
+  }, [spokenLang, learnLang]);
 
-  // Active lens. Initialized from (in order) URL `?lens=` → onboarding
-  // prefs → "play". Switching mid-session rewrites the prompt for NEW taps
-  // but doesn't retroactively change already-locked tracks (each track
-  // snapshots its mode at lock time, via `TrackRefs.mode`).
-  const [mode, setMode] = useState<Lens>("play");
+  // Active lens. The LENS picker + language/history variants were removed
+  // from the UI — the main route now always runs the "play" lens. Each
+  // track still snapshots `mode` at lock time (via `TrackRefs.mode`) for
+  // downstream prompt routing, so we keep the ref shape intact.
+  const mode: Lens = "play";
   const modeRef = useRef<Lens>("play");
-  useEffect(() => {
-    modeRef.current = mode;
-  }, [mode]);
-  useEffect(() => {
-    // URL takes precedence (landing links /?lens=play etc.).
-    let initial: Lens | null = null;
-    try {
-      const url = new URL(window.location.href);
-      const qs = url.searchParams.get("lens");
-      if (qs === "play" || qs === "language" || qs === "history") {
-        initial = qs;
-      }
-    } catch {
-      // ignore
-    }
-    if (!initial) {
-      const prefs = readOnboardingPrefs();
-      if (prefs) initial = prefs.lens;
-    }
-    if (initial) setMode(initial);
-  }, []);
 
   // Lens onboarding overlay. Shown when:
   //   (a) URL has `?onboarding=1` (landing's CTAs add it on every click —
@@ -769,10 +736,10 @@ export function Tracker() {
   const handleOnboardingFinished = useCallback(
     (completed: { lens: Lens; spokenLang: "en" | "zh" }) => {
       setShowLensOnboarding(false);
-      setMode(completed.lens);
-      // Sync the language toggle to the user's pick so the UI matches
-      // their onboarding answer without them having to flip it again.
-      setLang(completed.spokenLang);
+      // Lens is hardcoded to "play" now — onboarding's lens pick no longer
+      // wires anywhere. We still sync the spoken language so the UI
+      // matches the user's onboarding answer without a second flip.
+      setSpokenLang(completed.spokenLang);
       // Suppress the legacy "tap anything" bubble — the lens overlay IS
       // the onboarding now; two consecutive overlays feels like paperwork.
       try {
@@ -1455,7 +1422,7 @@ export function Tracker() {
       // card + retap lines stay consistent with what the user wants to
       // hear (e.g. learnLang=en → object description is in English even
       // when the user speaks Chinese).
-      describeObject(cropDataUrl, track.className, learnLangRef.current, tapTag)
+      describeObject(cropDataUrl, track.className, spokenLangRef.current, tapTag)
         .then(({ description }) => {
           // Track may have been evicted while we waited; bail if so.
           const current = tracksRef.current.find((t) => t.id === trackId);
@@ -1620,7 +1587,7 @@ export function Tracker() {
             text,
             voiceId: voiceId ?? "",
             turnId: tid,
-            lang: langRef.current,
+            lang: spokenLangRef.current,
             emotion: emotion ? [emotion] : [],
             speed: speed ?? null,
           }),
@@ -1874,7 +1841,7 @@ export function Tracker() {
                 voiceId: track.voiceId,
                 description: track.description,
                 history: track.history.slice(-32),
-                lang: langRef.current,
+                lang: spokenLangRef.current,
                 spokenLang: spokenLangRef.current,
                 learnLang: learnLangRef.current,
                 mode: track.mode,
@@ -1985,7 +1952,7 @@ export function Tracker() {
               track.voiceId,
               track.description,
               track.history.slice(-32),
-              langRef.current,
+              spokenLangRef.current,
               tapTag,
               spokenLangRef.current,
               learnLangRef.current,
@@ -2769,7 +2736,7 @@ export function Tracker() {
           formData.append("className", subject);
         }
         formData.append("turnId", tid);
-        formData.append("lang", langRef.current);
+        formData.append("lang", spokenLangRef.current);
         formData.append("spokenLang", spokenLangRef.current);
         formData.append("learnLang", learnLangRef.current);
         formData.append("mode", track.mode);
@@ -3153,7 +3120,7 @@ export function Tracker() {
         peers,
         recentTurns,
         mode,
-        lang: langRef.current,
+        lang: spokenLangRef.current,
       });
       if (gen !== groupGenRef.current) {
         // eslint-disable-next-line no-console
@@ -3171,7 +3138,7 @@ export function Tracker() {
             text: line,
             voiceId: pick.voiceId ?? "",
             turnId: `gp${gen}`,
-            lang: langRef.current,
+            lang: spokenLangRef.current,
             emotion: emotion ? [emotion] : [],
             speed: speed ?? null,
           }),
@@ -3477,7 +3444,7 @@ export function Tracker() {
         peers,
         recentTurns,
         mode,
-        lang: langRef.current,
+        lang: spokenLangRef.current,
       });
       if (turnGen !== groupGenRef.current || callGen !== speaker.speakGen) {
         // eslint-disable-next-line no-console
@@ -4435,52 +4402,39 @@ export function Tracker() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tracksUI, sessionCards, learnLang]);
 
-  // Unified popup item: prefer the pending capture (so the popup appears
-  // instantly on tap), upgrade to the stored card as soon as its trackId
-  // matches. Falls back to the newest non-dismissed card when nothing is
-  // pending, so dismissed popups don't leave stale state behind.
+  // Unified popup item: only renders when there's an active fresh-tap
+  // `pendingCapture`. On page load / reload we intentionally show
+  // nothing, even if sessionCards are hydrated from storage — the
+  // gallery page is the home for historical cards, not a popup on /.
   const activeCaptureItem: CaptureItem | null = useMemo(() => {
     const placeholderName = learnLang === "zh" ? "识别中…" : "looking…";
-    if (pendingCapture) {
-      if (dismissedTrackIds.has(pendingCapture.trackId)) return null;
-      const card = sessionCards.find(
-        (c) => c.trackId === pendingCapture.trackId
-      );
-      if (card) {
-        return {
-          trackId: card.trackId,
-          // Never show the YOLO class — use the VLM's name, falling
-          // back to a neutral language-appropriate placeholder.
-          className: cardDisplayName(card),
-          imageDataUrl: card.imageDataUrl,
-          cardId: card.id,
-          status: (card.generatedImageStatus ?? "idle") as CaptureItem["status"],
-        };
-      }
+    if (!pendingCapture) return null;
+    if (dismissedTrackIds.has(pendingCapture.trackId)) return null;
+    const card = sessionCards.find(
+      (c) => c.trackId === pendingCapture.trackId
+    );
+    if (card) {
       return {
-        trackId: pendingCapture.trackId,
-        // While the VLM is in flight we intentionally don't surface the
-        // YOLO class — it would be "cup" / "chair", defeating the whole
-        // point of VLM-named cards. Show a language-appropriate
-        // placeholder and let the popup upgrade when the name arrives.
-        className: placeholderName,
-        imageDataUrl: pendingCapture.imageDataUrl,
-        cardId: null,
-        status: "preparing",
+        trackId: card.trackId,
+        // Never show the YOLO class — use the VLM's name, falling
+        // back to a neutral language-appropriate placeholder.
+        className: cardDisplayName(card),
+        imageDataUrl: card.imageDataUrl,
+        cardId: card.id,
+        status: (card.generatedImageStatus ?? "idle") as CaptureItem["status"],
       };
     }
-    for (let i = sessionCards.length - 1; i >= 0; i--) {
-      const c = sessionCards[i];
-      if (dismissedTrackIds.has(c.trackId)) continue;
-      return {
-        trackId: c.trackId,
-        className: cardDisplayName(c),
-        imageDataUrl: c.imageDataUrl,
-        cardId: c.id,
-        status: (c.generatedImageStatus ?? "idle") as CaptureItem["status"],
-      };
-    }
-    return null;
+    return {
+      trackId: pendingCapture.trackId,
+      // While the VLM is in flight we intentionally don't surface the
+      // YOLO class — it would be "cup" / "chair", defeating the whole
+      // point of VLM-named cards. Show a language-appropriate
+      // placeholder and let the popup upgrade when the name arrives.
+      className: placeholderName,
+      imageDataUrl: pendingCapture.imageDataUrl,
+      cardId: null,
+      status: "preparing",
+    };
   }, [sessionCards, dismissedTrackIds, pendingCapture, learnLang]);
 
   const dotClass =
@@ -4718,52 +4672,6 @@ export function Tracker() {
               {statusText}
             </span>
           </div>
-          {/* Lens pill — Play / Language / History. Switches the soul of
-              the camera: the prompt fed to each new tap. Already-locked
-              tracks keep the mode they were locked in (snapshotted onto
-              TrackRefs.mode), so changing this mid-session only affects
-              the next object you tap. */}
-          <div
-            role="group"
-            aria-label="lens"
-            className="flex items-center gap-1 rounded-full bg-white/15 p-0.5 pl-2 ring-1 ring-white/25 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] backdrop-blur-xl"
-          >
-            <span
-              aria-hidden
-              className="select-none text-[9px] font-semibold uppercase tracking-[0.15em] text-white/55"
-            >
-              lens
-            </span>
-            {(
-              [
-                ["play", "play", "✿"],
-                ["language", "lang", "✦"],
-                ["history", "past", "♡"],
-              ] as const
-            ).map(([value, label, glyph]) => (
-              <button
-                key={value}
-                onPointerDown={(e) => e.stopPropagation()}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setMode(value);
-                }}
-                aria-pressed={mode === value}
-                className={
-                  "grid h-6 min-w-[44px] place-items-center gap-1 rounded-full px-2 text-[10.5px] font-semibold tracking-wide transition " +
-                  (mode === value
-                    ? "bg-white/85 text-[#c23a7a] shadow-sm"
-                    : "text-white/80 hover:text-white")
-                }
-                title={`${value} lens`}
-              >
-                <span aria-hidden className="text-[11px] leading-none">
-                  {glyph}
-                </span>
-                <span className="leading-none">{label}</span>
-              </button>
-            ))}
-          </div>
           {/* Spoken-language toggle — 中 / EN. Sets the user's native
               tongue; paired with `learn` so the user can see both at once.
               STT routing reads `spokenLang`, so flipping this re-routes
@@ -4805,54 +4713,6 @@ export function Tracker() {
               className={
                 "grid h-6 min-w-[28px] place-items-center rounded-full px-2 text-[10.5px] font-semibold tracking-wide transition " +
                 (spokenLang === "en"
-                  ? "bg-white/80 text-[#c23a7a] shadow-sm"
-                  : "text-white/80 hover:text-white")
-              }
-            >
-              EN
-            </button>
-          </div>
-          {/* Learn-language toggle — 中 / EN. Switches the target
-              language the object introduces itself and replies in, which
-              also gates teach mode. Only affects calls started AFTER the
-              flip; in-flight TTS keeps playing. */}
-          <div
-            role="group"
-            aria-label="learn language"
-            className="flex items-center gap-1 rounded-full bg-white/15 p-0.5 pl-2 ring-1 ring-white/25 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] backdrop-blur-xl"
-          >
-            <span
-              aria-hidden
-              className="select-none text-[9px] font-semibold uppercase tracking-[0.15em] text-white/55"
-            >
-              learn
-            </span>
-            <button
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation();
-                setLang("zh");
-              }}
-              aria-pressed={lang === "zh"}
-              className={
-                "grid h-6 min-w-[28px] place-items-center rounded-full px-2 text-[11px] font-semibold transition " +
-                (lang === "zh"
-                  ? "bg-white/80 text-[#c23a7a] shadow-sm"
-                  : "text-white/80 hover:text-white")
-              }
-            >
-              中
-            </button>
-            <button
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation();
-                setLang("en");
-              }}
-              aria-pressed={lang === "en"}
-              className={
-                "grid h-6 min-w-[28px] place-items-center rounded-full px-2 text-[10.5px] font-semibold tracking-wide transition " +
-                (lang === "en"
                   ? "bg-white/80 text-[#c23a7a] shadow-sm"
                   : "text-white/80 hover:text-white")
               }

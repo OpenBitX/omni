@@ -28,7 +28,7 @@
 // Backend: `npm run server:v2` on port 8001. See server-v2/README.md.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { converseWithObject } from "@/app/actions";
+import { assessObject, converseWithObject } from "@/app/actions";
 import {
   FACE_VOICE_HEIGHT,
   FACE_VOICE_WIDTH,
@@ -121,6 +121,10 @@ type ServerEvent =
       score: number;
       stale?: boolean;
       maskArea?: number;
+      // Server has crossed the tier-1 → tier-2 threshold and is
+      // reacquiring with points-only prompts. Client dims harder so the
+      // user gets visual feedback that we're searching, not just stuck.
+      reacquiring?: boolean;
     }
   | { type: "lost"; reason: string }
   | { type: "error"; message: string };
@@ -782,8 +786,14 @@ export function TrackerV2() {
             track.opacity = 1;
           }
         } else {
-          // Stale / missing / malformed frame — fade slightly but don't drop.
-          track.opacity = Math.max(0.5, track.opacity - 0.1);
+          // Stale / missing / malformed frame — fade but don't drop.
+          // Two-tier fade matches the server's two-tier retry: tier-1
+          // stale frames (normal re-prompt retry) only fade gently; once
+          // the server signals `reacquiring` (tier-2, points-only global
+          // search) we dim harder so the user SEES that we're searching.
+          const floor = payload.reacquiring ? 0.25 : 0.5;
+          const step = payload.reacquiring ? 0.15 : 0.1;
+          track.opacity = Math.max(floor, track.opacity - step);
           track.staleStreak++;
           // Decay velocity during stalls so we don't keep extrapolating
           // a stale trajectory after the object has stopped moving.
@@ -1119,6 +1129,31 @@ export function TrackerV2() {
         setError("frame encode failed");
         return;
       }
+
+      // 2a) Fire the person-reject gate in parallel. V1 runs this on
+      //     every tap — it's the "don't glue a face onto a human" rule.
+      //     We don't await it: assessObject lives on a reasoning VLM that
+      //     takes ~3–5s, and blocking would visibly stall the lock. If
+      //     the result comes back "unsuitable" for the SAME track gen
+      //     still active, we release the face with the model's verbatim
+      //     reason (toast tone). Stale responses for a retapped track
+      //     are dropped via the gen guard — same pattern we use
+      //     everywhere else in this file for in-flight async.
+      void (async () => {
+        try {
+          const a = await assessObject(dataUrl, xNorm, yNorm, "v2");
+          if (trackGenRef.current !== nextTrackGen) return;
+          if (!a.suitable) {
+            setError(a.reason || "not a good object for a face");
+            releaseTrack();
+          }
+        } catch {
+          // Assess failed (GLM down, rate limit, etc.) — don't punish
+          // the user for an infra blip; let the lock proceed. V1's
+          // default stance is also "generous, only reject obvious
+          // mismatches," so a silent fail here matches the spirit.
+        }
+      })();
 
       // Wake the audio context on the tap gesture so MediaSource has a
       // running graph to stream into by the time /api/speak's first byte
