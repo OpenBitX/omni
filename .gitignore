@@ -19,8 +19,7 @@ public/ort/
 server/Screenshot_*.png
 server/*.coords.json
 
-# Large / unused ONNX models — only yolo26n.onnx is tracked
+# Large / unused ONNX models — yolo26n.onnx + yolo26n-seg.onnx are tracked
 public/models/rf-detr-nano.onnx
 public/models/yolov8n.onnx
-public/models/yolo26n-seg.onnx
 
