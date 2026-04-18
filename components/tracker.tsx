@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import {
   converseWithObject,
   describeObject,
@@ -18,10 +19,10 @@ import {
 } from "@/components/face-voice";
 import { SpeechBubble } from "@/components/speech-bubble";
 import {
-  SessionGallery,
-  type CardLiveStatus,
+  addSessionCard,
+  clearSessionCards,
   type SessionCard,
-} from "@/components/session-gallery";
+} from "@/lib/session-cards";
 import {
   COCO_CLASSES,
   PERSON_CLASS_ID,
@@ -980,17 +981,6 @@ export function Tracker() {
     langRef.current = lang;
   }, [lang]);
 
-  // --- Session gallery: one card per first-tap capture. The card pins the
-  // crop + persona + opening line the moment the VLM returns, so the user
-  // can scroll back through everything they pointed at in this session and
-  // speak to any of them again. Cards are session-only (no persistence).
-  const [sessionCards, setSessionCards] = useState<SessionCard[]>([]);
-  // The card whose mic button is currently pressed (press-and-hold visual
-  // state). Separate from `isRecording` because the main mic button and
-  // gallery mic buttons share the underlying recorder but need distinct
-  // "this one is active" highlights.
-  const [activeCardId, setActiveCardId] = useState<string | null>(null);
-
   // --- Push-to-talk state (UI only, decoupled from per-track voice) -----
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
@@ -1496,8 +1486,7 @@ export function Tracker() {
     setTracksUI([]);
     // Full-reset also wipes the session gallery — the × button handles
     // per-card removal; this is the "clean slate" demo hard-reset.
-    setSessionCards([]);
-    setActiveCardId(null);
+    clearSessionCards();
     // Bump generation so any in-flight tap's generateLine/TTS drops silent.
     generationRef.current++;
     // Invalidate any staged group turn + in-flight prepare; scene is gone.
@@ -2241,10 +2230,10 @@ export function Tracker() {
         // Session gallery: on the first tap of each track (the /api/speak
         // branch runs only when !isRetap) save a card capturing everything
         // the VLM just decided — crop, persona, voice, and opening line.
+        // The card lives in a sessionStorage-backed store so the /gallery
+        // route (a separate page) can read it without a shared parent.
         // Guarded by voiceId + description + line so a degraded no-backend
-        // run doesn't fill the gallery with half-built cards. We key by
-        // trackId so re-taps on the same track don't push duplicates
-        // (!isRetap already prevents that, but defensive double-check).
+        // run doesn't fill the gallery with half-built cards.
         if (
           !isRetap &&
           chosenVoiceId &&
@@ -2252,21 +2241,17 @@ export function Tracker() {
           typeof line === "string" &&
           line.trim()
         ) {
-          const className = track.className;
           const newCard: SessionCard = {
             id: `card-${trackId}-${Date.now()}`,
             trackId,
             createdAt: Date.now(),
-            className,
+            className: track.className,
             description: chosenDescription,
             voiceId: chosenVoiceId,
             line,
             imageDataUrl: cropDataUrl,
           };
-          setSessionCards((prev) => {
-            if (prev.some((c) => c.trackId === trackId)) return prev;
-            return [...prev, newCard];
-          });
+          addSessionCard(newCard);
         }
         // Record what the object said into its own memory so a later
         // conversation turn can call back to it.
@@ -4476,52 +4461,6 @@ export function Tracker() {
     stopTalkLevelLoop();
   }, [stopTalkLevelLoop]);
 
-  // Gallery-card mic handlers. Instead of duplicating the whole mic stack
-  // (recorder + SR + Whisper race), a card press just aims the existing
-  // talk flow at its track: bump lastTapAt so pickTalkTarget() picks this
-  // one, then reuse startRecording(). If the track was evicted (out of
-  // frame long enough for LRU to reclaim it) the card is visually disabled
-  // and we no-op — user needs to re-tap the object to bring it back.
-  const handleCardMicPress = useCallback(
-    (cardId: string) => {
-      const card = sessionCards.find((c) => c.id === cardId);
-      if (!card) return;
-      const track = tracksRef.current.find((t) => t.id === card.trackId);
-      if (!track) {
-        showRejection("out of view — tap it again");
-        return;
-      }
-      track.lastTapAt = performance.now();
-      setActiveCardId(cardId);
-      void startRecording();
-    },
-    [sessionCards, showRejection, startRecording]
-  );
-
-  const handleCardMicRelease = useCallback(
-    (cardId: string) => {
-      if (activeCardId === cardId) {
-        setActiveCardId(null);
-      }
-      stopRecording();
-    },
-    [activeCardId, stopRecording]
-  );
-
-  const handleCardDismiss = useCallback((cardId: string) => {
-    setSessionCards((prev) => prev.filter((c) => c.id !== cardId));
-    setActiveCardId((prev) => (prev === cardId ? null : prev));
-  }, []);
-
-  // Clear the active-card highlight any time recording actually stops —
-  // covers paths like PointerLeave with no buttons down, or someone else
-  // calling stopRecording() while we were aimed at a card.
-  useEffect(() => {
-    if (!isRecording && activeCardId !== null) {
-      setActiveCardId(null);
-    }
-  }, [isRecording, activeCardId]);
-
   // --- Derived UI --------------------------------------------------------
   const anyThinking = tracksUI.some((t) => t.thinking);
   const anySpeaking = tracksUI.some((t) => t.speaking);
@@ -4531,18 +4470,6 @@ export function Tracker() {
   // Drives the mic button's aria-label only — pressing talk while busy
   // now interrupts the current voice instead of being blocked.
   const micBusy = anyThinking || anySpeaking;
-
-  // For each gallery card, is its backing track still being tracked? Used
-  // to enable/disable the card's mic button. Rebuilt only when tracksUI or
-  // the card list changes — not every render.
-  const cardStatus = useMemo<Record<string, CardLiveStatus>>(() => {
-    const liveIds = new Set(tracksUI.map((t) => t.id));
-    const out: Record<string, CardLiveStatus> = {};
-    for (const c of sessionCards) {
-      out[c.trackId] = liveIds.has(c.trackId) ? "alive" : "lost";
-    }
-    return out;
-  }, [tracksUI, sessionCards]);
 
   // Which face the mic is aimed at — the most-recently-tapped one. Drives
   // the button label so the user sees "talk to the cup" before they press.
@@ -4838,6 +4765,15 @@ export function Tracker() {
               EN
             </button>
           </div>
+          <Link
+            href="/gallery"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            className="grid h-7 w-auto place-items-center rounded-full bg-white/15 px-2.5 text-[10.5px] font-semibold uppercase tracking-wider text-white/90 ring-1 ring-white/25 backdrop-blur-xl transition hover:bg-white/25"
+            aria-label="open gallery"
+          >
+            gallery
+          </Link>
           <button
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => {
@@ -5320,18 +5256,6 @@ export function Tracker() {
           </div>
         </div>
       )}
-
-      {/* Session gallery — horizontal strip of every object captured this
-          session. Stays above the mic button; empty until the first tap
-          completes. */}
-      <SessionGallery
-        cards={sessionCards}
-        activeCardId={activeCardId}
-        cardStatus={cardStatus}
-        onMicPress={handleCardMicPress}
-        onMicRelease={handleCardMicRelease}
-        onDismiss={handleCardDismiss}
-      />
 
       {/* Hold-to-talk button (unchanged). */}
       <div

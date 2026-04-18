@@ -183,10 +183,11 @@ function getOpenAIClient(): OpenAI | null {
 function getGeminiClient(): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) return null;
-  // Default to v1 so Gemini 3.x models resolve — the SDK's built-in
-  // default is still `v1beta`, which 404s on `gemini-3.1-flash` etc.
-  // Override with GEMINI_API_VERSION=v1beta to pin an older tier.
-  const apiVersion = process.env.GEMINI_API_VERSION?.trim() || "v1";
+  // The `v1` REST endpoint rejects camelCase sub-fields the SDK emits
+  // (`responseMimeType`, `responseSchema`, `thinkingConfig`,
+  // `systemInstruction`) with 400 INVALID_ARGUMENT; only `v1beta`
+  // accepts them. Override with GEMINI_API_VERSION=<version> if needed.
+  const apiVersion = process.env.GEMINI_API_VERSION?.trim() || "v1beta";
   return new GoogleGenAI({ apiKey: key, apiVersion });
 }
 
@@ -206,6 +207,28 @@ function isTransientFetchError(err: unknown): boolean {
     msg.includes("socket hang up") ||
     msg.includes("network")
   );
+}
+
+// One-word label classifying an error so log summaries stay scannable.
+// Ordered from most-specific to most-generic — the first match wins.
+function classifyError(err: unknown): string {
+  if (!(err instanceof Error)) return "unknown";
+  const msg = err.message.toLowerCase();
+  const status = msg.match(/\b([45]\d\d)\b/)?.[1];
+  if (msg.includes("invalid_argument") || msg.includes("unknown name"))
+    return status ? `${status}:schema` : "schema";
+  if (msg.includes("not found") || status === "404")
+    return status ? `${status}:model-missing` : "model-missing";
+  if (msg.includes("unauthor") || status === "401" || status === "403")
+    return status ? `${status}:auth` : "auth";
+  if (msg.includes("quota") || msg.includes("rate") || status === "429")
+    return status ? `${status}:rate-limit` : "rate-limit";
+  if (msg.includes("timeout") || msg.includes("etimedout")) return "timeout";
+  if (msg.includes("parse") || msg.includes("empty line") || msg.includes("json"))
+    return "parse";
+  if (isTransientFetchError(err)) return "transient";
+  if (status) return status;
+  return "error";
 }
 
 // Cerebras — fastest Llama inference for the hot-path LLM reply
@@ -652,13 +675,12 @@ const GENERATE_BUNDLED_MODEL_GLM =
   process.env.GLM_BUNDLED_MODEL?.trim() || "glm-4.5v";
 const GENERATE_BUNDLED_MODEL_OPENAI =
   process.env.OPENAI_BUNDLED_MODEL?.trim() || "gpt-4o-mini";
-// `gemini-3.1-flash` — fastest flash tier in the 3.x family. Not served
-// on `v1beta` (404s there), so the client is pinned to `v1` in
-// `getGeminiClient()`. If this name ever drifts, override via
-// `GEMINI_BUNDLED_MODEL=<name>` and/or `GEMINI_API_VERSION=<version>`
-// without touching code.
+// `gemini-2.5-flash` — known-working flash tier on the `v1beta` endpoint
+// that the SDK's camelCase request shape pairs with. If you want to try
+// a newer model, override via `GEMINI_BUNDLED_MODEL=<name>` (and
+// `GEMINI_API_VERSION=<version>` if the model isn't served on v1beta).
 const GENERATE_BUNDLED_MODEL_GEMINI =
-  process.env.GEMINI_BUNDLED_MODEL?.trim() || "gemini-3.1-flash";
+  process.env.GEMINI_BUNDLED_MODEL?.trim() || "gemini-2.5-flash";
 
 function parseBundledJson(
   raw: string
