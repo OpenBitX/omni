@@ -56,6 +56,30 @@ CHECKPOINT_ENV = os.environ.get("SAM2_CHECKPOINT", "")
 DEFAULT_CHECKPOINT = ROOT / "checkpoints" / "sam2.1_hiera_tiny.pt"
 DEFAULT_CONFIG_NAME = os.environ.get("SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_t.yaml")
 
+# === Tracking stickiness tunables ====================================
+#
+# These shape how aggressively we trust and re-prompt from the previous
+# frame. Set with conservative defaults — if tracks are still drifting,
+# the knobs to turn first are BBOX_PAD_FRAC (more context for SAM2) and
+# DRIFT_AREA_RATIO (stricter = stickier, at the cost of slower handling
+# of genuinely fast size changes like zooming in).
+
+# Amount to pad the previous frame's mask bbox before feeding it as the
+# box prompt. SAM2 refines the boundary *within* the prompted box, so a
+# tight bbox can amputate parts of a moving object. 0.15 = 15% padding
+# on each side — enough slack for motion without dragging in background.
+BBOX_PAD_FRAC = float(os.environ.get("SAM2_BBOX_PAD", "0.15"))
+# Max acceptable frame-to-frame area change. New mask area > N× previous
+# (or < 1/N×) is assumed to be bleed into the background or dropout onto
+# a tiny neighbor. Rejected updates don't advance `prev_low_res`, so the
+# next frame re-prompts from the last good state instead of compounding
+# the drift. `3.0` is a generous cap — a hand entering the frame grows
+# 2–3× over a couple frames; beyond that it's almost always bleed.
+DRIFT_AREA_RATIO = float(os.environ.get("SAM2_DRIFT_RATIO", "3.0"))
+# Max consecutive bad frames (low score OR drift-rejected) before we
+# give up and emit "lost". Higher = stickier through brief occlusion.
+LOST_AFTER_BAD_FRAMES = int(os.environ.get("SAM2_LOST_AFTER", "5"))
+
 
 # =====================================================================
 # Model loading (lazy, device autodetect)
@@ -145,6 +169,38 @@ def _bbox_from_mask(mask: np.ndarray) -> Optional[tuple[float, float, float, flo
     return float(cx), float(cy), float(w), float(h)
 
 
+def _bbox_xyxy_from_mask(mask: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+    """Return (x1, y1, x2, y2) in *pixel* coords on the mask's own grid, or
+    None if empty. This is the form SAM2's `box=` prompt expects. Kept
+    alongside `_bbox_from_mask` which returns normalized center-width for
+    client serialization."""
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _pad_box_xyxy(
+    box: tuple[int, int, int, int], W: int, H: int, pad_frac: float
+) -> tuple[float, float, float, float]:
+    """Grow a pixel bbox by `pad_frac` of its longer edge on each side,
+    clamped to frame bounds. Purpose: give SAM2 slack to refine the mask
+    for objects that moved/rotated between frames — a tight bbox prompt
+    clips the mask at the previous silhouette and the object visibly
+    "chips off" along motion direction. Padding by ~15% is a sweet spot
+    for 640px frames."""
+    x1, y1, x2, y2 = box
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    pad = int(round(max(w, h) * pad_frac))
+    return (
+        float(max(0, x1 - pad)),
+        float(max(0, y1 - pad)),
+        float(min(W - 1, x2 + pad)),
+        float(min(H - 1, y2 + pad)),
+    )
+
+
 def _centroid_from_mask(mask: np.ndarray) -> Optional[tuple[float, float]]:
     """Mask centroid in pixel coords on the mask's own grid. Used to re-prompt
     the next frame — the centroid is more stable than the bbox center for
@@ -153,6 +209,13 @@ def _centroid_from_mask(mask: np.ndarray) -> Optional[tuple[float, float]]:
     if xs.size == 0:
         return None
     return float(xs.mean()), float(ys.mean())
+
+
+def _mask_area_px(mask: np.ndarray) -> int:
+    """Foreground pixel count. Used by the drift-rejection heuristic:
+    frame-to-frame area ratios > DRIFT_AREA_RATIO mean the mask has
+    bled into the background or collapsed to a tiny neighbor region."""
+    return int(mask.sum())
 
 
 # =====================================================================
@@ -167,23 +230,45 @@ class Session:
         IDLE          -- no track. Waiting for {"type":"init", x, y}.
         PENDING_INIT  -- got init text, waiting for the JPEG binary that goes with it.
         TRACKING      -- have a mask. Each incoming JPEG extends the track.
+
+    Tracking state accumulates per frame:
+        prev_low_res        -- last good (1, 256, 256) logits for mask_input chaining
+        prev_centroid_px    -- last good mask centroid (stable re-prompt point)
+        prev_bbox_xyxy      -- last good mask bbox in pixels (box prompt for next frame)
+        prev_area_px        -- last good mask foreground pixel count (drift detection)
+        initial_tap_norm    -- the user's original tap, stashed for life of the track
+        bad_frame_streak    -- consecutive low-score / drift-rejected frames; triggers
+                               "lost" after LOST_AFTER_BAD_FRAMES so one blurry frame
+                               or brief occlusion doesn't kill the track.
+        frames_tracked      -- monotonically increases. First few frames skip drift
+                               checks because the mask naturally grows as SAM2 locks
+                               on (point-only prompt → triple prompt produces a fuller
+                               mask, which would otherwise trip the area ratio).
     """
 
     def __init__(self) -> None:
         self.state: str = "IDLE"
         self.track_id: Optional[str] = None
         self.pending_point: Optional[tuple[float, float]] = None  # normalized
+        self.initial_tap_norm: Optional[tuple[float, float]] = None
         self.prev_low_res: Optional[np.ndarray] = None  # (1, 256, 256) logits
-        self.prev_centroid_px: Optional[tuple[float, float]] = None  # in resized-frame px
-        self.frames_since_ok: int = 0
+        self.prev_centroid_px: Optional[tuple[float, float]] = None
+        self.prev_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+        self.prev_area_px: int = 0
+        self.bad_frame_streak: int = 0
+        self.frames_tracked: int = 0
 
     def reset(self) -> None:
         self.state = "IDLE"
         self.track_id = None
         self.pending_point = None
+        self.initial_tap_norm = None
         self.prev_low_res = None
         self.prev_centroid_px = None
-        self.frames_since_ok = 0
+        self.prev_bbox_xyxy = None
+        self.prev_area_px = 0
+        self.bad_frame_streak = 0
+        self.frames_tracked = 0
 
 
 # =====================================================================
@@ -193,14 +278,24 @@ class Session:
 
 async def _predict(
     frame_rgb: np.ndarray,
-    point_xy_px: tuple[float, float],
+    points_xy_px: list[tuple[float, float]],
+    point_labels: list[int],
+    box_xyxy: Optional[tuple[float, float, float, float]],
     prev_low_res: Optional[np.ndarray],
 ) -> tuple[np.ndarray, float, np.ndarray]:
-    """Run SAM2 on a single frame with a point prompt (+ optional prev mask).
+    """Run SAM2 on a single frame with any combination of point / box / mask
+    prompts. Returns (mask_bool, score, low_res_logits).
 
-    Returns (mask_bool, score, low_res_logits). Serialized on `_model_lock`
-    so concurrent sessions don't thrash the predictor's internal `set_image`
-    state. Actual torch work runs in a thread so the asyncio loop stays free.
+    The "sticky tracking" recipe is the triple-prompt: a point at the last
+    centroid (says *this is the object*), a box from the last mask padded
+    15% (says *roughly where to look*), and the previous frame's low-res
+    logits via mask_input (says *here's what the silhouette looked like*).
+    Any one of these alone leaks; together they pin the segmentation.
+
+    Serialized on `_model_lock` because SAM2's image predictor stores the
+    encoded image on `self`, so concurrent `set_image` calls race. Heavy
+    torch work goes through `asyncio.to_thread` so the event loop stays
+    responsive for other WS messages.
     """
     import torch
 
@@ -208,26 +303,22 @@ async def _predict(
 
     def _run():
         predictor.set_image(frame_rgb)
-        # SAM2 expects shape (N,2) float32 for point_coords, (N,) int for labels.
-        pts = np.array([[point_xy_px[0], point_xy_px[1]]], dtype=np.float32)
-        lbl = np.array([1], dtype=np.int32)  # 1 = foreground
-        kwargs: dict[str, Any] = dict(
-            point_coords=pts,
-            point_labels=lbl,
-            multimask_output=False,
-        )
+        kwargs: dict[str, Any] = dict(multimask_output=False)
+        if points_xy_px:
+            kwargs["point_coords"] = np.array(points_xy_px, dtype=np.float32)
+            kwargs["point_labels"] = np.array(point_labels, dtype=np.int32)
+        if box_xyxy is not None:
+            kwargs["box"] = np.array(box_xyxy, dtype=np.float32)
         if prev_low_res is not None:
             kwargs["mask_input"] = prev_low_res
 
         with torch.inference_mode():
-            # autocast only on CUDA; MPS autocast is flaky, CPU doesn't need it.
             if _device == "cuda":
                 with torch.autocast(device_type="cuda", dtype=_dtype):
                     masks, scores, low_res = predictor.predict(**kwargs)
             else:
                 masks, scores, low_res = predictor.predict(**kwargs)
 
-        # masks: (1, H, W) bool-ish; scores: (1,) float; low_res: (1, 256, 256)
         return masks[0].astype(bool), float(scores[0]), low_res
 
     async with _model_lock:
@@ -256,6 +347,9 @@ async def health() -> dict[str, Any]:
         "model_loaded": _predictor is not None,
         "max_long_edge": MAX_LONG_EDGE,
         "score_lost_threshold": SCORE_LOST_THRESHOLD,
+        "bbox_pad_frac": BBOX_PAD_FRAC,
+        "drift_area_ratio": DRIFT_AREA_RATIO,
+        "lost_after_bad_frames": LOST_AFTER_BAD_FRAMES,
     }
 
 
@@ -302,10 +396,13 @@ async def sam2_ws(ws: WebSocket) -> None:
                     x = min(1.0, max(0.0, x))
                     y = min(1.0, max(0.0, y))
                     sess.pending_point = (x, y)
+                    sess.initial_tap_norm = (x, y)
                     sess.state = "PENDING_INIT"
                     sess.prev_low_res = None
                     sess.prev_centroid_px = None
-                    sess.frames_since_ok = 0
+                    sess.prev_bbox_xyxy = None
+                    sess.prev_area_px = 0
+                    sess.bad_frame_streak = 0
                     sess.track_id = secrets.token_hex(4)
                     log.info("[ws %s] init point=(%.3f,%.3f) track=%s", client, x, y, sess.track_id)
                 elif kind == "reset":
@@ -333,18 +430,29 @@ async def sam2_ws(ws: WebSocket) -> None:
                 H, W = frame.shape[:2]
 
                 if sess.state == "PENDING_INIT" and sess.pending_point is not None:
+                    # Init uses only the point prompt — we have no previous
+                    # mask or bbox yet, and the tap is the strongest signal
+                    # about what the user wants.
                     px = sess.pending_point[0] * W
                     py = sess.pending_point[1] * H
                     try:
-                        mask, score, low_res = await _predict(frame, (px, py), None)
+                        mask, score, low_res = await _predict(
+                            frame,
+                            points_xy_px=[(px, py)],
+                            point_labels=[1],
+                            box_xyxy=None,
+                            prev_low_res=None,
+                        )
                     except Exception as e:
                         log.exception("[ws %s] predict init failed", client)
                         await _send_json(ws, {"type": "error", "message": f"predict: {e}"})
                         continue
 
-                    bbox = _bbox_from_mask(mask)
+                    bbox_cxcywh = _bbox_from_mask(mask)
+                    bbox_xyxy = _bbox_xyxy_from_mask(mask)
                     cen = _centroid_from_mask(mask)
-                    if bbox is None or score < SCORE_LOST_THRESHOLD:
+                    area = _mask_area_px(mask)
+                    if bbox_cxcywh is None or bbox_xyxy is None or score < SCORE_LOST_THRESHOLD:
                         sess.reset()
                         await _send_json(ws, {"type": "lost", "reason": "low_score_init"})
                         continue
@@ -352,46 +460,131 @@ async def sam2_ws(ws: WebSocket) -> None:
                     sess.state = "TRACKING"
                     sess.prev_low_res = low_res
                     sess.prev_centroid_px = cen
-                    sess.frames_since_ok = 0
+                    sess.prev_bbox_xyxy = bbox_xyxy
+                    sess.prev_area_px = area
+                    sess.bad_frame_streak = 0
                     await _send_json(ws, {
                         "type": "initialized",
                         "trackId": sess.track_id,
-                        "bbox": list(bbox),
+                        "bbox": list(bbox_cxcywh),
                         "score": round(score, 4),
                     })
                     continue
 
                 if sess.state == "TRACKING":
-                    # Re-prompt using previous mask centroid (in pixels, scaled
-                    # to this frame's dims since both resize to MAX_LONG_EDGE).
-                    if sess.prev_centroid_px is None:
+                    # Re-prompt using previous mask centroid + bbox + mask.
+                    # The triple prompt is what makes SAM2 "stick": the point
+                    # says *this pixel is foreground*, the box limits search
+                    # to a plausible region, and the mask_input gives a shape
+                    # prior. Missing any one and SAM2 tends to drift into
+                    # adjacent same-texture regions (shadows, cloth, skin).
+                    if sess.prev_centroid_px is None or sess.prev_bbox_xyxy is None:
                         sess.reset()
-                        await _send_json(ws, {"type": "lost", "reason": "no_centroid"})
+                        await _send_json(ws, {"type": "lost", "reason": "no_prev_state"})
                         continue
+
                     cx_px, cy_px = sess.prev_centroid_px
                     cx_px = min(max(cx_px, 0.0), W - 1.0)
                     cy_px = min(max(cy_px, 0.0), H - 1.0)
+
+                    # Pad the bbox so SAM2 can refine into areas the object
+                    # moved into between frames. Without padding, fast
+                    # translation makes the mask "chip off" its leading edge.
+                    box_prompt = _pad_box_xyxy(
+                        sess.prev_bbox_xyxy, W, H, BBOX_PAD_FRAC
+                    )
+
+                    # Build the point prompt set. Base case: just the
+                    # centroid. Recovery case (after a bad frame): ALSO
+                    # include the user's original tap, but ONLY if that
+                    # tap still lies inside the padded previous bbox —
+                    # otherwise the object has moved away from where it
+                    # was picked and the original tap now points at
+                    # background, which would actively mislead SAM2.
+                    #
+                    # This gives us a "re-lock" pass whenever tracking
+                    # wobbles: two positive points constrain the mask to
+                    # the intersection, snapping the segmentation back
+                    # to the intended object.
+                    pts: list[tuple[float, float]] = [(cx_px, cy_px)]
+                    labels: list[int] = [1]
+                    if (
+                        sess.bad_frame_streak > 0
+                        and sess.initial_tap_norm is not None
+                    ):
+                        tap_px_x = sess.initial_tap_norm[0] * W
+                        tap_px_y = sess.initial_tap_norm[1] * H
+                        bx1, by1, bx2, by2 = box_prompt
+                        if bx1 <= tap_px_x <= bx2 and by1 <= tap_px_y <= by2:
+                            pts.append((tap_px_x, tap_px_y))
+                            labels.append(1)
+
                     try:
                         mask, score, low_res = await _predict(
-                            frame, (cx_px, cy_px), sess.prev_low_res
+                            frame,
+                            points_xy_px=pts,
+                            point_labels=labels,
+                            box_xyxy=box_prompt,
+                            prev_low_res=sess.prev_low_res,
                         )
                     except Exception as e:
                         log.exception("[ws %s] predict track failed", client)
                         await _send_json(ws, {"type": "error", "message": f"predict: {e}"})
                         continue
 
-                    bbox = _bbox_from_mask(mask)
+                    bbox_cxcywh = _bbox_from_mask(mask)
+                    bbox_xyxy = _bbox_xyxy_from_mask(mask)
                     cen = _centroid_from_mask(mask)
-                    if bbox is None or score < SCORE_LOST_THRESHOLD:
-                        sess.frames_since_ok += 1
-                        # One bad frame isn't fatal — give the object two strikes
-                        # before declaring a lost track (matches YOLO's
-                        # LOST_AFTER_MISSES philosophy, just smaller because each
-                        # SAM2 frame is already doing temporal work).
-                        if sess.frames_since_ok >= 3:
+                    area = _mask_area_px(mask)
+
+                    # === Drift detection ================================
+                    # Compare against previous frame. Two failure modes:
+                    #  a) score dipped (SAM2 itself is uncertain)
+                    #  b) area exploded or collapsed (mask bled into the
+                    #     background or snapped onto a tiny neighbor)
+                    # Both count as "bad frames" — we don't advance state
+                    # on bad frames so the next frame re-prompts from the
+                    # last KNOWN-GOOD centroid/bbox/mask, not the drifted
+                    # one. This is what stops runaway bleed.
+                    low_score = score < SCORE_LOST_THRESHOLD
+                    area_ratio = (
+                        float(area) / max(1, sess.prev_area_px)
+                        if sess.prev_area_px > 0
+                        else 1.0
+                    )
+                    # Grace the first couple of frames: SAM2 with just the
+                    # init point tends to produce a tight mask, and the
+                    # triple-prompt on frame 2+ produces a fuller mask —
+                    # that legitimate ~2-3× growth would falsely trip drift.
+                    # After frames_tracked > 2 we expect the mask area to
+                    # be stable frame-to-frame, so drift rejection kicks in.
+                    grace_phase = sess.frames_tracked < 2
+                    drifted = (not grace_phase) and (
+                        area_ratio > DRIFT_AREA_RATIO
+                        or area_ratio < (1.0 / DRIFT_AREA_RATIO)
+                    )
+                    bad = (
+                        bbox_cxcywh is None
+                        or bbox_xyxy is None
+                        or low_score
+                        or drifted
+                    )
+
+                    if bad:
+                        sess.bad_frame_streak += 1
+                        if sess.bad_frame_streak >= LOST_AFTER_BAD_FRAMES:
+                            reason = (
+                                "drift" if drifted else "low_score"
+                                if low_score else "empty_mask"
+                            )
                             sess.reset()
-                            await _send_json(ws, {"type": "lost", "reason": "low_score"})
+                            await _send_json(ws, {"type": "lost", "reason": reason})
                         else:
+                            # Hold the face where it was — tell the client
+                            # this frame is stale so it fades slightly but
+                            # doesn't move. Importantly we DO NOT write to
+                            # prev_low_res / prev_bbox — the next frame
+                            # re-prompts from the last good state.
                             await _send_json(ws, {
                                 "type": "track",
                                 "bbox": None,
@@ -400,12 +593,16 @@ async def sam2_ws(ws: WebSocket) -> None:
                             })
                         continue
 
+                    # Good frame — commit to state.
                     sess.prev_low_res = low_res
                     sess.prev_centroid_px = cen
-                    sess.frames_since_ok = 0
+                    sess.prev_bbox_xyxy = bbox_xyxy
+                    sess.prev_area_px = area
+                    sess.bad_frame_streak = 0
+                    sess.frames_tracked += 1
                     await _send_json(ws, {
                         "type": "track",
-                        "bbox": list(bbox),
+                        "bbox": list(bbox_cxcywh),
                         "score": round(score, 4),
                     })
                     continue
