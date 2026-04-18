@@ -171,6 +171,14 @@ const VOICE_SIZE_REF_FRAC = 0.22;
 const VOICE_SIZE_EXP = 1.6;
 const VOICE_GAIN_MAX = 4.0;
 
+// Voice persistence when tracking drops out. Tracking briefly loses the
+// object all the time (half-second occlusions, a single missed frame) — if
+// the voice followed opacity directly it'd cut in and out. Hold full audio
+// for VOICE_PERSIST_MS after loss, then fade with VOICE_FADE_ALPHA. Face
+// still fades on its own schedule; only the audio lingers.
+const VOICE_PERSIST_MS = 2000;
+const VOICE_FADE_ALPHA = 0.04;
+
 // CSS blend mode applied to the face when it rides inside an object's
 // silhouette. `hard-light` adopts the object's color cast without crushing
 // the face detail the way `multiply` does. Easy to tune — set to `normal`
@@ -401,6 +409,11 @@ type TrackRefs = {
   smoothedBox: Box;
   missedFrames: number;
   opacity: number;
+  // Audio-only fade. Stays at 1 while present AND through a grace period
+  // (VOICE_PERSIST_MS) after loss, then lerps down. Decoupled from opacity
+  // so a half-second dropout doesn't punch a hole in the voice.
+  audioLevel: number;
+  lostSinceMs: number | null;
   lastTapAt: number;
   // Velocity for inter-inference glide (source pixels / ms), plus timestamp
   // of the last observation that moved the smoothed box. Extrapolation at
@@ -1565,12 +1578,24 @@ export function Tracker() {
       // back in cleanly at the new location instead of gliding through
       // wrong space.
       for (const t of tracksRef.current) {
-        const target = t.missedFrames >= LOST_AFTER_MISSES ? 0 : 1;
+        const lost = t.missedFrames >= LOST_AFTER_MISSES;
+        const target = lost ? 0 : 1;
         t.opacity = lerp(t.opacity, target, OPACITY_EMA_ALPHA);
-        // Voice rides with the face — disembodied audio when the face has
-        // faded out feels haunted. Layered on top: visible-area fraction
-        // (slides off frame → voice drops off), and super-linear size
-        // boost (fills the frame → ULTRA loud). Capped at VOICE_GAIN_MAX.
+        // Audio-only fade: hold full volume through brief dropouts so a
+        // half-second tracking blip doesn't pop the voice. Only after
+        // VOICE_PERSIST_MS of continuous loss does the voice start fading.
+        if (lost) {
+          if (t.lostSinceMs == null) t.lostSinceMs = now;
+          if (now - t.lostSinceMs >= VOICE_PERSIST_MS) {
+            t.audioLevel = lerp(t.audioLevel, 0, VOICE_FADE_ALPHA);
+          }
+        } else {
+          t.lostSinceMs = null;
+          t.audioLevel = 1;
+        }
+        // Gain = audio-level × visible-area fraction (slides off frame →
+        // quieter) × super-linear size boost (fills frame → ULTRA loud).
+        // Capped at VOICE_GAIN_MAX.
         if (t.gain) {
           const b = t.smoothedBox;
           const visW = Math.max(0, Math.min(b.x2, v.videoWidth) - Math.max(b.x1, 0));
@@ -1579,7 +1604,7 @@ export function Tracker() {
           const refPx = VOICE_SIZE_REF_FRAC * Math.min(v.videoWidth, v.videoHeight);
           const sizeFrac = refPx > 0 ? Math.min(b.w, b.h) / refPx : 1;
           const sizeBoost = Math.pow(Math.max(sizeFrac, 0.05), VOICE_SIZE_EXP);
-          const g = t.opacity * visibleFrac * sizeBoost;
+          const g = t.audioLevel * visibleFrac * sizeBoost;
           t.gain.gain.value = Math.max(0, Math.min(g, VOICE_GAIN_MAX));
         }
       }
@@ -2271,6 +2296,8 @@ export function Tracker() {
         smoothedBox: lockBox,
         missedFrames: 0,
         opacity: 0,
+        audioLevel: 1,
+        lostSinceMs: null,
         lastTapAt: nowTs,
         vx: 0,
         vy: 0,
@@ -3194,7 +3221,7 @@ export function Tracker() {
       {/* "You said …" transcript echo — instant signal that Whisper heard
           the voice message. Rendered just below the status pill so it
           overlaps the thinking + reply caption without fighting either. */}
-      {heardText && (
+      {heardText && isRecording && (
         <div
           className="pointer-events-none absolute inset-x-0 top-[132px] flex justify-center px-6"
           style={{ animation: "bubble-in 320ms cubic-bezier(0.16,1,0.3,1) both" }}
