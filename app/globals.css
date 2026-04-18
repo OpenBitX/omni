@@ -291,3 +291,300 @@ body::before {
   0% { transform: rotate(0deg); }
   100% { transform: rotate(360deg); }
 }
+
+/* ──────────────────────────────────────────────────────────────
+   Shared button surfaces.
+   Goal: ultra-clean, pastel-glossy, consistent hover/active motion.
+   Padding / font / size stay under Tailwind control — these classes
+   only own the surface (gradient, shadow, highlight, motion).
+   ────────────────────────────────────────────────────────────── */
+
+@keyframes btn-breath {
+  0%, 100% { filter: drop-shadow(0 14px 30px rgba(236, 72, 153, 0.38)); }
+  50%      { filter: drop-shadow(0 20px 44px rgba(236, 72, 153, 0.55)); }
+}
+
+/* Primary accent CTA — pink-to-magenta, glossy sheen, subtle breath.
+   Intended to sit on light backgrounds (landing, empty state). */
+.btn-primary {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 9999px;
+  color: #fff;
+  background:
+    radial-gradient(120% 100% at 50% -10%, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 55%),
+    linear-gradient(155deg, #ffa4cc 0%, #ec4899 55%, #c026d3 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.55),
+    inset 0 -6px 14px -6px rgba(190, 24, 93, 0.28);
+  animation: btn-breath 3.2s ease-in-out infinite;
+  transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  will-change: transform;
+}
+.btn-primary:hover { transform: translateY(-1px) scale(1.02); }
+.btn-primary:active { transform: translateY(0) scale(0.97); }
+@media (prefers-reduced-motion: reduce) {
+  .btn-primary { animation: none; }
+}
+
+/* Ghost — white-frosted pill for secondary CTAs on light backgrounds. */
+.btn-ghost {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 9999px;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow:
+    0 10px 26px -14px rgba(42, 21, 64, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.85);
+  transition:
+    transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1),
+    background 220ms ease,
+    box-shadow 220ms ease;
+}
+.btn-ghost:hover {
+  transform: translateY(-1px) scale(1.02);
+  background: rgba(255, 255, 255, 1);
+  box-shadow:
+    0 14px 32px -14px rgba(42, 21, 64, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 1),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.95);
+}
+.btn-ghost:active { transform: translateY(0) scale(0.97); }
+
+/* Frosted overlay pill — sits on camera feed / dark gallery bg.
+   Glossier than the old `bg-white/15 ring-white/25` combo. */
+.btn-frost {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border-radius: 9999px;
+  color: rgba(255, 255, 255, 0.95);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0.08) 100%);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow:
+    0 8px 24px -12px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+  transition:
+    transform 200ms cubic-bezier(0.2, 0.7, 0.2, 1),
+    background 200ms ease,
+    box-shadow 200ms ease;
+}
+.btn-frost:hover {
+  transform: translateY(-1px);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.34) 0%, rgba(255, 255, 255, 0.14) 100%);
+  box-shadow:
+    0 12px 28px -12px rgba(0, 0, 0, 0.6),
+    inset 0 1px 0 rgba(255, 255, 255, 0.42),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.3);
+}
+.btn-frost:active { transform: translateY(0) scale(0.97); }
+.btn-frost:disabled,
+.btn-frost[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Frost — accent on-state (group chat on, add-hint flashing, etc.). */
+.btn-frost-accent {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border-radius: 9999px;
+  color: #7a1a4a;
+  background:
+    radial-gradient(120% 100% at 50% -10%, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 55%),
+    linear-gradient(155deg, #ffd1e8 0%, #ffa4cc 55%, #ec4899 100%);
+  box-shadow:
+    0 10px 26px -12px rgba(236, 72, 153, 0.7),
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.6);
+  transition: transform 200ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.btn-frost-accent:hover { transform: translateY(-1px) scale(1.02); }
+.btn-frost-accent:active { transform: translateY(0) scale(0.97); }
+
+/* Danger hover — opt-in rose wash for destructive frost buttons (clear ×). */
+.btn-frost-danger:hover {
+  background: linear-gradient(180deg, rgba(244, 63, 94, 0.42) 0%, rgba(244, 63, 94, 0.18) 100%);
+  box-shadow:
+    0 12px 28px -12px rgba(244, 63, 94, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.38),
+    inset 0 0 0 1px rgba(254, 205, 211, 0.45);
+}
+
+/* ──────────────────────────────────────────────────────────────
+   Bookshelf gallery.
+   The wooden bookshelf image lives at public/bookshelf.png (aspect
+   ~3014×1722). Items are absolutely-positioned over four shelf
+   bands and three bays. Each generated PNG is die-cut on a pure
+   white background; mix-blend-mode: multiply drops the white into
+   the wood so the character reads like a sticker on the shelf,
+   while the filter layer paints a lift-shadow.
+   ────────────────────────────────────────────────────────────── */
+.shelf-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 3014 / 1722;
+  border-radius: 22px;
+  overflow: hidden;
+  isolation: isolate;
+  box-shadow:
+    0 42px 120px -36px rgba(0, 0, 0, 0.75),
+    0 0 0 1px rgba(255, 225, 180, 0.12),
+    inset 0 0 80px rgba(0, 0, 0, 0.35);
+}
+.shelf-frame::after {
+  /* Faint glow from top of each arch — subtle depth */
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(60% 28% at 18% 18%, rgba(255, 220, 170, 0.22), transparent 70%),
+    radial-gradient(60% 28% at 50% 18%, rgba(255, 220, 170, 0.18), transparent 70%),
+    radial-gradient(60% 28% at 82% 18%, rgba(255, 220, 170, 0.22), transparent 70%);
+  mix-blend-mode: screen;
+  opacity: 0.85;
+}
+.shelf-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+
+.shelf-slot {
+  position: absolute;
+  transform: translate(-50%, 0);
+  display: grid;
+  place-items: end center;
+  width: clamp(68px, 17%, 170px);
+  aspect-ratio: 1;
+  cursor: pointer;
+  transition: transform 320ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    filter 260ms ease;
+  will-change: transform, filter;
+}
+.shelf-slot:hover { transform: translate(-50%, -4px) scale(1.04); }
+.shelf-slot[data-selected="true"] { transform: translate(-50%, -8px) scale(1.08); }
+.shelf-slot[data-active="true"] { transform: translate(-50%, -10px) scale(1.1); }
+
+.shelf-cutout {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  mix-blend-mode: multiply;
+  filter: drop-shadow(0 6px 4px rgba(0, 0, 0, 0.55))
+    drop-shadow(0 14px 20px rgba(0, 0, 0, 0.45));
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+.shelf-cutout[data-loaded="false"] { opacity: 0; }
+.shelf-cutout {
+  opacity: 1;
+  transition: opacity 500ms ease-out;
+}
+
+/* Fallback when only the raw camera crop is available — keep it visible
+   (no multiply) and frame it as a small round portrait. */
+.shelf-fallback {
+  width: 82%;
+  height: 82%;
+  object-fit: cover;
+  border-radius: 18% / 22%;
+  box-shadow:
+    0 8px 16px rgba(0, 0, 0, 0.55),
+    0 0 0 2px rgba(255, 230, 200, 0.35);
+  user-select: none;
+  pointer-events: none;
+}
+
+/* Warm pulse under the currently-selected/speaking cutout. Lives beneath
+   the image so the item glows where it sits on the shelf. */
+@keyframes shelf-halo-pulse {
+  0%, 100% { opacity: 0.55; transform: translate(-50%, -8%) scale(0.95); }
+  50% { opacity: 0.9; transform: translate(-50%, -8%) scale(1.08); }
+}
+.shelf-halo {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: 120%;
+  height: 55%;
+  background: radial-gradient(ellipse at center,
+    rgba(255, 192, 220, 0.65) 0%,
+    rgba(255, 150, 200, 0.38) 35%,
+    rgba(255, 150, 200, 0) 70%);
+  filter: blur(8px);
+  pointer-events: none;
+  animation: shelf-halo-pulse 2.2s ease-in-out infinite;
+  z-index: -1;
+}
+
+/* Item pending paint — gentle shimmer inside the slot. */
+.shelf-painting {
+  width: 72%;
+  height: 72%;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #ffb8d6 0%, #ffd4e3 100%);
+  box-shadow: 0 10px 24px -10px rgba(255, 111, 174, 0.7);
+  display: grid;
+  place-items: center;
+  color: #3a0a29;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  animation: soft-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes shelf-enter {
+  0%   { opacity: 0; transform: translate(-50%, 24px) scale(0.7); }
+  70%  { opacity: 1; transform: translate(-50%, -4px) scale(1.05); }
+  100% { opacity: 1; transform: translate(-50%, 0) scale(1); }
+}
+.shelf-slot { animation: shelf-enter 580ms cubic-bezier(0.2, 0.9, 0.25, 1.05) both; }
+@media (prefers-reduced-motion: reduce) {
+  .shelf-slot { animation: none; }
+  .shelf-halo { animation: none; }
+}
+
+/* Conversation drawer — slides up when a shelf item is selected. */
+@keyframes drawer-in {
+  0% { opacity: 0; transform: translateY(24px) scale(0.98); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.drawer-in { animation: drawer-in 360ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+@media (prefers-reduced-motion: reduce) {
+  .drawer-in { animation: none; }
+}
+
+/* Hold-to-talk mic — big round primary action. Ring pulse when recording. */
+@keyframes mic-ring-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 120, 180, 0.55), 0 24px 52px -14px rgba(255, 80, 150, 0.7); }
+  50% { box-shadow: 0 0 0 18px rgba(255, 120, 180, 0), 0 28px 60px -12px rgba(255, 80, 150, 0.85); }
+}
+.mic-recording {
+  animation: mic-ring-pulse 1.2s ease-in-out infinite;
+}

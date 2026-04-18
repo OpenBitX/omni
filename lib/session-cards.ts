@@ -13,6 +13,11 @@ import { useEffect, useState } from "react";
 
 export type AppLang = "en" | "zh";
 
+// The lens active when this card was captured. Snapshotted at first-tap
+// so the gallery can filter/tint by lens even after the user switches
+// modes later in the session.
+export type CardMode = "play" | "language" | "history";
+
 export type ChatTurn = {
   role: "user" | "assistant";
   content: string;
@@ -54,6 +59,10 @@ export type SessionCard = {
   spokenLang?: AppLang;
   learnLang?: AppLang;
   teachMode?: boolean;
+
+  // Lens at capture time. Absent for cards from before the multi-lens
+  // release — treat those as "play" when filtering.
+  mode?: CardMode;
 };
 
 const STORAGE_KEY = "omni.sessionCards.v2";
