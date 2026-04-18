@@ -624,7 +624,7 @@ export async function generateLine(
       maxTokens: 80,
       temperature: 0.95,
     });
-    line = extractTextLine(raw);
+    line = extractTextLine(raw.content);
     if (!line) throw new Error("empty line from model");
     // eslint-disable-next-line no-console
     console.log(
