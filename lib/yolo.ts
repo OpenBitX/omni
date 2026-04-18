@@ -204,35 +204,82 @@ function defaultConfig(opts: YoloInitOptions): Config {
 // Fetch the ONNX model with progress reporting so the UI can show "32%
 // downloaded" instead of a mystery delay. Falls back to a single `fetch` +
 // `arrayBuffer()` if the browser can't stream (very old browsers).
+//
+// Mobile networks stall silently. The overall fetch is bounded by
+// MODEL_FETCH_TIMEOUT_MS; any stretch without a progress chunk longer than
+// MODEL_FETCH_STALL_MS also aborts, so a connection that opens and then goes
+// dead on 4G surfaces as a clean error the retry button can recover from.
+const MODEL_FETCH_TIMEOUT_MS = 30_000;
+const MODEL_FETCH_STALL_MS = 12_000;
+
 async function fetchModelWithProgress(url: string): Promise<ArrayBuffer> {
-  const resp = await fetch(url, { cache: "force-cache" });
+  const abort = new AbortController();
+  let lastProgressAt = performance.now();
+  const overallTimer = setTimeout(() => {
+    abort.abort(new Error(`model fetch exceeded ${MODEL_FETCH_TIMEOUT_MS}ms`));
+  }, MODEL_FETCH_TIMEOUT_MS);
+  const stallTimer = setInterval(() => {
+    if (performance.now() - lastProgressAt > MODEL_FETCH_STALL_MS) {
+      abort.abort(new Error(`model fetch stalled for ${MODEL_FETCH_STALL_MS}ms`));
+    }
+  }, 2_000);
+  const cleanup = () => {
+    clearTimeout(overallTimer);
+    clearInterval(stallTimer);
+  };
+
+  let resp: Response;
+  try {
+    resp = await fetch(url, { cache: "force-cache", signal: abort.signal });
+  } catch (err) {
+    cleanup();
+    const reason = abort.signal.aborted
+      ? (abort.signal.reason instanceof Error ? abort.signal.reason.message : "aborted")
+      : err instanceof Error ? err.message : String(err);
+    throw new Error(`model fetch failed: ${reason}`);
+  }
   if (!resp.ok) {
+    cleanup();
     throw new Error(`model fetch failed: ${resp.status} ${resp.statusText}`);
   }
   const total = Number(resp.headers.get("content-length") ?? 0);
   setStatus({ stage: "downloading", bytesLoaded: 0, bytesTotal: total, progress: total > 0 ? 0 : -1 });
 
   if (!resp.body || !("getReader" in resp.body)) {
-    const buf = await resp.arrayBuffer();
-    setStatus({ bytesLoaded: buf.byteLength, bytesTotal: buf.byteLength, progress: 1 });
-    return buf;
+    try {
+      const buf = await resp.arrayBuffer();
+      setStatus({ bytesLoaded: buf.byteLength, bytesTotal: buf.byteLength, progress: 1 });
+      return buf;
+    } finally {
+      cleanup();
+    }
   }
   const reader = resp.body.getReader();
   const chunks: Uint8Array[] = [];
   let loaded = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      chunks.push(value);
-      loaded += value.byteLength;
-      setStatus({
-        bytesLoaded: loaded,
-        bytesTotal: total,
-        progress: total > 0 ? loaded / total : -1,
-      });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        loaded += value.byteLength;
+        lastProgressAt = performance.now();
+        setStatus({
+          bytesLoaded: loaded,
+          bytesTotal: total,
+          progress: total > 0 ? loaded / total : -1,
+        });
+      }
     }
+  } catch (err) {
+    cleanup();
+    const reason = abort.signal.aborted
+      ? (abort.signal.reason instanceof Error ? abort.signal.reason.message : "aborted")
+      : err instanceof Error ? err.message : String(err);
+    throw new Error(`model fetch failed: ${reason}`);
   }
+  cleanup();
   const merged = new Uint8Array(loaded);
   let off = 0;
   for (const c of chunks) {

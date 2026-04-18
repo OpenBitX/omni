@@ -100,10 +100,22 @@ export function FaceVoice({ shape }: FaceVoiceProps) {
         ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
         const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const d = img.data;
+        // Brightness gain before luma-keying. The key sets alpha =
+        // max(r,g,b), so mid-grey pixels (lids, iris shadow) end up half
+        // transparent and visually vanish against anything non-white.
+        // Boosting RGB lifts both the whites AND the resulting alpha in
+        // one pass — eyes look brighter and more opaque simultaneously.
+        const GAIN = 1.45;
         for (let i = 0; i < d.length; i += 4) {
-          const r = d[i];
-          const g = d[i + 1];
-          const b = d[i + 2];
+          let r = d[i] * GAIN;
+          let g = d[i + 1] * GAIN;
+          let b = d[i + 2] * GAIN;
+          if (r > 255) r = 255;
+          if (g > 255) g = 255;
+          if (b > 255) b = 255;
+          d[i] = r;
+          d[i + 1] = g;
+          d[i + 2] = b;
           const m = r > g ? r : g;
           d[i + 3] = m > b ? m : b;
         }

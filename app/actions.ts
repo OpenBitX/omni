@@ -183,7 +183,11 @@ function getOpenAIClient(): OpenAI | null {
 function getGeminiClient(): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) return null;
-  return new GoogleGenAI({ apiKey: key });
+  // Default to v1 so Gemini 3.x models resolve — the SDK's built-in
+  // default is still `v1beta`, which 404s on `gemini-3.1-flash` etc.
+  // Override with GEMINI_API_VERSION=v1beta to pin an older tier.
+  const apiVersion = process.env.GEMINI_API_VERSION?.trim() || "v1";
+  return new GoogleGenAI({ apiKey: key, apiVersion });
 }
 
 // True for transient network errors worth retrying once (cold TLS, DNS,
@@ -648,12 +652,13 @@ const GENERATE_BUNDLED_MODEL_GLM =
   process.env.GLM_BUNDLED_MODEL?.trim() || "glm-4.5v";
 const GENERATE_BUNDLED_MODEL_OPENAI =
   process.env.OPENAI_BUNDLED_MODEL?.trim() || "gpt-4o-mini";
-// `gemini-2.5-flash-lite` runs ~0.5–1s faster than `gemini-2.5-flash` on
-// this payload (same family, smaller model). Persona-card quality is
-// slightly weaker but fine for the 35-word description we actually use.
-// Flip back to `gemini-2.5-flash` via env if quality regresses.
+// `gemini-3.1-flash` — fastest flash tier in the 3.x family. Not served
+// on `v1beta` (404s there), so the client is pinned to `v1` in
+// `getGeminiClient()`. If this name ever drifts, override via
+// `GEMINI_BUNDLED_MODEL=<name>` and/or `GEMINI_API_VERSION=<version>`
+// without touching code.
 const GENERATE_BUNDLED_MODEL_GEMINI =
-  process.env.GEMINI_BUNDLED_MODEL?.trim() || "gemini-2.5-flash-lite";
+  process.env.GEMINI_BUNDLED_MODEL?.trim() || "gemini-3.1-flash";
 
 function parseBundledJson(
   raw: string
@@ -1379,7 +1384,7 @@ async function cartesiaTTS(
     console.log("[tts cartesia] — skipping: no CARTESIA_API_KEY");
     return null;
   }
-  const modelId = process.env.CARTESIA_MODEL_ID?.trim() || "sonic-2";
+  const modelId = process.env.CARTESIA_MODEL_ID?.trim() || "sonic-3";
   const defaultVoice =
     lang === "zh"
       ? process.env.CARTESIA_VOICE_ID_ZH?.trim() ||

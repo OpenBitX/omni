@@ -19,6 +19,12 @@ public/ort/
 server/Screenshot_*.png
 server/*.coords.json
 
+# server-v2 (SAM2 backend) — venv + ~150 MB checkpoint, not suitable for git
+server-v2/.venv/
+server-v2/__pycache__/
+server-v2/*.pyc
+server-v2/checkpoints/
+
 # Large / unused ONNX models — yolo26n.onnx + yolo26n-seg.onnx are tracked
 public/models/rf-detr-nano.onnx
 public/models/yolov8n.onnx

@@ -1,0 +1,20 @@
+# Server V2 — SAM2-tiny streaming segmentation backend.
+# Lives in its own venv (server-v2/.venv) to stay isolated from server/.
+# Install via scripts/setup-sam2.sh.
+
+# Web
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.17
+python-dotenv>=1.0
+websockets>=13.0
+
+# Image IO
+numpy>=1.26
+opencv-python>=4.10
+pillow>=10.0
+
+# SAM2 — installed separately from git in setup-sam2.sh because the PyPI
+# mirror lags the upstream repo. Pinning is handled there.
+# torch is also installed via setup-sam2.sh so the right wheel is picked
+# for the platform (MPS on macOS, CUDA on Linux, CPU fallback).
