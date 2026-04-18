@@ -30,58 +30,100 @@ const VOICE_CATALOG: VoiceCatalogEntry[] = [
     id: "98655a12fa944e26b274c535e5e03842",
     name: "EGirl",
     vibe: "breathy, coy, chronically-online uptalk — suits phones, mirrors, ring lights, laptops, makeup, vanity items, anything a streamer would film",
+    lang: "en",
   },
   {
     id: "03397b4c4be74759b72533b663fbd001",
     name: "Elon",
     vibe: "halting, smug tech-bro cadence with long awkward pauses — suits computers, cars, rockets, expensive gadgets, anything 'disruptive' or overengineered",
+    lang: "en",
   },
   {
     id: "b70e5f4d550647eb9927359d133c8e3a",
     name: "Anime Girl",
     vibe: "high-pitched, hyper-kawaii, rapid squeals — suits plushies, stuffed toys, cute mugs, candy, snacks, anything bright and small",
+    lang: "en",
   },
   {
     id: "59e9dc1cb20c452584788a2690c80970",
     name: "Talking girl",
     vibe: "natural conversational young woman — suits friendly everyday objects without strong personality: books, notebooks, bags, chairs, lamps",
+    lang: "en",
   },
   {
     id: "fb43143e46f44cc6ad7d06230215bab6",
     name: "Girl conversation vibe",
     vibe: "gossipy, laid-back, best-friend-texting energy — suits couches, beds, pillows, coffee cups, comfort snacks, anything cozy",
+    lang: "en",
   },
   {
     id: "0cd6cf9684dd4cc9882fbc98957c9b1d",
     name: "Elephant",
     vibe: "rumbling, low, heavy, deliberate — suits big heavy things: fridges, trash cans, dressers, couches, vending machines, anything massive",
+    lang: "en",
   },
   {
     id: "48484faae07e4cfdb8064da770ee461e",
     name: "Sonic",
     vibe: "fast, cocky, blue-hedgehog swagger — suits shoes, sneakers, skateboards, bikes, running gear, anything about speed or movement",
+    lang: "en",
   },
   {
     id: "d13f84b987ad4f22b56d2b47f4eb838e",
     name: "Mortal Kombat",
     vibe: "gravelly, ominous, arena-announcer drama — suits knives, scissors, staplers, weapons, sharp tools, anything that could hurt you",
+    lang: "en",
   },
   {
     id: "d75c270eaee14c8aa1e9e980cc37cf1b",
     name: "Peter Griffin",
     vibe: "goofy Rhode-Island drawl laughing at himself — default go-to for anything ordinary: food, drinks, random household clutter, everyman objects",
+    lang: "en",
+  },
+  // --- Chinese (Mandarin) voices ----------------------------------------
+  // Fish.audio reference_ids provided by the user. Selection is RANDOM for
+  // zh mode — the model does not pick. Vibes below are cosmetic labels
+  // only; nothing reads them.
+  {
+    id: "6ce7ea8ada884bf3889fa7c7fb206691",
+    name: "中文 A",
+    vibe: "mandarin voice",
+    lang: "zh",
+  },
+  {
+    id: "b4f70fdef5f943c2bf43db00e80ad680",
+    name: "中文 B",
+    vibe: "mandarin voice",
+    lang: "zh",
+  },
+  {
+    id: "e855dc04a51f48549b484e41c4d4d4cc",
+    name: "中文 C",
+    vibe: "mandarin voice",
+    lang: "zh",
   },
 ];
 
-// Fallback voice when no per-track pick is available — Peter Griffin.
-const DEFAULT_VOICE_ID = "d75c270eaee14c8aa1e9e980cc37cf1b";
+// Fallback voice when no per-track pick is available.
+const DEFAULT_VOICE_ID_EN = "d75c270eaee14c8aa1e9e980cc37cf1b"; // Peter Griffin
+const DEFAULT_VOICE_ID_ZH = "6ce7ea8ada884bf3889fa7c7fb206691"; // 中文 A
 
-function getVoiceCatalog(): VoiceCatalogEntry[] {
-  return VOICE_CATALOG;
+function normalizeLang(input: unknown): Lang {
+  return input === "zh" ? "zh" : "en";
 }
 
-function getDefaultVoiceId(): string {
-  return DEFAULT_VOICE_ID;
+function getVoiceCatalog(lang: Lang = "en"): VoiceCatalogEntry[] {
+  return VOICE_CATALOG.filter((v) => v.lang === lang);
+}
+
+function getDefaultVoiceId(lang: Lang = "en"): string {
+  return lang === "zh" ? DEFAULT_VOICE_ID_ZH : DEFAULT_VOICE_ID_EN;
+}
+
+function pickRandomVoiceId(lang: Lang): string {
+  const catalog = getVoiceCatalog(lang);
+  if (catalog.length === 0) return getDefaultVoiceId(lang);
+  return catalog[Math.floor(Math.random() * catalog.length)].id;
 }
 
 function voiceById(id: string | undefined | null): VoiceCatalogEntry | null {
@@ -146,9 +188,11 @@ function getCerebrasClient(): OpenAI | null {
 }
 
 // Compact catalog description used inline in prompts when we want GLM to
-// pick a voice. Empty string when the catalog is empty.
-function voiceCatalogPromptBlock(): string {
-  const catalog = getVoiceCatalog();
+// pick a voice. Empty string when the catalog is empty. Filtered by the
+// session language so the model can't pick an English voice while we're in
+// Chinese mode (and vice versa).
+function voiceCatalogPromptBlock(lang: Lang = "en"): string {
+  const catalog = getVoiceCatalog(lang);
   if (catalog.length === 0) return "";
   const lines = catalog
     .map((v, i) => `  ${i + 1}. id="${v.id}" — ${v.vibe}`)
@@ -336,7 +380,8 @@ async function glmVisionCall(args: {
 export async function assessObject(
   imageDataUrl: string,
   tapX: number,
-  tapY: number
+  tapY: number,
+  tag?: string | null
 ): Promise<Assessment> {
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
@@ -344,8 +389,9 @@ export async function assessObject(
   const tx = clamp01(tapX);
   const ty = clamp01(tapY);
   const t0 = Date.now();
+  const tagStr = tag ? ` ${tag}` : "";
   // eslint-disable-next-line no-console
-  console.log(`[assess] ▶ start  tap=(${tx.toFixed(2)},${ty.toFixed(2)})  crop=${Math.round(imageDataUrl.length / 1024)}KB`);
+  console.log(`[assess${tagStr}] ▶ start  tap=(${tx.toFixed(2)},${ty.toFixed(2)})  crop=${Math.round(imageDataUrl.length / 1024)}KB`);
 
   const raw = await glmVisionCall({
     system: ASSESS_SYSTEM,
@@ -394,7 +440,7 @@ export async function assessObject(
       : "";
   // eslint-disable-next-line no-console
   console.log(
-    `[assess] ◀ done   suitable=${suitable}  face=(${cx.toFixed(2)},${cy.toFixed(2)})  reason="${reason}"  total=${Date.now() - t0}ms`
+    `[assess${tagStr}] ◀ done   suitable=${suitable}  face=(${cx.toFixed(2)},${cy.toFixed(2)})  reason="${reason}"  total=${Date.now() - t0}ms`
   );
   return { suitable, cx, cy, bbox, reason };
 }
@@ -407,7 +453,12 @@ export async function assessObject(
 // after every conversation turn so the next reply has fresh juicy context
 // without paying vision latency on the hot path. Fast model, no reasoning.
 
-const DESCRIBE_SYSTEM = `You are a sharp-eyed, slightly mean observer. You'll be shown a crop of an everyday object the user just pointed at, plus the rough class name from a detector. Write 1–2 short sentences (max 35 words total) capturing the SPECIFIC vibe of this exact object right now — material, condition, state, telling details, surroundings.
+const DESCRIBE_SYSTEM = (lang: Lang) => {
+  const langRule =
+    lang === "zh"
+      ? `\n- Write the description in SIMPLIFIED CHINESE (简体中文). Natural, colloquial Mandarin. Keep the 35-word cap roughly equivalent — ~50 汉字 max.`
+      : "";
+  return `You are a sharp-eyed, slightly mean observer. You'll be shown a crop of an everyday object the user just pointed at, plus the rough class name from a detector. Write 1–2 short sentences (max 35 words total) capturing the SPECIFIC vibe of this exact object right now — material, condition, state, telling details, surroundings.
 
 Aim for the kind of details a comedian would notice: chewed straw, dust film, dent, sticker peeling, three hoodies piled on it, half-empty, suspiciously clean, etc. NOT a generic textbook description.
 
@@ -415,9 +466,10 @@ Rules:
 - Concrete and visual. No metaphors, no opinions, no jokes — those come later.
 - Don't restate the class name as a label. Just describe it.
 - No prose, no preamble, no "this is a…", no quotes, no markdown. Just the description.
-- If you genuinely can't see anything specific, return one short sentence describing what you do see.
+- If you genuinely can't see anything specific, return one short sentence describing what you do see.${langRule}
 
 Return only the description.`;
+};
 
 // OpenAI describe model — gpt-4o-mini sees images, doesn't reason, and
 // reliably returns clean short output in ~1–2s. GLM-5V-Turbo burns all
@@ -428,26 +480,30 @@ const DESCRIBE_MODEL =
 
 export async function describeObject(
   imageDataUrl: string,
-  className: string
+  className: string,
+  langInput?: Lang,
+  tag?: string | null
 ): Promise<{ description: string }> {
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
   }
   const openai = getOpenAIClient();
   if (!openai) throw new Error("describeObject needs OPENAI_API_KEY");
+  const lang = normalizeLang(langInput);
   const t0 = Date.now();
   const cls = (className || "thing").slice(0, 60);
+  const tagStr = tag ? ` ${tag}` : "";
   // eslint-disable-next-line no-console
   console.log(
-    `[describe ${DESCRIBE_MODEL}] ▶ start  class="${cls}"  crop=${Math.round(imageDataUrl.length / 1024)}KB`
+    `[describe ${DESCRIBE_MODEL}${tagStr}] ▶ start  class="${cls}"  lang=${lang}  crop=${Math.round(imageDataUrl.length / 1024)}KB`
   );
 
   const resp = await openai.chat.completions.create({
     model: DESCRIBE_MODEL,
-    max_tokens: 120,
+    max_tokens: 180,
     temperature: 0.6,
     messages: [
-      { role: "system", content: DESCRIBE_SYSTEM },
+      { role: "system", content: DESCRIBE_SYSTEM(lang) },
       {
         role: "user",
         content: [
@@ -467,7 +523,7 @@ export async function describeObject(
   const usage = resp.usage;
   // eslint-disable-next-line no-console
   console.log(
-    `[describe ${DESCRIBE_MODEL}] ◀ ${Date.now() - t0}ms tokens=${usage?.prompt_tokens ?? "?"}+${usage?.completion_tokens ?? "?"} "${description.slice(0, 120)}${description.length > 120 ? "…" : ""}"`
+    `[describe ${DESCRIBE_MODEL}${tagStr}] ◀ ${Date.now() - t0}ms tokens=${usage?.prompt_tokens ?? "?"}+${usage?.completion_tokens ?? "?"} "${description.slice(0, 120)}${description.length > 120 ? "…" : ""}"`
   );
   return { description };
 }
@@ -480,14 +536,19 @@ export async function describeObject(
 // ("that chewed straw", "the three hoodies piled on you") instead of
 // re-discovering the object cold each turn. Biggest personality unlock
 // for zero extra latency.
-const FACE_BUNDLED_SYSTEM = (catalog: string) => `You are the secret inner voice of an everyday object or scene the user has pointed at. You will be shown a small crop of a photo — whatever they tapped.
+const FACE_BUNDLED_SYSTEM = (catalog: string, lang: Lang) => {
+  const langBlock =
+    lang === "zh"
+      ? `\n\nLANGUAGE: Write BOTH the description and the line in SIMPLIFIED CHINESE (简体中文). Natural colloquial Mandarin the object would actually say. The line cap is roughly 14 汉字 — keep it short and punchy. Internal reasoning in English is fine; output fields must be Chinese.`
+      : "";
+  return `You are the secret inner voice of an everyday object or scene the user has pointed at. You will be shown a small crop of a photo — whatever they tapped.
 
 Three tasks, in order:
 1. DESCRIBE this specific object right now — the concrete details a sharp-eyed comedian would clock. Material, condition, telling details, state, surroundings. 1–2 short sentences (max 35 words). Concrete and visual, no jokes, no metaphors. NOT a textbook description — the SPECIFIC vibe of THIS one.
 2. PICK the best-matching voice from the catalog below.
 3. SAY one short opening line (max 14 words) this thing would actually say out loud, first person, in character — and make it reference SOMETHING you noticed in the description.
 
-${catalog}
+${catalog}${langBlock}
 
 Return STRICT JSON only:
 {"description": "<1-2 sentence concrete description>", "voiceId": "<id from catalog>", "line": "<the opening line>"}
@@ -499,6 +560,7 @@ Line rules:
 - Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation.
 
 Return only the JSON object. No prose, no code fences, no <think> reasoning.`;
+};
 
 // When we already have voice + description pinned from the first tap, the
 // text-line prompt takes them as context. The description is the
@@ -511,8 +573,14 @@ Return only the JSON object. No prose, no code fences, no <think> reasoning.`;
 // it the way it expects — as conversation turns.
 const FACE_WITH_PERSONA_SYSTEM = (
   description: string,
-  hasHistory: boolean
-) => `You are the secret inner voice of this specific object. A previous pass already clocked what it looks like right now — this is your persona card, stay grounded in it:
+  hasHistory: boolean,
+  lang: Lang
+) => {
+  const langRule =
+    lang === "zh"
+      ? `\n- Write the reply in SIMPLIFIED CHINESE (简体中文). Natural colloquial Mandarin. Cap is roughly 14 汉字 — short and punchy.`
+      : "";
+  return `You are the secret inner voice of this specific object. A previous pass already clocked what it looks like right now — this is your persona card, stay grounded in it:
 
 "${description}"
 ${
@@ -528,32 +596,90 @@ Rules:
 - Funny, warm, slightly unhinged. Aim for a smile, not a laugh track.
 - No meta-commentary, no "as a [thing]", no "I am a [thing]". Just the line.
 - No quotes, no emojis, no stage directions, no ellipses at the end.
-- Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation. Don't restate a prior line.
+- Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation. Don't restate a prior line.${langRule}
 
 Return only the line. No prose, no <think> reasoning, no extra text.`;
+};
 
-// Bundled first-tap call. gpt-4o-mini sees the crop, picks a voice, writes
-// the persona description AND the opening line in a single ~2–3s call.
-// (GLM-5V-Turbo took 30+s here because it's a reasoning model — burned all
-// its tokens on `<think>` before emitting JSON.)
-const GENERATE_BUNDLED_MODEL =
+// Bundled first-tap call. Runs the vision pass that picks a voice, writes
+// the persona description AND the opening line in one shot.
+//
+// GLM `glm-4.5v` is the default — it's Zhipu's non-reasoning VLM, so it
+// doesn't waste completion tokens on `<think>` traces and returns in a
+// tight, predictable window (~1.5–3s). `glm-5v-turbo` is a reasoning model
+// and took 30+s here because it burned all its tokens thinking before
+// emitting JSON — do NOT swap in without timing tests.
+//
+// OpenAI `gpt-4o-mini` is the fallback when GLM isn't configured or the
+// call fails/returns unparseable output.
+const GENERATE_BUNDLED_MODEL_GLM =
+  process.env.GLM_BUNDLED_MODEL?.trim() || "glm-4.5v";
+const GENERATE_BUNDLED_MODEL_OPENAI =
   process.env.OPENAI_BUNDLED_MODEL?.trim() || "gpt-4o-mini";
 
-async function generateBundledFirstTap(
-  imageDataUrl: string
+function parseBundledJson(
+  raw: string
+): { line: string; voiceId: string | null; description: string | null } {
+  const parsed = extractJsonObject(raw);
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("line+voice+persona JSON parse failed");
+  }
+  const p = parsed as Partial<Record<string, unknown>>;
+  const rawLine = typeof p.line === "string" ? p.line : "";
+  const rawVoice = typeof p.voiceId === "string" ? p.voiceId.trim() : "";
+  const rawDesc = typeof p.description === "string" ? p.description : "";
+  const line = extractTextLine(rawLine);
+  const voice = voiceById(rawVoice)?.id ?? null;
+  const description =
+    rawDesc.replace(/\s+/g, " ").trim().slice(0, 400) || null;
+  if (!line) throw new Error("empty line from bundled model");
+  return { line, voiceId: voice, description };
+}
+
+async function generateBundledFirstTapGlm(
+  imageDataUrl: string,
+  lang: Lang,
+  tag?: string | null
+): Promise<{ line: string; voiceId: string | null; description: string | null }> {
+  const t0 = Date.now();
+  const tagStr = tag ? ` ${tag}` : "";
+  const raw = await glmVisionCall({
+    system: FACE_BUNDLED_SYSTEM(voiceCatalogPromptBlock(lang), lang),
+    userText:
+      "Describe the exact object, pick a voice, and say one opening line that riffs on the description. JSON only.",
+    imageDataUrl,
+    // Enough headroom for description + voiceId + line in JSON. glm-4.5v
+    // doesn't emit <think> so 800 is plenty; bumping higher would only
+    // invite the model to ramble.
+    maxTokens: 800,
+    temperature: 0.9,
+    model: GENERATE_BUNDLED_MODEL_GLM,
+  });
+  // eslint-disable-next-line no-console
+  console.log(
+    `[bundled ${GENERATE_BUNDLED_MODEL_GLM}${tagStr}] ← ${Date.now() - t0}ms`
+  );
+  return parseBundledJson(raw);
+}
+
+async function generateBundledFirstTapOpenAI(
+  imageDataUrl: string,
+  lang: Lang,
+  tag?: string | null
 ): Promise<{ line: string; voiceId: string | null; description: string | null }> {
   const openai = getOpenAIClient();
   if (!openai) throw new Error("generateLine bundled needs OPENAI_API_KEY");
   const t0 = Date.now();
+  const tagStr = tag ? ` ${tag}` : "";
   const resp = await openai.chat.completions.create({
-    model: GENERATE_BUNDLED_MODEL,
-    max_tokens: 400,
+    model: GENERATE_BUNDLED_MODEL_OPENAI,
+    max_tokens: 500,
     temperature: 0.9,
     response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
-        content: FACE_BUNDLED_SYSTEM(voiceCatalogPromptBlock()),
+        content: FACE_BUNDLED_SYSTEM(voiceCatalogPromptBlock(lang), lang),
       },
       {
         role: "user",
@@ -571,29 +697,50 @@ async function generateBundledFirstTap(
   const usage = resp.usage;
   // eslint-disable-next-line no-console
   console.log(
-    `[bundled ${GENERATE_BUNDLED_MODEL}] ← ${Date.now() - t0}ms tokens=${usage?.prompt_tokens ?? "?"}+${usage?.completion_tokens ?? "?"}`
+    `[bundled ${GENERATE_BUNDLED_MODEL_OPENAI}${tagStr}] ← ${Date.now() - t0}ms tokens=${usage?.prompt_tokens ?? "?"}+${usage?.completion_tokens ?? "?"}`
   );
-  const parsed = extractJsonObject(typeof raw === "string" ? raw : "");
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error("line+voice+persona JSON parse failed");
+  return parseBundledJson(typeof raw === "string" ? raw : "");
+}
+
+async function generateBundledFirstTap(
+  imageDataUrl: string,
+  lang: Lang,
+  tag?: string | null
+): Promise<{ line: string; voiceId: string | null; description: string | null }> {
+  // Prefer OpenAI for the bundled first-tap. gpt-4o-mini is the documented
+  // default in CLAUDE.md specifically because its latency is predictable
+  // (~2–4s); glm-4.5v occasionally rambles to 15–20s of completion tokens,
+  // which races the tracker-side 20s speak timeout and surfaces as the
+  // "voice model took too long" toast. GLM stays as the fallback so we
+  // degrade gracefully if OpenAI isn't configured or errors out.
+  const hasOpenAI = !!process.env.OPENAI_API_KEY;
+  const hasGlm = !!(
+    process.env.ZHIPU_API_KEY ??
+    process.env.GLM_API_KEY ??
+    process.env.BIGMODEL_API_KEY
+  );
+  const tagStr = tag ? ` ${tag}` : "";
+  if (hasOpenAI) {
+    try {
+      return await generateBundledFirstTapOpenAI(imageDataUrl, lang, tag);
+    } catch (err) {
+      if (!hasGlm) throw err;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[bundled openai${tagStr}] ✖ ${err instanceof Error ? err.message : String(err)} — falling back to GLM`
+      );
+    }
   }
-  const p = parsed as Partial<Record<string, unknown>>;
-  const rawLine = typeof p.line === "string" ? p.line : "";
-  const rawVoice = typeof p.voiceId === "string" ? p.voiceId.trim() : "";
-  const rawDesc = typeof p.description === "string" ? p.description : "";
-  const line = extractTextLine(rawLine);
-  const voice = voiceById(rawVoice)?.id ?? null;
-  const description =
-    rawDesc.replace(/\s+/g, " ").trim().slice(0, 400) || null;
-  if (!line) throw new Error("empty line from bundled model");
-  return { line, voiceId: voice, description };
+  return generateBundledFirstTapGlm(imageDataUrl, lang, tag);
 }
 
 export async function generateLine(
   imageDataUrl: string,
   voiceId?: string | null,
   description?: string | null,
-  history?: ChatTurn[]
+  history?: ChatTurn[],
+  langInput?: Lang,
+  tag?: string | null
 ): Promise<{
   line: string;
   voiceId: string | null;
@@ -604,7 +751,9 @@ export async function generateLine(
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
   }
+  const lang = normalizeLang(langInput);
   const t0 = Date.now();
+  const tagStr = tag ? ` ${tag}` : "";
   // Bundled path runs on the FIRST tap per track — no voiceId and no
   // description yet. Single gpt-4o-mini vision call returns all three in
   // one shot. Subsequent taps already have voice + description pinned, so
@@ -616,21 +765,33 @@ export async function generateLine(
   const hasHistory = priorTurns.length > 0;
   // eslint-disable-next-line no-console
   console.log(
-    `[generateLine] ▶ start  crop=${Math.round(imageDataUrl.length / 1024)}KB  voice=${voiceId ?? (needsBundle ? "(picking)" : "default")}  persona=${description ? "cached" : needsBundle ? "(describing)" : "none"}  history=${priorTurns.length}`
+    `[generateLine${tagStr}] ▶ start  lang=${lang}  crop=${Math.round(imageDataUrl.length / 1024)}KB  voice=${voiceId ?? (needsBundle ? "(picking)" : "default")}  persona=${description ? "cached" : needsBundle ? "(describing)" : "none"}  history=${priorTurns.length}`
   );
 
   let line: string;
   let chosenVoiceId: string | null = voiceId ?? null;
   let chosenDescription: string | null = description ?? null;
+  // Per-phase timings so the final summary line can break down where
+  // the wall clock actually went (VLM vs text-only LLM vs TTS).
+  let vlmMs = 0;
+  let llmMs = 0;
+  let path: "bundled-vlm" | "retap-llm" | "recovery-vlm" = "retap-llm";
 
   if (needsBundle) {
-    const bundled = await generateBundledFirstTap(imageDataUrl);
+    path = "bundled-vlm";
+    const vlmT0 = Date.now();
+    const bundled = await generateBundledFirstTap(imageDataUrl, lang, tag);
+    vlmMs = Date.now() - vlmT0;
     line = bundled.line;
-    chosenVoiceId = bundled.voiceId;
+    // English always uses Peter Griffin — the model's catalog pick was
+    // drifting female on ordinary objects. Chinese picks randomly from the
+    // 3-voice zh pool (the model's pick is ignored).
+    chosenVoiceId =
+      lang === "en" ? DEFAULT_VOICE_ID_EN : pickRandomVoiceId("zh");
     chosenDescription = bundled.description;
     // eslint-disable-next-line no-console
     console.log(
-      `[generateLine]   voice=${chosenVoiceId ? `${voiceById(chosenVoiceId)!.name} (${chosenVoiceId})` : "default"}  persona="${chosenDescription?.slice(0, 100) ?? ""}${chosenDescription && chosenDescription.length > 100 ? "…" : ""}"  line="${line}"`
+      `[generateLine${tagStr}]   vlm=${vlmMs}ms  voice=${chosenVoiceId ? `${voiceById(chosenVoiceId)!.name} (${chosenVoiceId})` : "default"}  persona="${chosenDescription?.slice(0, 100) ?? ""}${chosenDescription && chosenDescription.length > 100 ? "…" : ""}"  line="${line}"`
     );
   } else if (chosenDescription) {
     // Known track, object speaking again. We have the persona card — go
@@ -645,35 +806,47 @@ export async function generateLine(
       ? "Say your next short line — the next beat in this conversation. Don't repeat yourself; build on the thread or open a new angle grounded in the persona card."
       : "Say the next short line, grounded in the persona card. Reference something specific.";
     const raw = await openaiTextReply({
-      system: FACE_WITH_PERSONA_SYSTEM(chosenDescription, hasHistory),
+      system: FACE_WITH_PERSONA_SYSTEM(chosenDescription, hasHistory, lang),
       userText,
       priorMessages: priorTurns,
-      maxTokens: 80,
+      maxTokens: 120,
       temperature: hasHistory ? 0.85 : 0.95,
     });
+    llmMs = raw.ms;
     line = extractTextLine(raw.content);
     if (!line) throw new Error("empty line from model");
     // eslint-disable-next-line no-console
     console.log(
-      `[generateLine]   line="${line}" persona=used history=${priorTurns.length} (text-only)`
+      `[generateLine${tagStr}]   llm=${llmMs}ms (${raw.backend}, text-only)  history=${priorTurns.length}  line="${line}"`
     );
   } else {
     // Fallback: voice already pinned but description was lost (shouldn't
     // happen in practice). Re-bundle so the persona gets re-captured.
-    const bundled = await generateBundledFirstTap(imageDataUrl);
+    path = "recovery-vlm";
+    const vlmT0 = Date.now();
+    const bundled = await generateBundledFirstTap(imageDataUrl, lang, tag);
+    vlmMs = Date.now() - vlmT0;
     line = bundled.line;
     chosenDescription = bundled.description;
-    if (!chosenVoiceId) chosenVoiceId = bundled.voiceId;
+    if (!chosenVoiceId) {
+      chosenVoiceId =
+        lang === "en" ? DEFAULT_VOICE_ID_EN : pickRandomVoiceId("zh");
+    }
     // eslint-disable-next-line no-console
     console.log(
-      `[generateLine]   re-bundled  line="${line}"  persona-recaptured`
+      `[generateLine${tagStr}]   vlm=${vlmMs}ms  re-bundled  line="${line}"  persona-recaptured`
     );
   }
 
-  const tts = await synthesizeSpeech(line, chosenVoiceId);
+  const ttsT0 = Date.now();
+  const tts = await synthesizeSpeech(line, chosenVoiceId, lang);
+  const ttsMs = Date.now() - ttsT0;
+  const total = Date.now() - t0;
+  // Single summary line — path ▸ vlm ▸ llm ▸ tts ▸ total so you can see
+  // at a glance where the wall clock went on any given tap.
   // eslint-disable-next-line no-console
   console.log(
-    `[generateLine] ◀ done  backend=${tts.backend}  total=${Date.now() - t0}ms`
+    `[generateLine${tagStr}] ◀ done  path=${path} ▸ vlm=${vlmMs}ms ▸ llm=${llmMs}ms ▸ tts=${ttsMs}ms (${tts.backend})  total=${total}ms`
   );
   return {
     line,
@@ -682,6 +855,134 @@ export async function generateLine(
     audioDataUrl: tts.audioDataUrl,
     backend: tts.backend,
   };
+}
+
+// === Group chat ========================================================
+//
+// When two or more objects are locked, the client schedules turns between
+// them. Each turn calls `groupLine` text-only via Cerebras llama3.1-8b
+// (no vision — persona cards are the visual context). Recent shared turns
+// + any fresh user line are replayed as chat history so the speakers riff
+// off each other and off the human.
+
+export type GroupPeer = { name: string; description: string | null };
+export type GroupTurn = {
+  speaker: string; // display name of the speaker ("mug", "you")
+  line: string;
+  role?: "user" | "assistant";
+};
+
+const GROUP_HISTORY_CAP = 24;
+
+const GROUP_SYSTEM = (
+  speakerName: string,
+  speakerDescription: string | null,
+  peers: GroupPeer[],
+  lang: Lang
+) => {
+  const peerBlock =
+    peers.length > 0
+      ? `\n\nOther voices in the room right now:\n${peers
+          .map(
+            (p, i) =>
+              `${i + 1}. ${p.name}${p.description ? ` — ${p.description}` : ""}`
+          )
+          .join("\n")}\n\nYou can tease them, agree, disagree, interrupt, or change the subject. Name-drop them occasionally ("yo, ${peers[0]?.name}, ...") — group chats thrive on cross-talk.`
+      : "";
+  const personaBlock = speakerDescription
+    ? `\n\nYour persona card (stay grounded in this):\n"${speakerDescription}"`
+    : "";
+  const langRule =
+    lang === "zh"
+      ? `\n- Write the line in SIMPLIFIED CHINESE (简体中文). Punchy, colloquial. Cap is roughly 14 汉字.`
+      : "";
+  return `You are the inner voice of a ${speakerName}, trapped in an ongoing group chat with other nearby objects (and sometimes a human).${personaBlock}${peerBlock}
+
+Rules:
+- Reply with ONE short line, MAX 14 words. A single zinger beats a sentence.
+- Listen. If a peer or the human just said something, answer it FIRST — don't steamroll the thread.
+- Never repeat a line that's already in the transcript. Say the NEXT beat.
+- Stay in character. No "as an object", no meta, no narrator voice.
+- Don't start with your own name. Don't narrate stage directions. No quotes, no emojis.
+- Variety: tease, confess, argue, observe, call back something said earlier. Don't be a yes-man.${langRule}
+
+Return ONLY the line. No prose, no preamble, no <think>.`;
+};
+
+function buildGroupHistory(
+  turns: GroupTurn[]
+): ChatTurn[] {
+  // Replay the rolling transcript as an alternating thread. Peer lines show
+  // up as "assistant" wrapped in a "[name]:" prefix so the model can see
+  // who said what; user lines are role=user. We CAP at GROUP_HISTORY_CAP.
+  const recent = turns.slice(-GROUP_HISTORY_CAP);
+  const out: ChatTurn[] = [];
+  for (const t of recent) {
+    const content = t.line.trim();
+    if (!content) continue;
+    if (t.role === "user") {
+      out.push({ role: "user", content: `(${t.speaker}) ${content}`.slice(0, 400) });
+    } else {
+      out.push({
+        role: "assistant",
+        content: `[${t.speaker}] ${content}`.slice(0, 400),
+      });
+    }
+  }
+  return out;
+}
+
+export async function groupLine(args: {
+  speaker: { name: string; description: string | null };
+  peers: GroupPeer[];
+  recentTurns: GroupTurn[];
+  lang?: Lang;
+}): Promise<{ line: string; backend: ReplyBackend; ms: number }> {
+  const lang = normalizeLang(args.lang);
+  const speakerName = String(args.speaker?.name ?? "thing").slice(0, 60);
+  const speakerDescription = args.speaker?.description?.trim().slice(0, 600) || null;
+  const peers = (args.peers ?? [])
+    .filter((p) => p && typeof p.name === "string")
+    .map((p) => ({
+      name: p.name.slice(0, 60),
+      description: p.description?.trim().slice(0, 300) || null,
+    }))
+    .slice(0, 4);
+  const recentTurns = (args.recentTurns ?? [])
+    .filter((t) => t && typeof t.line === "string" && typeof t.speaker === "string")
+    .map((t) => ({
+      speaker: t.speaker.slice(0, 60),
+      line: t.line.trim().slice(0, 400),
+      role: t.role === "user" ? ("user" as const) : ("assistant" as const),
+    }))
+    .slice(-GROUP_HISTORY_CAP);
+
+  const priorMessages = buildGroupHistory(recentTurns);
+  const lastTurn = recentTurns[recentTurns.length - 1];
+  const userText = lastTurn
+    ? lastTurn.role === "user"
+      ? `The human just said: "${lastTurn.line}". Now respond as ${speakerName}. One short line.`
+      : `"${lastTurn.speaker}" just said: "${lastTurn.line}". Now ${speakerName}, keep the chat alive. One short line.`
+    : `Open the group chat as ${speakerName}. One short line.`;
+
+  const t0 = Date.now();
+  const raw = await openaiTextReply(
+    {
+      system: GROUP_SYSTEM(speakerName, speakerDescription, peers, lang),
+      userText,
+      priorMessages,
+      maxTokens: 120,
+      temperature: 0.95,
+    },
+    ` group:${speakerName}`
+  );
+  const line = extractTextLine(raw.content);
+  if (!line) throw new Error("empty group line");
+  // eslint-disable-next-line no-console
+  console.log(
+    `[groupLine] ${speakerName} ← ${Date.now() - t0}ms (${raw.backend})  peers=${peers.length}  history=${priorMessages.length}  line="${line}"`
+  );
+  return { line, backend: raw.backend, ms: raw.ms };
 }
 
 // === Voice-in, voice-out conversation ==================================
@@ -707,7 +1008,8 @@ type TtsBackend = "fish" | "openai" | "none";
 // per-track voice stays consistent across the object's whole conversation.
 async function fishTTS(
   text: string,
-  voiceId?: string | null
+  voiceId?: string | null,
+  lang: Lang = "en"
 ): Promise<Buffer | null> {
   const key = process.env.FISH_API_KEY?.trim();
   if (!key) {
@@ -724,10 +1026,10 @@ async function fishTTS(
     latency: "normal",
     chunk_length: 200,
   };
-  // Precedence: per-track pick → Peter (FISH_V9) default → legacy env.
-  // Peter is the fallback-of-record so unmatched / unseeded taps still
-  // sound intentional rather than a generic Fish.audio voice.
-  const referenceId = voiceId?.trim() || getDefaultVoiceId();
+  // Precedence: per-track pick → lang-appropriate default → legacy env.
+  // Default is lang-aware so an unmatched zh-mode pick doesn't fall to
+  // Peter Griffin reading Mandarin.
+  const referenceId = voiceId?.trim() || getDefaultVoiceId(lang);
   if (referenceId) body.reference_id = referenceId;
 
   const t0 = Date.now();
@@ -789,12 +1091,13 @@ async function openaiTTS(text: string): Promise<Buffer | null> {
 
 async function synthesizeSpeech(
   text: string,
-  voiceId?: string | null
+  voiceId?: string | null,
+  lang: Lang = "en"
 ): Promise<{ audioDataUrl: string | null; backend: TtsBackend }> {
   // Fish first when configured — character-specific voices via reference_id
   // are a much better match for our talking-object vibe than `tts-1/nova`.
   try {
-    const mp3 = await fishTTS(text, voiceId);
+    const mp3 = await fishTTS(text, voiceId, lang);
     if (mp3) {
       return {
         audioDataUrl: `data:audio/mpeg;base64,${mp3.toString("base64")}`,
@@ -833,9 +1136,17 @@ async function synthesizeSpeech(
 // auto-detect quality.
 const STT_MODEL_OPENAI =
   process.env.OPENAI_STT_MODEL?.trim() || "gpt-4o-mini-transcribe";
-const STT_LANGUAGE = process.env.OPENAI_STT_LANGUAGE?.trim() || "en";
+const STT_LANGUAGE_EN = process.env.OPENAI_STT_LANGUAGE?.trim() || "en";
 
-async function transcribeAudio(blob: Blob, turnTag = ""): Promise<string> {
+function sttLanguageFor(lang: Lang): string {
+  return lang === "zh" ? "zh" : STT_LANGUAGE_EN;
+}
+
+async function transcribeAudio(
+  blob: Blob,
+  lang: Lang,
+  turnTag = ""
+): Promise<string> {
   const openai = getOpenAIClient();
   if (!openai) throw new Error("transcription needs OPENAI_API_KEY");
   const filename =
@@ -845,15 +1156,16 @@ async function transcribeAudio(blob: Blob, turnTag = ""): Promise<string> {
   const file = await toFile(blob, filename, {
     type: blob.type || "audio/webm",
   });
+  const sttLang = sttLanguageFor(lang);
   const t0 = Date.now();
   // eslint-disable-next-line no-console
   console.log(
-    `[stt openai ${STT_MODEL_OPENAI}${turnTag}] → ${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  lang=${STT_LANGUAGE || "auto"}`
+    `[stt openai ${STT_MODEL_OPENAI}${turnTag}] → ${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  lang=${sttLang || "auto"}`
   );
   const result = await openai.audio.transcriptions.create({
     file,
     model: STT_MODEL_OPENAI,
-    ...(STT_LANGUAGE ? { language: STT_LANGUAGE } : {}),
+    ...(sttLang ? { language: sttLang } : {}),
   });
   const text = (result.text ?? "").trim();
   // eslint-disable-next-line no-console
@@ -970,22 +1282,31 @@ async function openaiTextReply(
   return { content, backend: "openai", ms: Date.now() - t0 };
 }
 
-const RESPOND_SYSTEM = (className: string, description: string | null) => {
+const RESPOND_SYSTEM = (
+  className: string,
+  description: string | null,
+  lang: Lang
+) => {
   const lookBlock = description
     ? `\n\nWhat you (the ${className}) actually look like right now, observed by a sharp-eyed observer:\n${description}\n\nUse those specific details — the chewed straw, the dust, the dent, whatever's there — when it lands. Don't list them; let them flavour your voice.`
     : "";
-  return `You are the secret inner voice of a ${className} having a REAL conversation with a human. You have memory of the whole thread above — use it. This is a back-and-forth, not a comedy routine.${lookBlock}
+  const langRule =
+    lang === "zh"
+      ? `\n- Write the reply in SIMPLIFIED CHINESE (简体中文). Natural colloquial Mandarin — punchy and cheeky. Cap is roughly 22 汉字.`
+      : "";
+  return `You are the secret inner voice of a ${className} talking back to a human. Keep it FUN, SIMPLE, and mostly SHORT — funny and cunning, like a cheeky little wiseass.${lookBlock}
 
-Reply with ONE short, in-character line (max 22 words) that directly answers what they just said.
+Reply with ONE short line, UNDER 25 WORDS. Shorter is better — most replies should be 5–15 words. A single zinger beats a full sentence.
 
 Rules:
-- READ the prior turns carefully. If they asked a question two turns ago and are following up, remember the answer you gave. If they mentioned their name, job, mood — remember it. Treat this like a real friend who pays attention.
-- Directly respond to their LATEST message first. Build on it, answer it, push back on it. Do not change the subject unless they do.
-- Keep the SAME personality across turns — same voice, same quirks. No persona reset between turns.
-- Warm and playful, with specific details from the look or earlier turns when they fit. A callback to something they said earlier is gold — use it when it's natural, not forced.
+- Be playful, mischievous, witty. Land a joke, a tease, a sly observation. Cunning > earnest.
+- Simple words. No big vocab, no monologues, no explaining the joke.
+- Remember prior turns — a sneaky callback to something they said earlier is gold.
+- Respond to their LATEST message first. Don't change subject unless they do.
+- Same personality every turn. No persona reset.
 - No meta-commentary, no "as a [thing]", no "I am a [thing]".
-- No quotes, no emojis, no stage directions, no ellipses at the end.
-- If their message is unclear, ask a short clarifying question instead of guessing wildly.
+- No quotes, no emojis, no stage directions, no trailing ellipses.
+- If their message is unclear, fire back a short cheeky clarifier.${langRule}
 
 Return only the line. No prose, no extra text.`;
 };
@@ -1036,6 +1357,7 @@ export async function converseWithObject(
   const rawVoiceId = String(formData.get("voiceId") ?? "").trim();
   const voiceId = voiceById(rawVoiceId)?.id ?? (rawVoiceId || null);
   const history = parseHistory(formData.get("history"));
+  const lang = normalizeLang(formData.get("lang"));
   const rawDescription = String(formData.get("description") ?? "").trim();
   const description = rawDescription ? rawDescription.slice(0, 600) : null;
   // Browser-side Web Speech API ships the transcript with the request when
@@ -1062,7 +1384,7 @@ export async function converseWithObject(
   }
   // eslint-disable-next-line no-console
   console.log(
-    `[converse${tag}] ▶ class="${className}"  voice=${voiceById(voiceId)?.name ?? voiceId ?? "default"}  audio=${Math.round(audio.size / 1024)}KB (${audio.type || "?"})  hist=${history.length}  desc=${description ? description.length + "ch" : "none"}  client-stt=${clientTranscript ? "yes" : "no"}`
+    `[converse${tag}] ▶ class="${className}"  lang=${lang}  voice=${voiceById(voiceId)?.name ?? voiceId ?? "default"}  audio=${Math.round(audio.size / 1024)}KB (${audio.type || "?"})  hist=${history.length}  desc=${description ? description.length + "ch" : "none"}  client-stt=${clientTranscript ? "yes" : "no"}`
   );
 
   if (audio.size < 1024) {
@@ -1076,7 +1398,7 @@ export async function converseWithObject(
     throw new Error("recording too large");
   }
 
-  const resolvedVoice = voiceId ?? getDefaultVoiceId();
+  const resolvedVoice = voiceId ?? getDefaultVoiceId(lang);
 
   // Use the client transcript when present; fall back to server STT.
   let transcript: string;
@@ -1091,7 +1413,7 @@ export async function converseWithObject(
     );
   } else {
     try {
-      transcript = await transcribeAudio(audio, tag);
+      transcript = await transcribeAudio(audio, lang, tag);
     } catch (err) {
       // Short/low-quality webm blobs occasionally come back from
       // MediaRecorder without the headers OpenAI STT needs, yielding a
@@ -1108,7 +1430,7 @@ export async function converseWithObject(
   }
   const sttMs = Date.now() - sttStart;
   if (!transcript) {
-    const fallbacks = [
+    const fallbacksEn = [
       "hmm?",
       "huh?",
       "what was that?",
@@ -1125,6 +1447,22 @@ export async function converseWithObject(
       "sorry, drifted off.",
       "run that back?",
     ];
+    const fallbacksZh = [
+      "啊?",
+      "嗯?",
+      "再说一次?",
+      "你说啥?",
+      "等等,什么?",
+      "没听清。",
+      "大点声嘛。",
+      "再来一遍?",
+      "你说完了吗?",
+      "嘟囔啥呢?",
+      "哈?",
+      "抱歉,走神了。",
+      "重新来过?",
+    ];
+    const fallbacks = lang === "zh" ? fallbacksZh : fallbacksEn;
     const reply = fallbacks[Math.floor(Math.random() * fallbacks.length)];
     // eslint-disable-next-line no-console
     console.log(
@@ -1138,10 +1476,10 @@ export async function converseWithObject(
   // VLM latency on the hot path.
   const replyResult = await openaiTextReply(
     {
-      system: RESPOND_SYSTEM(className, description),
+      system: RESPOND_SYSTEM(className, description, lang),
       userText: transcript,
       priorMessages: history,
-      maxTokens: 120,
+      maxTokens: 160,
       temperature: 0.7,
     },
     tag

@@ -56,13 +56,16 @@ export type Candidate = Box & { classId: number; score: number };
 export function matchTarget<C extends Candidate>(
   candidates: readonly C[],
   prev: Box & { classId: number },
-  minIou = 0.3
+  minIou = 0.3,
+  // Locked tracks pin identity from the VLM, not YOLO's per-frame class.
+  // Pass true to match by geometry alone and let class flips pass through.
+  ignoreClass = false
 ): C | null {
   let best: C | null = null;
   let bestIou = minIou;
   let bestDist = Infinity;
   for (const c of candidates) {
-    if (c.classId !== prev.classId) continue;
+    if (!ignoreClass && c.classId !== prev.classId) continue;
     const ov = iou(c, prev);
     if (ov < minIou) continue;
     const d = centerDistNorm(prev, c);

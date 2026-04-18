@@ -1,0 +1,16 @@
+[project]
+name = "server"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "dlib>=20.0.1",
+    "fastapi>=0.136.0",
+    "imutils>=0.5.4",
+    "numpy>=2.4.4",
+    "openai>=2.32.0",
+    "opencv-python>=4.13.0.92",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.26",
+    "uvicorn[standard]>=0.44.0",
+    "websockets>=16.0",
+]

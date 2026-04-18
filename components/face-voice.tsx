@@ -29,8 +29,16 @@ type FaceVoiceProps = {
   shape: MouthShape;
 };
 
+// Intermediate canvas resolution for the luma key. The source video is
+// 1280×220 but displayed at ~62% of 280 CSS px, so 512 wide keeps retina
+// crisp and caps per-frame pixel work at ~45k — cheap even on mid-tier
+// Android. Height preserves the 1280:220 source aspect.
+const EYES_CANVAS_WIDTH = 512;
+const EYES_CANVAS_HEIGHT = 88;
+
 export function FaceVoice({ shape }: FaceVoiceProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Preload every shape once — single cached HEAD request per file, then the
   // subsequent <img src> swaps are instant.
@@ -47,20 +55,119 @@ export function FaceVoice({ shape }: FaceVoiceProps) {
     };
   }, []);
 
-  // Autoplay the eyes video. Muted + playsInline so iOS Safari is happy.
+  // Autoplay the eyes video and pipe each decoded frame through a canvas
+  // that luma-keys black → transparent (alpha = max(r,g,b)). Both shipped
+  // source files are yuv420p (no real alpha channel), and `mix-blend-mode:
+  // screen` on a raw <video> breaks on mobile Safari and Android Chrome —
+  // hardware-accelerated video lives on its own compositor layer and ignores
+  // the blend, so a black rectangle ends up painted under the mouth. By
+  // rasterising into a 2D canvas we emit true RGBA that every browser honours.
   useEffect(() => {
     const v = videoRef.current;
-    if (!v) return;
+    const canvas = canvasRef.current;
+    if (!v || !canvas) return;
     v.muted = true;
     v.loop = true;
     v.playsInline = true;
-    const p = v.play();
-    if (p && typeof p.catch === "function") {
-      // Autoplay can be blocked until a user gesture; we retry on the next
-      // pointer event in practice the tap that locks the face already
-      // clears the policy.
-      p.catch(() => {});
-    }
+
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+    canvas.width = EYES_CANVAS_WIDTH;
+    canvas.height = EYES_CANVAS_HEIGHT;
+
+    let cancelled = false;
+    let rafId: number | null = null;
+    let vfcId: number | null = null;
+    const videoAny = v as unknown as {
+      requestVideoFrameCallback?: (cb: () => void) => number;
+      cancelVideoFrameCallback?: (id: number) => void;
+    };
+
+    const tryPlay = (reload = false) => {
+      if (cancelled || !v) return;
+      if (reload) {
+        try {
+          v.load();
+        } catch {}
+      }
+      const p = v.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    };
+
+    const drawFrame = () => {
+      if (cancelled) return;
+      if (v.readyState >= 2 && v.videoWidth > 0) {
+        ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const d = img.data;
+        for (let i = 0; i < d.length; i += 4) {
+          const r = d[i];
+          const g = d[i + 1];
+          const b = d[i + 2];
+          const m = r > g ? r : g;
+          d[i + 3] = m > b ? m : b;
+        }
+        ctx.putImageData(img, 0, 0);
+      }
+      scheduleNext();
+    };
+
+    const scheduleNext = () => {
+      if (cancelled) return;
+      if (typeof videoAny.requestVideoFrameCallback === "function") {
+        vfcId = videoAny.requestVideoFrameCallback(drawFrame);
+      } else {
+        rafId = requestAnimationFrame(drawFrame);
+      }
+    };
+
+    tryPlay();
+    const onLoaded = () => tryPlay();
+    v.addEventListener("loadedmetadata", onLoaded);
+    v.addEventListener("loadeddata", onLoaded);
+    v.addEventListener("canplay", onLoaded);
+    v.addEventListener("error", () => tryPlay(true));
+    scheduleNext();
+
+    const gestureRetry = () => {
+      if (v.paused || v.currentTime === 0) tryPlay(v.readyState < 2);
+    };
+    window.addEventListener("pointerdown", gestureRetry, { passive: true });
+    window.addEventListener("touchstart", gestureRetry, { passive: true });
+    const onVisibility = () => {
+      if (!document.hidden && (v.paused || v.currentTime === 0)) tryPlay(true);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
+    // Watchdog: if the video still hasn't moved past t=0 after 600ms,
+    // force a full reload + replay. Retry a couple of times before giving up.
+    let attempts = 0;
+    const watchdog = window.setInterval(() => {
+      if (cancelled || !v) return;
+      const stuck = v.paused || v.currentTime === 0 || v.readyState < 2;
+      if (!stuck) {
+        window.clearInterval(watchdog);
+        return;
+      }
+      attempts += 1;
+      tryPlay(true);
+      if (attempts >= 4) window.clearInterval(watchdog);
+    }, 600);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(watchdog);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      if (vfcId !== null && typeof videoAny.cancelVideoFrameCallback === "function") {
+        videoAny.cancelVideoFrameCallback(vfcId);
+      }
+      v.removeEventListener("loadedmetadata", onLoaded);
+      v.removeEventListener("loadeddata", onLoaded);
+      v.removeEventListener("canplay", onLoaded);
+      window.removeEventListener("pointerdown", gestureRetry);
+      window.removeEventListener("touchstart", gestureRetry);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
 
   return (
@@ -72,9 +179,9 @@ export function FaceVoice({ shape }: FaceVoiceProps) {
         filter: "drop-shadow(0 6px 10px rgba(0,0,0,0.55))",
       }}
     >
-      {/* Eyes layer. VP9+alpha webm has real transparency; the mp4 fallback
-          is matted on black so we screen-blend to key it out. Both paths
-          land visually identical. */}
+      {/* Hidden source video — kept in the DOM at 1×1 with opacity 0 so
+          mobile Safari keeps it decoding. All visible pixels come from the
+          canvas below, which carries the luma-keyed RGBA frames. */}
       <video
         ref={videoRef}
         muted
@@ -82,18 +189,28 @@ export function FaceVoice({ shape }: FaceVoiceProps) {
         playsInline
         autoPlay
         preload="auto"
-        className="absolute"
+        aria-hidden
         style={{
-          top: "10%",
-          left: "50%",
-          width: "62%",
-          transform: "translateX(-50%)",
-          mixBlendMode: "screen",
+          position: "absolute",
+          width: 1,
+          height: 1,
+          opacity: 0,
+          pointerEvents: "none",
         }}
       >
         <source src="/facevoice/eyes.webm" type="video/webm" />
         <source src="/facevoice/eyes.mp4" type="video/mp4" />
       </video>
+      <canvas
+        ref={canvasRef}
+        className="pointer-events-none absolute"
+        style={{
+          top: "10%",
+          left: "50%",
+          width: "62%",
+          transform: "translateX(-50%)",
+        }}
+      />
 
       {/* Mouth layer. PNG has transparent alpha channel — no blend needed. */}
       <img

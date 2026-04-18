@@ -23,7 +23,7 @@ type SpeechBubbleProps = {
   speaking: boolean;
   // Max bubble width in CSS px at scale=1. Parent sizes this from the face's
   // displayed width so a mug gets a pill and a sofa gets a paragraph.
-  maxWidth: number;
+  maxWidth: number | string;
 };
 
 export function SpeechBubble({ caption, thinking, speaking, maxWidth }: SpeechBubbleProps) {
@@ -120,11 +120,9 @@ export function SpeechBubble({ caption, thinking, speaking, maxWidth }: SpeechBu
       style={{
         maxWidth,
         transformOrigin: "50% 100%",
-        // One soft drop-shadow wraps the bubble + tail as a single blob. Two
-        // layered shadows: a deep pink halo for the pastel language, and a
-        // tighter ink shadow for grounding.
+        // Chunky hard offset — the classic newsprint comic drop. No blur.
         filter:
-          "drop-shadow(0 12px 22px rgba(236,72,153,0.18)) drop-shadow(0 4px 10px rgba(42,21,64,0.14))",
+          "drop-shadow(5px 5px 0 #1a1024) drop-shadow(0 8px 18px rgba(236,72,153,0.18))",
         animation:
           phase === "out"
             ? `bubble-out ${EXIT_MS}ms cubic-bezier(0.4,0,1,1) both`
@@ -132,56 +130,86 @@ export function SpeechBubble({ caption, thinking, speaking, maxWidth }: SpeechBu
       }}
     >
       <div
-        className="relative rounded-[26px] bg-white px-[20px] py-[13px]"
+        className="relative rounded-[44px] px-[34px] py-[22px]"
         style={{
-          // Inset highlight at the top reads as a glossy ceramic rim. The
-          // second inset traces a barely-there pink edge so the bubble feels
-          // intentional without a hard ring.
-          boxShadow:
-            "inset 0 1px 0 rgba(255,255,255,0.9), inset 0 0 0 1px rgba(255,192,219,0.55)",
+          // Faint cream tint reads as old newsprint paper, not screen-white.
+          background: "#fffdf2",
+          // Thick ink outline — the load-bearing comic-book signal.
+          border: "4px solid #1a1024",
         }}
       >
         {isThinking ? (
-          <span className="flex items-center gap-[6px] py-[3px] px-[2px]">
+          <span className="flex items-center gap-[12px] py-[6px] px-[2px]">
             <span
-              className="h-[7px] w-[7px] rounded-full bg-[color:var(--accent)]/80"
+              className="h-[13px] w-[13px] rounded-full bg-[#1a1024]"
               style={{ animation: "dot-bounce 1.1s ease-in-out infinite" }}
             />
             <span
-              className="h-[7px] w-[7px] rounded-full bg-[color:var(--accent)]/80"
+              className="h-[13px] w-[13px] rounded-full bg-[#1a1024]"
               style={{ animation: "dot-bounce 1.1s ease-in-out 0.15s infinite" }}
             />
             <span
-              className="h-[7px] w-[7px] rounded-full bg-[color:var(--accent)]/80"
+              className="h-[13px] w-[13px] rounded-full bg-[#1a1024]"
               style={{ animation: "dot-bounce 1.1s ease-in-out 0.3s infinite" }}
             />
           </span>
         ) : (
-          <p className="serif-italic text-balance text-center text-[15px] leading-[1.38] tracking-[-0.005em] text-[color:var(--ink)] whitespace-pre-wrap break-words">
+          <p
+            className="text-center text-[30px] leading-[1.1] uppercase text-[#1a1024] whitespace-pre-wrap break-words"
+            style={{
+              fontFamily: "var(--font-comic), 'Bangers', 'Comic Sans MS', system-ui, sans-serif",
+              letterSpacing: "0.04em",
+              textShadow: "1px 1px 0 rgba(26,16,36,0.08)",
+            }}
+          >
             {shownCaption ? shownCaption.slice(0, revealedChars) : ""}
             {shownCaption && revealedChars < shownCaption.length && (
               <span
                 aria-hidden
-                className="ml-[2px] inline-block h-[0.85em] w-[3px] rounded-full bg-[color:var(--accent)]/70 align-baseline translate-y-[2px]"
+                className="ml-[3px] inline-block h-[0.78em] w-[4px] bg-[#1a1024] align-baseline translate-y-[2px]"
                 style={{ animation: "caret-blink 0.9s steps(2) infinite" }}
               />
             )}
           </p>
         )}
       </div>
-      {/* Tail — a small rounded square rotated 45°, sharing the fill and
-          inset highlight so it reads as part of the bubble. The parent's
-          drop-shadow wraps it continuously. */}
+      {/* Comic tail — open V drawn as SVG so the ink outline stays continuous
+          with the bubble border. A small cream-fill mask covers the bubble's
+          bottom border under the tail so the V appears to open into it. */}
       <span
         aria-hidden
-        className="absolute left-1/2 h-[12px] w-[12px] rounded-[3px] bg-white"
+        className="absolute left-1/2"
         style={{
-          bottom: -5,
-          transform: "translateX(-50%) rotate(45deg)",
-          boxShadow: "inset 0 0 0 1px rgba(255,192,219,0.55)",
+          bottom: -4,
+          transform: "translateX(-50%)",
+          width: 36,
+          height: 8,
+          background: "#fffdf2",
           animation: speaking ? "tail-bob 1.6s ease-in-out infinite" : undefined,
         }}
       />
+      <svg
+        aria-hidden
+        width="44"
+        height="26"
+        viewBox="0 0 44 26"
+        className="absolute left-1/2"
+        style={{
+          bottom: -25,
+          transform: "translateX(-50%)",
+          overflow: "visible",
+          animation: speaking ? "tail-bob 1.6s ease-in-out infinite" : undefined,
+        }}
+      >
+        <path
+          d="M4 0 L22 24 L40 0"
+          fill="#fffdf2"
+          stroke="#1a1024"
+          strokeWidth="4"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+      </svg>
     </div>
   );
 }

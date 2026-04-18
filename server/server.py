@@ -35,6 +35,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from imutils import face_utils, resize
 
+from yolo_ws import ws_handler as yolo_ws_handler
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mirror")
 
@@ -721,6 +723,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    """Per-request access log with wall-clock timing. Skips /health to
+    keep the log readable under liveness-probe traffic."""
+    path = request.url.path
+    if path == "/health":
+        return await call_next(request)
+    t0 = time.time()
+    log.info("[http] ▶ %s %s", request.method, path)
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        log.warning(
+            "[http] ✖ %s %s after %dms: %s",
+            request.method,
+            path,
+            int((time.time() - t0) * 1000),
+            e,
+        )
+        raise
+    log.info(
+        "[http] ◀ %s %s %d in %dms",
+        request.method,
+        path,
+        response.status_code,
+        int((time.time() - t0) * 1000),
+    )
+    return response
+
 compositor = Compositor()
 executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="composite")
 
@@ -888,7 +920,13 @@ async def _composite_async(frame_bgr: np.ndarray) -> tuple[np.ndarray, bool]:
 async def ws(websocket: WebSocket):
     await websocket.accept()
     last_face_state: bool | None = None
-    log.info("ws connected")
+    # Rolling FPS / composite-time window so the log shows cadence without
+    # spamming per-frame lines. 100-frame window ~= every 3-5 seconds.
+    frame_count = 0
+    window_start = time.time()
+    window_composite_ms = 0.0
+    window_face_frames = 0
+    log.info("[ws/mirror] ▶ connected")
     try:
         while True:
             msg = await websocket.receive()
@@ -903,11 +941,13 @@ async def ws(websocket: WebSocket):
                 frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
                 if frame is None:
                     continue
+                frame_t0 = time.time()
                 try:
                     out, has_face = await _composite_async(frame)
                 except Exception:
                     log.exception("composite pipeline failed")
                     continue
+                window_composite_ms += (time.time() - frame_t0) * 1000
 
                 ok_enc, enc = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 78])
                 if not ok_enc:
@@ -916,6 +956,23 @@ async def ws(websocket: WebSocket):
                     await websocket.send_bytes(enc.tobytes())
                 except Exception:
                     break
+                frame_count += 1
+                if has_face:
+                    window_face_frames += 1
+                if frame_count % 100 == 0:
+                    elapsed = time.time() - window_start
+                    fps = 100 / elapsed if elapsed > 0 else 0
+                    avg_ms = window_composite_ms / 100
+                    log.info(
+                        "[ws/mirror] ◦ frames=%d fps=%.1f avg-composite=%.1fms face-ratio=%d/100",
+                        frame_count,
+                        fps,
+                        avg_ms,
+                        window_face_frames,
+                    )
+                    window_start = time.time()
+                    window_composite_ms = 0.0
+                    window_face_frames = 0
 
                 if last_face_state != has_face:
                     last_face_state = has_face
@@ -951,7 +1008,12 @@ async def ws(websocket: WebSocket):
     except Exception:
         log.exception("ws loop crashed")
     finally:
-        log.info("ws closed")
+        log.info("[ws/mirror] ◀ closed frames=%d", frame_count)
+
+
+@app.websocket("/ws/yolo")
+async def ws_yolo(websocket: WebSocket):
+    await yolo_ws_handler(websocket)
 
 
 if __name__ == "__main__":
