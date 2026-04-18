@@ -45,7 +45,7 @@ export async function POST(req: Request) {
     );
     // eslint-disable-next-line no-console
     console.log(
-      `[api/generate-line${tagStr}] ◀ done total=${Date.now() - t0}ms backend=${res.backend}`
+      `[api/generate-line${tagStr}] ◀ done total=${Date.now() - t0}ms`
     );
     return NextResponse.json({
       line: res.line,
