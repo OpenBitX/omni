@@ -63,6 +63,13 @@ export type Detection = {
   //   above 1 (round objects have a meaningless principal angle).
   principalAngle?: number;
   axisRatio?: number;
+  // Pole of inaccessibility — the point inside the silhouette that is
+  // farthest from any edge. In source (video) pixels. This is the best
+  // place to plant the talking face: the centroid can land near an edge
+  // for crescent/L-shaped masks, where the pole always sits in the
+  // thickest interior region. Computed via 2-pass chamfer distance
+  // transform on the binary mask.
+  maskPole?: { x: number; y: number };
 };
 
 // Head type selects the post-processing branch.
@@ -780,6 +787,93 @@ function postprocessYoloSegDetr(
       axisRatio = Math.sqrt(Math.max(1, lambda1) / Math.max(1, lambda2));
     }
 
+    // Pole of inaccessibility — the inside-pixel farthest from any edge.
+    // 2-pass chamfer distance transform (3-4-5 would be more isotropic,
+    // 1/√2 works fine at this resolution and is cheaper). The result is
+    // used as the face's anchor point so faces land in the thickest part
+    // of the silhouette instead of near an edge.
+    //   - Pass 1: top-left → bottom-right, min of (top, left, diag) + cost
+    //   - Pass 2: bottom-right → top-left, min of (bottom, right, diag)
+    // Off-pixels pin the boundary at 0. Cost: ~4 × maskArea flops.
+    let maskPole: { x: number; y: number } | undefined;
+    if (abovePixels > 0) {
+      const INF = 1e9;
+      const DIAG = Math.SQRT2;
+      const dist = new Float32Array(maskW * maskH);
+      for (let i = 0; i < dist.length; i++) {
+        dist[i] = maskData[i] > 0 ? INF : 0;
+      }
+      for (let y = 0; y < maskH; y++) {
+        for (let x = 0; x < maskW; x++) {
+          const i = y * maskW + x;
+          if (maskData[i] === 0) continue;
+          let d = dist[i];
+          if (y > 0) {
+            const top = dist[i - maskW] + 1;
+            if (top < d) d = top;
+            if (x > 0) {
+              const tl = dist[i - maskW - 1] + DIAG;
+              if (tl < d) d = tl;
+            }
+            if (x < maskW - 1) {
+              const tr = dist[i - maskW + 1] + DIAG;
+              if (tr < d) d = tr;
+            }
+          }
+          if (x > 0) {
+            const left = dist[i - 1] + 1;
+            if (left < d) d = left;
+          }
+          dist[i] = d;
+        }
+      }
+      let bestI = -1;
+      let bestD = 0;
+      for (let y = maskH - 1; y >= 0; y--) {
+        for (let x = maskW - 1; x >= 0; x--) {
+          const i = y * maskW + x;
+          if (maskData[i] === 0) continue;
+          let d = dist[i];
+          if (y < maskH - 1) {
+            const bot = dist[i + maskW] + 1;
+            if (bot < d) d = bot;
+            if (x > 0) {
+              const bl = dist[i + maskW - 1] + DIAG;
+              if (bl < d) d = bl;
+            }
+            if (x < maskW - 1) {
+              const br = dist[i + maskW + 1] + DIAG;
+              if (br < d) d = br;
+            }
+          }
+          if (x < maskW - 1) {
+            const right = dist[i + 1] + 1;
+            if (right < d) d = right;
+          }
+          dist[i] = d;
+          if (d > bestD) {
+            bestD = d;
+            bestI = i;
+          }
+        }
+      }
+      if (bestI >= 0) {
+        // bestI was computed in the local mask grid; add px1/py1 to get
+        // proto coords, then invert letterbox back to source pixels the
+        // same way maskCentroid does.
+        const protoX = px1 + (bestI % maskW);
+        const protoY = py1 + Math.floor(bestI / maskW);
+        const pole640X = protoX / inputToProtoX;
+        const pole640Y = protoY / inputToProtoY;
+        const poleSrcX = (pole640X - pre.padX) / pre.scale;
+        const poleSrcY = (pole640Y - pre.padY) / pre.scale;
+        maskPole = {
+          x: Math.max(sx1, Math.min(sx2, poleSrcX)),
+          y: Math.max(sy1, Math.min(sy2, poleSrcY)),
+        };
+      }
+    }
+
     let maskCentroid: { x: number; y: number } | undefined;
     if (totalMass > 0) {
       // Centroid lives in proto coords; scale back to source pixels.
@@ -808,6 +902,7 @@ function postprocessYoloSegDetr(
       mask: abovePixels > 0 ? { data: maskData, w: maskW, h: maskH } : undefined,
       principalAngle,
       axisRatio,
+      maskPole,
     });
   }
 

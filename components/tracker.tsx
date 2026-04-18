@@ -6,7 +6,9 @@ import {
   FACE_VOICE_HEIGHT,
   FACE_VOICE_WIDTH,
   FaceVoice,
-  classifyShape,
+  classifyShapeSmooth,
+  createLipSyncState,
+  type LipSyncState,
   type MouthShape,
 } from "@/components/face-voice";
 import { SpeechBubble } from "@/components/speech-bubble";
@@ -32,6 +34,53 @@ import {
   type Box,
   type BoxEMA,
 } from "@/lib/iou";
+
+// === Web Speech API typing ==============================================
+//
+// The DOM lib doesn't always expose SpeechRecognition (it's
+// implementation-defined) and Safari only ships the webkit-prefixed
+// variant. We declare a minimal shape locally so the code compiles
+// everywhere and feature-detect at runtime before using it.
+
+interface SpeechRecognitionResultLike {
+  isFinal: boolean;
+  0: { transcript: string; confidence?: number };
+}
+interface SpeechRecognitionResultListLike {
+  length: number;
+  [index: number]: SpeechRecognitionResultLike;
+}
+interface SpeechRecognitionEventLike extends Event {
+  resultIndex: number;
+  results: SpeechRecognitionResultListLike;
+}
+interface SpeechRecognitionErrorEventLike extends Event {
+  error: string;
+  message?: string;
+}
+interface SpeechRecognitionLike {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives: number;
+  start(): void;
+  stop(): void;
+  abort(): void;
+  onresult: ((e: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((e: SpeechRecognitionErrorEventLike) => void) | null;
+  onend: ((e: Event) => void) | null;
+  onstart: ((e: Event) => void) | null;
+}
+type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
+
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as {
+    SpeechRecognition?: SpeechRecognitionCtor;
+    webkitSpeechRecognition?: SpeechRecognitionCtor;
+  };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+}
 
 // === Pipeline tuning knobs ===============================================
 
@@ -372,6 +421,10 @@ type TrackRefs = {
   timeData: Uint8Array<ArrayBuffer> | null;
   source: AudioBufferSourceNode | null;
   shape: MouthShape;
+  // Per-track lip-sync state (envelope follower + adaptive peak +
+  // shape hysteresis). Reset at the start of every new line so the peak
+  // calibrates to the new utterance's loudness, not the previous one's.
+  lipSync: LipSyncState;
   // Auto-dismiss timer id for this track's caption once audio finishes.
   // Held per-track so a retap can cancel the prior dismissal.
   captionClearTimer: number | null;
@@ -417,6 +470,11 @@ type TrackRefs = {
   // (renderBox.cx - maskAnchor.cx) so the silhouette glides with the face
   // during inter-inference extrapolation instead of snapping at inference rate.
   maskAnchor: { cx: number; cy: number } | null;
+  // Face rotation in radians. Target comes from the mask's principal-axis
+  // angle; smoothed by ROTATION_EMA_ALPHA, gated by ORIENTATION_MIN_RATIO
+  // so round objects stay upright. Applied on top of translate+scale in
+  // the render transform so the face tilts with bananas, pens, laptops.
+  rotation: number;
 };
 
 // How long a caption stays on screen after its voice line finishes. Long
@@ -447,6 +505,9 @@ type TrackUI = {
   maskTop: number;
   maskWidth: number;
   maskHeight: number;
+  // Face rotation (radians) piped from TrackRefs. Applied via CSS rotate()
+  // inside the face transform.
+  rotation: number;
 };
 
 // Stream an mp3 response body into a MediaSource SourceBuffer and play it
@@ -1071,6 +1132,11 @@ export function Tracker() {
       const track = tracksRef.current.find((t) => t.id === trackId);
       if (!ctx || !track) return;
 
+      // Reset lip-sync state for this new reply. Peak calibrates to the
+      // incoming stream's actual loudness; without this, a previous loud
+      // line leaves peak high and the quieter reply shows as closed mouth.
+      track.lipSync = createLipSyncState();
+
       const ensureAnalyser = () => {
         if (track.analyser) return;
         const analyser = ctx.createAnalyser();
@@ -1307,6 +1373,11 @@ export function Tracker() {
           track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
         }
 
+        // Reset lip-sync envelope + adaptive peak for this new line so
+        // openness normalizes against THIS utterance's level, not the
+        // previous one's (Fish.audio and OpenAI fallback can differ 2–3×).
+        track.lipSync = createLipSyncState();
+
         const source = ctx.createBufferSource();
         source.buffer = audioBuf;
         source.connect(track.analyser);
@@ -1462,13 +1533,26 @@ export function Tracker() {
         if (t.gain) t.gain.gain.value = t.opacity;
       }
 
-      // (3) Per-track mouth-shape classification.
+      // (3) Per-track mouth-shape classification. Gate on either audio
+      // path — `t.source` covers the lock-time AudioBufferSource line and
+      // `t.streamingAudio` covers the conversation reply's MediaSource
+      // stream. Without the streaming gate, replies play audibly but the
+      // mouth stays shut. `classifyShapeSmooth` keeps an envelope +
+      // adaptive peak in `t.lipSync` so openness is normalized to this
+      // utterance's actual level (quiet Fish voices still open the mouth)
+      // and frame-to-frame flicker is filtered out.
       for (const t of tracksRef.current) {
         let shape: MouthShape = "X";
-        if (t.source && t.analyser && t.freqData && t.timeData) {
+        const audible = t.source != null || t.streamingAudio != null;
+        if (audible && t.analyser && t.freqData && t.timeData) {
           t.analyser.getByteTimeDomainData(t.timeData);
           t.analyser.getByteFrequencyData(t.freqData);
-          shape = classifyShape(t.timeData, t.freqData).shape;
+          shape = classifyShapeSmooth(t.lipSync, t.timeData, t.freqData);
+        } else {
+          // Not playing — decay the envelope so the next line starts clean.
+          t.lipSync.envelope = 0;
+          t.lipSync.prevShape = "X";
+          t.lipSync.heldFrames = 0;
         }
         t.shape = shape;
       }
@@ -1519,6 +1603,7 @@ export function Tracker() {
           );
           const opacity = t.opacity;
           const shape = t.shape;
+          const rotation = t.rotation;
 
           // Project the silhouette clip into element space, offset by how
           // far the tracker thinks the object has moved since the mask was
@@ -1560,7 +1645,8 @@ export function Tracker() {
             ui.maskLeft === maskLeft &&
             ui.maskTop === maskTop &&
             ui.maskWidth === maskWidth &&
-            ui.maskHeight === maskHeight
+            ui.maskHeight === maskHeight &&
+            ui.rotation === rotation
           ) {
             return ui;
           }
@@ -1577,6 +1663,7 @@ export function Tracker() {
             maskTop,
             maskWidth,
             maskHeight,
+            rotation,
           };
         });
         return changed ? next : prev;
@@ -1700,6 +1787,21 @@ export function Tracker() {
                 };
               }
             }
+
+            // Orientation — rotate the face along the object's long axis
+            // when the silhouette is comfortably elongated. Below the
+            // ratio threshold, target 0 so round objects (cups, balls)
+            // stay upright instead of drifting with PCA noise. Principal
+            // axis is 180° ambiguous — wrap delta to ±π/2 before the EMA
+            // so we don't spin the long way around when the axis flips.
+            const axisRatio = match.axisRatio ?? 0;
+            const rawAngle = match.principalAngle ?? 0;
+            const targetAngle =
+              axisRatio >= ORIENTATION_MIN_RATIO ? rawAngle : 0;
+            let delta = targetAngle - t.rotation;
+            while (delta > Math.PI / 2) delta -= Math.PI;
+            while (delta < -Math.PI / 2) delta += Math.PI;
+            t.rotation += delta * ROTATION_EMA_ALPHA;
           }
         } else {
           t.missedFrames++;
@@ -1768,7 +1870,7 @@ export function Tracker() {
   // so lips sync) but routes through the converseWithObject server action
   // instead of the one-shot generateLine.
   const sendTalkToTrack = useCallback(
-    async (trackId: string, blob: Blob) => {
+    async (trackId: string, blob: Blob, clientTranscript?: string) => {
       const ctx = ensureAudioCtx();
       const track = tracksRef.current.find((t) => t.id === trackId);
       if (!ctx || !track) return;
@@ -1812,6 +1914,13 @@ export function Tracker() {
         // path (no vision call) while still getting funnier-than-classname
         // context — the chewed straw, dust, dent, etc.
         if (track.description) formData.append("description", track.description);
+        // Browser-side Web Speech API transcript. When present, the server
+        // skips its STT call entirely (~700–1300ms saved). Empty falls back
+        // to server STT against the audio blob.
+        const trimmedTranscript = (clientTranscript ?? "").trim();
+        if (trimmedTranscript) {
+          formData.append("transcript", trimmedTranscript);
+        }
         // Full conversation so far — object's prior lines + user turns.
         // The server re-caps to 16; we cap here so the payload stays small.
         formData.append(
@@ -1821,7 +1930,7 @@ export function Tracker() {
 
         // eslint-disable-next-line no-console
         console.log(
-          `[talk:${trackId}] → converseWithObject  class="${track.className}"  audio=${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  voice=${track.voiceId ?? "default"}  history=${track.history.length}  desc=${track.description ? track.description.length + "ch" : "none"}`
+          `[talk:${trackId}] → converseWithObject  class="${track.className}"  audio=${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  voice=${track.voiceId ?? "default"}  history=${track.history.length}  desc=${track.description ? track.description.length + "ch" : "none"}  client-stt=${trimmedTranscript ? trimmedTranscript.length + "ch" : "no"}`
         );
         const t0 = performance.now();
         const { transcript, reply, voiceId: replyVoiceId } =
@@ -2102,6 +2211,7 @@ export function Tracker() {
         timeData: null,
         source: null,
         shape: "X",
+        lipSync: createLipSyncState(),
         captionClearTimer: null,
         streamingAudio: null,
         streamingUrl: null,
@@ -2113,6 +2223,7 @@ export function Tracker() {
         maskDataUrl: null,
         maskSrcBox: null,
         maskAnchor: null,
+        rotation: 0,
       };
 
       // LRU eviction when the slots are full.
@@ -2188,6 +2299,7 @@ export function Tracker() {
           maskTop: 0,
           maskWidth: 0,
           maskHeight: 0,
+          rotation: 0,
         },
       ]);
 
@@ -2314,8 +2426,97 @@ export function Tracker() {
         talkFlashTimerRef.current = null;
       }, 650);
 
-      void sendTalkToTrack(target.id, blob);
+      // Wait briefly for the in-flight SpeechRecognition to settle so we
+      // can pass its transcript through and skip the server STT roundtrip
+      // entirely. Cap at 500ms — if SR is slower than that something is
+      // off and the server fallback will still produce a transcript.
+      void (async () => {
+        const finished = speechFinishedRef.current;
+        if (finished) {
+          await Promise.race([
+            finished,
+            new Promise<void>((r) => window.setTimeout(r, 500)),
+          ]);
+        }
+        const transcript = speechTranscriptPartsRef.current
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        speechTranscriptPartsRef.current = [];
+        // eslint-disable-next-line no-console
+        console.log(
+          `[sr] → handing off transcript (${transcript ? transcript.length + "ch" : "empty"}) to converseWithObject`
+        );
+        await sendTalkToTrack(target.id, blob, transcript);
+      })();
     };
+
+    // Kick off Web Speech API in parallel. By the time the user releases
+    // the talk button the transcript is usually already final, so we send
+    // it with the request and the server skips its STT call entirely.
+    const SR = getSpeechRecognitionCtor();
+    if (SR) {
+      try {
+        if (speechRecognitionRef.current) {
+          try {
+            speechRecognitionRef.current.abort();
+          } catch {
+            // ignore
+          }
+          speechRecognitionRef.current = null;
+        }
+        speechTranscriptPartsRef.current = [];
+        speechFinishedRef.current = new Promise<void>((resolve) => {
+          resolveSpeechFinishedRef.current = resolve;
+        });
+        const sr = new SR();
+        sr.lang = "en-US";
+        sr.continuous = true;
+        sr.interimResults = false;
+        sr.maxAlternatives = 1;
+        sr.onresult = (e) => {
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const r = e.results[i];
+            if (r.isFinal && r[0]?.transcript) {
+              speechTranscriptPartsRef.current.push(r[0].transcript);
+            }
+          }
+        };
+        sr.onerror = (ev) => {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[sr] ✖ ${ev.error}${ev.message ? ` (${ev.message})` : ""}`
+          );
+        };
+        sr.onend = () => {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[sr] ◼ ended  parts=${speechTranscriptPartsRef.current.length}`
+          );
+          resolveSpeechFinishedRef.current?.();
+          resolveSpeechFinishedRef.current = null;
+          speechRecognitionRef.current = null;
+        };
+        sr.start();
+        speechRecognitionRef.current = sr;
+        // eslint-disable-next-line no-console
+        console.log("[sr] ▶ started (browser-side transcription)");
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[sr] ✖ start failed: ${err instanceof Error ? err.message : String(err)} — falling back to server STT`
+        );
+        speechRecognitionRef.current = null;
+        speechFinishedRef.current = null;
+        resolveSpeechFinishedRef.current = null;
+      }
+    } else {
+      // No Web Speech in this browser — leave the refs unset so onstop
+      // takes the server-STT path.
+      speechFinishedRef.current = null;
+      speechTranscriptPartsRef.current = [];
+    }
+
     recorderRef.current = mr;
     mr.start(100);
     setIsRecording(true);
@@ -2378,6 +2579,16 @@ export function Tracker() {
       }
     }
     recorderRef.current = null;
+    // Tell SpeechRecognition to flush its buffer and emit a final result.
+    // The `onend` handler resolves `speechFinishedRef` which the recorder
+    // onstop is already awaiting (with a 500ms cap) before sending the turn.
+    if (speechRecognitionRef.current) {
+      try {
+        speechRecognitionRef.current.stop();
+      } catch {
+        // ignore — already stopped
+      }
+    }
     setIsRecording(false);
     stopTalkLevelLoop();
   }, [stopTalkLevelLoop]);
@@ -2496,18 +2707,25 @@ export function Tracker() {
                   maskSize: "100% 100%",
                   maskRepeat: "no-repeat",
                   mixBlendMode: FACE_BLEND_MODE,
+                  // drop-shadow projects OUTSIDE the mask silhouette — mixed
+                  // with the video through `hard-light` below, it reads as a
+                  // soft contact darkening around the face, anchoring it to
+                  // the surface instead of floating over it.
+                  filter: "drop-shadow(0 3px 8px rgba(0,0,0,0.35))",
                   opacity: t.opacity,
                 }}
               >
                 {/* Inner: face positioned at its anchor in element coords,
-                    expressed relative to the mask wrapper's origin. */}
+                    expressed relative to the mask wrapper's origin. Rotation
+                    (driven by the object's PCA principal angle) goes between
+                    centering and scale so the pivot stays at the anchor. */}
                 <div
                   style={{
                     position: "absolute",
                     left: t.left - t.maskLeft,
                     top: t.top - t.maskTop,
                     transformOrigin: "0 0",
-                    transform: `translate(-50%, -50%) scale(${t.scale})`,
+                    transform: `translate(-50%, -50%) rotate(${t.rotation}rad) scale(${t.scale})`,
                   }}
                 >
                   <FaceVoice shape={t.shape} />
@@ -2518,7 +2736,7 @@ export function Tracker() {
                 className="pointer-events-none absolute left-0 top-0 will-change-transform"
                 style={{
                   transformOrigin: "0 0",
-                  transform: `translate(${t.left}px, ${t.top}px) translate(-50%, -50%) scale(${t.scale})`,
+                  transform: `translate(${t.left}px, ${t.top}px) translate(-50%, -50%) rotate(${t.rotation}rad) scale(${t.scale})`,
                   opacity: t.opacity,
                 }}
               >
@@ -2840,11 +3058,11 @@ export function Tracker() {
           className="pointer-events-none absolute inset-x-0 top-[132px] flex justify-center px-6"
           style={{ animation: "bubble-in 320ms cubic-bezier(0.16,1,0.3,1) both" }}
         >
-          <div className="flex max-w-md items-center gap-2 rounded-full bg-black/55 px-4 py-1.5 ring-1 ring-white/15 backdrop-blur-xl">
+          <div className="flex max-w-[min(92vw,34rem)] flex-col items-center gap-0.5 rounded-2xl bg-black/55 px-4 py-2 ring-1 ring-white/15 backdrop-blur-xl">
             <span className="text-[10px] uppercase tracking-[0.18em] text-white/55">
               you said
             </span>
-            <span className="serif-italic truncate text-[13px] font-medium text-white/95">
+            <span className="serif-italic text-center text-[13px] font-medium leading-snug text-white/95 break-words">
               {heardText}
             </span>
           </div>

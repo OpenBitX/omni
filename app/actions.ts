@@ -808,7 +808,7 @@ const STT_MODEL_OPENAI =
   process.env.OPENAI_STT_MODEL?.trim() || "gpt-4o-mini-transcribe";
 const STT_LANGUAGE = process.env.OPENAI_STT_LANGUAGE?.trim() || "en";
 
-async function transcribeAudio(blob: Blob): Promise<string> {
+async function transcribeAudio(blob: Blob, turnTag = ""): Promise<string> {
   const openai = getOpenAIClient();
   if (!openai) throw new Error("transcription needs OPENAI_API_KEY");
   const filename =
@@ -821,7 +821,7 @@ async function transcribeAudio(blob: Blob): Promise<string> {
   const t0 = Date.now();
   // eslint-disable-next-line no-console
   console.log(
-    `[stt openai ${STT_MODEL_OPENAI}] → ${Math.round(blob.size / 1024)}KB (${blob.type || "?"}) as ${filename}  lang=${STT_LANGUAGE || "auto"}`
+    `[stt openai ${STT_MODEL_OPENAI}${turnTag}] → ${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  lang=${STT_LANGUAGE || "auto"}`
   );
   const result = await openai.audio.transcriptions.create({
     file,
@@ -831,7 +831,7 @@ async function transcribeAudio(blob: Blob): Promise<string> {
   const text = (result.text ?? "").trim();
   // eslint-disable-next-line no-console
   console.log(
-    `[stt openai ${STT_MODEL_OPENAI}] ← ${Date.now() - t0}ms "${text.slice(0, 120)}${text.length > 120 ? "…" : ""}"`
+    `[stt openai ${STT_MODEL_OPENAI}${turnTag}] ✓ ${Date.now() - t0}ms "${text.slice(0, 120)}${text.length > 120 ? "…" : ""}"`
   );
   return text;
 }
@@ -895,42 +895,52 @@ async function runTextReply(
   return content;
 }
 
-async function openaiTextReply(args: {
-  system: string;
-  userText: string;
-  priorMessages: ChatTurn[];
-  maxTokens: number;
-  temperature: number;
-}): Promise<string> {
+type ReplyBackend = "cerebras" | "openai";
+type ReplyResult = { content: string; backend: ReplyBackend; ms: number };
+
+async function openaiTextReply(
+  args: {
+    system: string;
+    userText: string;
+    priorMessages: ChatTurn[];
+    maxTokens: number;
+    temperature: number;
+  },
+  turnTag = ""
+): Promise<ReplyResult> {
   const cerebras = getCerebrasClient();
   const openai = getOpenAIClient();
   if (!cerebras && !openai) {
     throw new Error("text reply needs CEREBRAS_API_KEY or OPENAI_API_KEY");
   }
   if (cerebras) {
+    const t0 = Date.now();
     try {
-      return await runTextReply(
+      const content = await runTextReply(
         cerebras,
         REPLY_MODEL_CEREBRAS,
-        `[reply cerebras ${REPLY_MODEL_CEREBRAS}]`,
+        `[reply cerebras ${REPLY_MODEL_CEREBRAS}${turnTag}]`,
         args
       );
+      return { content, backend: "cerebras", ms: Date.now() - t0 };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // eslint-disable-next-line no-console
       console.log(
-        `[reply cerebras] ✖ ${msg.slice(0, 160)} — falling back to OpenAI`
+        `[reply cerebras${turnTag}] ✖ ${msg.slice(0, 160)} — falling back to OpenAI`
       );
       if (!openai) throw err;
     }
   }
   if (!openai) throw new Error("no reply backend available");
-  return runTextReply(
+  const t0 = Date.now();
+  const content = await runTextReply(
     openai,
     REPLY_MODEL_OPENAI,
-    `[reply openai ${REPLY_MODEL_OPENAI}]`,
+    `[reply openai ${REPLY_MODEL_OPENAI}${turnTag}]`,
     args
   );
+  return { content, backend: "openai", ms: Date.now() - t0 };
 }
 
 const RESPOND_SYSTEM = (className: string, description: string | null) => {
@@ -1008,27 +1018,34 @@ export async function converseWithObject(
   const clientTranscript = String(formData.get("transcript") ?? "")
     .trim()
     .slice(0, 1000);
+  // Per-press correlation id from the client. Used in every log line for
+  // this turn so you can grep one turn out of an interleaved log.
+  const turnId = (String(formData.get("turnId") ?? "").trim() || "?").slice(
+    0,
+    16
+  );
+  const tag = ` #${turnId}`;
 
   // Audio is still required as a fallback. If client transcription failed
   // we transcribe server-side from the blob.
   if (!(audio instanceof Blob)) {
     // eslint-disable-next-line no-console
-    console.log("[converse] ✖ missing audio");
+    console.log(`[converse${tag}] ✖ missing audio`);
     throw new Error("missing audio");
   }
   // eslint-disable-next-line no-console
   console.log(
-    `[converse] ▶ start  class="${className}"  audio=${Math.round(audio.size / 1024)}KB (${audio.type || "?"})  voice=${voiceId ?? "default"}  history=${history.length}  desc=${description ? description.length + "ch" : "none"}  client-stt=${clientTranscript ? "yes" : "no"}`
+    `[converse${tag}] ▶ class="${className}"  voice=${voiceById(voiceId)?.name ?? voiceId ?? "default"}  audio=${Math.round(audio.size / 1024)}KB (${audio.type || "?"})  hist=${history.length}  desc=${description ? description.length + "ch" : "none"}  client-stt=${clientTranscript ? "yes" : "no"}`
   );
 
   if (audio.size < 1024) {
     // eslint-disable-next-line no-console
-    console.log(`[converse] ✖ recording too short (${audio.size}B)`);
+    console.log(`[converse${tag}] ✖ recording too short (${audio.size}B)`);
     throw new Error("recording too short");
   }
   if (audio.size > 10_000_000) {
     // eslint-disable-next-line no-console
-    console.log(`[converse] ✖ recording too large (${audio.size}B)`);
+    console.log(`[converse${tag}] ✖ recording too large (${audio.size}B)`);
     throw new Error("recording too large");
   }
 
@@ -1036,37 +1053,49 @@ export async function converseWithObject(
 
   // Use the client transcript when present; fall back to server STT.
   let transcript: string;
+  let sttBackend: "client" | "openai";
+  const sttStart = Date.now();
   if (clientTranscript) {
     transcript = clientTranscript;
+    sttBackend = "client";
     // eslint-disable-next-line no-console
-    console.log(`[stt client] ← "${transcript.slice(0, 120)}${transcript.length > 120 ? "…" : ""}"`);
+    console.log(
+      `[stt client${tag}] ✓ 0ms "${transcript.slice(0, 120)}${transcript.length > 120 ? "…" : ""}"`
+    );
   } else {
-    transcript = await transcribeAudio(audio);
+    transcript = await transcribeAudio(audio, tag);
+    sttBackend = "openai";
   }
+  const sttMs = Date.now() - sttStart;
   if (!transcript) {
     // eslint-disable-next-line no-console
-    console.log(`[converse] ◀ empty transcript — returning "hmm?"  total=${Date.now() - t0}ms`);
+    console.log(
+      `[converse${tag}] ✓ TOTAL=${Date.now() - t0}ms ━ stt=${sttBackend}/${sttMs}ms (empty)  → reply="hmm?"`
+    );
     return { transcript: "", reply: "hmm?", voiceId: resolvedVoice };
   }
 
   // Fast text-only LLM. The visual context the reply needs lives in the
   // `description` string we hydrated in the background — no need to pay
   // VLM latency on the hot path.
-  const raw = await openaiTextReply({
-    system: RESPOND_SYSTEM(className, description),
-    userText: transcript,
-    priorMessages: history,
-    maxTokens: 120,
-    temperature: 0.95,
-  });
-  const reply = extractTextLine(raw);
+  const replyResult = await openaiTextReply(
+    {
+      system: RESPOND_SYSTEM(className, description),
+      userText: transcript,
+      priorMessages: history,
+      maxTokens: 120,
+      temperature: 0.95,
+    },
+    tag
+  );
+  const reply = extractTextLine(replyResult.content);
   if (!reply) throw new Error("empty reply from model");
-  // TTS is no longer synthesized here — the client posts {reply, voiceId}
-  // to /api/tts/stream and plays audio as it arrives. Cuts ~600–1500ms of
-  // dead air between "LLM finished" and "mouth starts moving".
+  // Single end-of-turn summary line — easy to scan, easy to screenshot.
+  // TTS happens client-side on /api/tts/stream so it's not in this budget.
+  const total = Date.now() - t0;
   // eslint-disable-next-line no-console
   console.log(
-    `[converse] ◀ done  reply="${reply}"  voice=${resolvedVoice ?? "none"}  total=${Date.now() - t0}ms`
+    `[converse${tag}] ✓ TOTAL=${total}ms ━ stt=${sttBackend}/${sttMs}ms ▸ llm=${replyResult.backend}/${replyResult.ms}ms  reply="${reply.slice(0, 80)}${reply.length > 80 ? "…" : ""}"`
   );
   return { transcript, reply, voiceId: resolvedVoice };
 }
