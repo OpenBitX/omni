@@ -21,11 +21,16 @@ export async function POST(req: Request) {
   // eslint-disable-next-line no-console
   console.log(`[api/assess${tagStr}] ▶ start`);
   try {
+    const learnLang =
+      body.learnLang === "zh" || body.learnLang === "en"
+        ? body.learnLang
+        : undefined;
     const res = await assessObject(
       body.imageDataUrl,
       Number(body.tapX) || 0,
       Number(body.tapY) || 0,
-      tag
+      tag,
+      learnLang
     );
     // eslint-disable-next-line no-console
     console.log(

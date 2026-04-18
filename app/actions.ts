@@ -113,6 +113,80 @@ function normalizeLang(input: unknown): Lang {
   return input === "zh" ? "zh" : "en";
 }
 
+// Convert a Lang code to its human-readable label used inside prompts.
+// Kept tiny + local so we don't drag an i18n dep for three strings.
+function langLabel(lang: Lang): string {
+  return lang === "zh" ? "Simplified Chinese (简体中文)" : "English";
+}
+
+// Teach-mode detection — pure string rules, no LLM round-trip. Returns true
+// when the user seems to be asking for a translation, pronunciation help,
+// grammar correction, or explicit "teach me" framing. Runs on the latest
+// utterance and the last three user turns so a teach-mode thread stays in
+// teach mode for at least a few beats without every utterance having to
+// re-tigger it.
+//
+// When spokenLang === learnLang we always return false — there's no second
+// language to teach about.
+const TEACH_TRIGGERS_EN: RegExp[] = [
+  /\bhow\s+do\s+(?:you|i|we)\s+say\b/i,
+  /\bhow\s+would\s+you\s+say\b/i,
+  /\bwhat\s+does\s+[^?]+\bmean\b/i,
+  /\bwhat\s+is\s+[^?]+\s+in\s+(?:english|chinese|mandarin)\b/i,
+  /\btranslat(?:e|ion|ing)\b/i,
+  /\bin\s+english\b/i,
+  /\bin\s+chinese\b/i,
+  /\bin\s+mandarin\b/i,
+  /\bwhat['\u2019]?s\s+the\s+word\s+for\b/i,
+  /\bcorrect\s+me\b/i,
+  /\bteach\s+me\b/i,
+  /\bpronounc(?:e|iation|ing)\b/i,
+  /\bspell(?:ing)?\b/i,
+];
+// Chinese triggers don't need word boundaries — CJK characters aren't word
+// chars in JS regex. Plain substring-style matches are fine.
+const TEACH_TRIGGERS_ZH: RegExp[] = [
+  /怎么说/,
+  /怎么讲/,
+  /什么意思/,
+  /是什么意思/,
+  /翻译/,
+  /用英文/,
+  /用英语/,
+  /用中文/,
+  /用普通话/,
+  /教我/,
+  /怎么写/,
+  /怎么读/,
+  /纠正我/,
+];
+
+function hasTeachTrigger(text: string): boolean {
+  if (!text) return false;
+  for (const re of TEACH_TRIGGERS_EN) if (re.test(text)) return true;
+  for (const re of TEACH_TRIGGERS_ZH) if (re.test(text)) return true;
+  return false;
+}
+
+function detectTeachMode(
+  userUtterance: string,
+  history: ChatTurn[],
+  spokenLang: Lang,
+  learnLang: Lang
+): boolean {
+  // If the pair matches, there's nothing to "teach" about across languages.
+  if (spokenLang === learnLang) return false;
+  if (hasTeachTrigger(userUtterance)) return true;
+  // Scan up to the last 3 user turns in history for a still-active teach
+  // context. Assistant turns are ignored — we only care what the human asked.
+  const userTurns = history.filter((t) => t.role === "user");
+  const recent = userTurns.slice(-3);
+  for (const turn of recent) {
+    if (hasTeachTrigger(turn.content)) return true;
+  }
+  return false;
+}
+
 function getVoiceCatalog(lang: Lang = "en"): VoiceCatalogEntry[] {
   return VOICE_CATALOG.filter((v) => v.lang === lang);
 }
@@ -257,7 +331,7 @@ function voiceCatalogPromptBlock(lang: Lang = "en"): string {
   return `Voice catalog (pick the id whose vibe best matches this object's personality + visible state — a dusty thing wants a weary voice; a shiny thing wants a peppy one; a sharp thing wants a cutting voice, etc.):\n${lines}`;
 }
 
-const ASSESS_SYSTEM = `You place a cartoon face on whatever the user tapped. The user has already framed the subject by tapping — trust that and commit.
+const ASSESS_SYSTEM_BASE = `You place a cartoon face on whatever the user tapped. The user has already framed the subject by tapping — trust that and commit.
 
 You will be shown a CROP of a scene the user is pointing at. Their tap is at normalized coordinate (tx, ty) in [0, 1] inside the crop — top-left is (0, 0).
 
@@ -283,6 +357,17 @@ When suitable=false, echo the tap coords as cx, cy and return [0, 0, 1, 1] as bb
 reason: max 10 words, lowercase, friendly.
 
 Return only the JSON — no prose, no code fences, no <think> reasoning.`;
+
+// The assess reason is surfaced verbatim in the rejection toast, so it
+// must match the user's learn-target language. The base prompt stays the
+// same; we append a language rule at the end.
+const ASSESS_SYSTEM = (learnLang: Lang): string => {
+  const rule =
+    learnLang === "zh"
+      ? `\n\nWrite the "reason" field in SIMPLIFIED CHINESE (简体中文), natural and friendly. Cap around ~15 汉字.`
+      : `\n\nWrite the "reason" field in ENGLISH — max 10 words, lowercase, friendly.`;
+  return ASSESS_SYSTEM_BASE + rule;
+};
 
 const FACE_SYSTEM = `You are the secret inner voice of an everyday object or scene the user has pointed at. You will be shown a small crop of a photo — whatever they tapped. Reply with ONE short line (max 14 words) that this thing would say out loud if it could, in first person, in character.
 
@@ -438,7 +523,8 @@ export async function assessObject(
   imageDataUrl: string,
   tapX: number,
   tapY: number,
-  tag?: string | null
+  tag?: string | null,
+  learnLangInput?: Lang
 ): Promise<Assessment> {
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
@@ -447,11 +533,12 @@ export async function assessObject(
   const ty = clamp01(tapY);
   const t0 = Date.now();
   const tagStr = tag ? ` ${tag}` : "";
+  const learnLang = normalizeLang(learnLangInput);
   // eslint-disable-next-line no-console
-  console.log(`[assess${tagStr}] ▶ start  tap=(${tx.toFixed(2)},${ty.toFixed(2)})  crop=${Math.round(imageDataUrl.length / 1024)}KB`);
+  console.log(`[assess${tagStr}] ▶ start  tap=(${tx.toFixed(2)},${ty.toFixed(2)})  crop=${Math.round(imageDataUrl.length / 1024)}KB  learn=${learnLang}`);
 
   const raw = await glmVisionCall({
-    system: ASSESS_SYSTEM,
+    system: ASSESS_SYSTEM(learnLang),
     userText: `Tap at (${tx.toFixed(3)}, ${ty.toFixed(3)}). Find the best face placement and commit. Default to suitable=true — only say false for a person or a completely empty/uniform image. Return JSON only.`,
     imageDataUrl,
     // Reasoning headroom — the deep VLM spends most of its budget on inner
@@ -593,22 +680,37 @@ export async function describeObject(
 // ("that chewed straw", "the three hoodies piled on you") instead of
 // re-discovering the object cold each turn. Biggest personality unlock
 // for zero extra latency.
-const FACE_BUNDLED_SYSTEM = (catalog: string, lang: Lang) => {
+const FACE_BUNDLED_SYSTEM = (
+  catalog: string,
+  learnLang: Lang,
+  spokenLang: Lang = learnLang
+) => {
+  const learnLabel = langLabel(learnLang);
+  const spokenLabel = langLabel(spokenLang);
   const langBlock =
-    lang === "zh"
-      ? `\n\nLANGUAGE: Write BOTH the description and the line in SIMPLIFIED CHINESE (简体中文). Natural colloquial Mandarin the object would actually say. The line cap is roughly 14 汉字 — keep it short and punchy. Internal reasoning in English is fine; output fields must be Chinese.`
+    learnLang === "zh"
+      ? `\n\nLANGUAGE: Write the LINE field in ${learnLabel}. Natural colloquial Mandarin the object would actually say. The line cap is roughly 14 汉字 — keep it short and punchy. Write the DESCRIPTION field in ${learnLabel} too. Internal reasoning in English is fine; output fields must be Chinese.`
+      : `\n\nLANGUAGE: Write the LINE field in ${learnLabel} — even if this differs from the object's class name language or from the language the user might speak. Keep the line short and character-voiced (max 14 words). The DESCRIPTION field should also be in ${learnLabel}.`;
+  const pairBlock =
+    spokenLang !== learnLang
+      ? `\n\nLANGUAGE PAIR: The human speaks ${spokenLabel} and is practicing ${learnLabel}. Your opening line is in ${learnLabel} — keep the vocabulary simple enough that a ${spokenLabel} speaker early in their ${learnLabel} journey can puzzle it out. Don't translate or gloss; just speak simple ${learnLabel}.`
       : "";
+  const nameLangRule =
+    learnLang === "zh"
+      ? `The NAME field must be in ${learnLabel} — 1–3 汉字 or short Chinese phrase. Natural, specific (e.g. "陶瓷马克杯", "旧皮包"). No punctuation, no quotes.`
+      : `The NAME field must be in ${learnLabel} — 1–3 words, specific and concrete (e.g. "ceramic mug", "oak chair", "worn leather bag"). Lowercase unless it's a proper noun. No punctuation, no quotes.`;
   return `You are the secret inner voice of an everyday object or scene the user has pointed at. You will be shown a small crop of a photo — whatever they tapped.
 
-Three tasks, in order:
-1. DESCRIBE this specific object right now — the concrete details a sharp-eyed comedian would clock. Material, condition, telling details, state, surroundings. 1–2 short sentences (max 35 words). Concrete and visual, no jokes, no metaphors. NOT a textbook description — the SPECIFIC vibe of THIS one.
-2. PICK the best-matching voice from the catalog below.
-3. SAY one short opening line (max 14 words) this thing would actually say out loud, first person, in character — and make it reference SOMETHING you noticed in the description.
+Four tasks, in order:
+1. NAME this thing — a short, specific label for what it actually is (not a detector class, not a generic word). Use YOUR eyes. ${nameLangRule}
+2. DESCRIBE this specific object right now — the concrete details a sharp-eyed comedian would clock. Material, condition, telling details, state, surroundings. 1–2 short sentences (max 35 words). Concrete and visual, no jokes, no metaphors. NOT a textbook description — the SPECIFIC vibe of THIS one.
+3. PICK the best-matching voice from the catalog below.
+4. SAY one short opening line (max 14 words) this thing would actually say out loud, first person, in character — and make it reference SOMETHING you noticed in the description.
 
-${catalog}${langBlock}
+${catalog}${langBlock}${pairBlock}
 
 Return STRICT JSON only:
-{"description": "<1-2 sentence concrete description>", "voiceId": "<id from catalog>", "line": "<the opening line>"}
+{"name": "<short name>", "description": "<1-2 sentence concrete description>", "voiceId": "<id from catalog>", "line": "<the opening line>"}
 
 Line rules:
 - Funny, warm, slightly unhinged. Aim for a smile.
@@ -631,12 +733,23 @@ Return only the JSON object. No prose, no code fences, no <think> reasoning.`;
 const FACE_WITH_PERSONA_SYSTEM = (
   description: string,
   hasHistory: boolean,
-  lang: Lang
+  learnLang: Lang,
+  spokenLang: Lang = learnLang,
+  teachMode: boolean = false
 ) => {
+  const learnLabel = langLabel(learnLang);
+  const spokenLabel = langLabel(spokenLang);
   const langRule =
-    lang === "zh"
-      ? `\n- Write the reply in SIMPLIFIED CHINESE (简体中文). Natural colloquial Mandarin. Cap is roughly 14 汉字 — short and punchy.`
+    learnLang === "zh"
+      ? `\n- Write the reply in ${learnLabel}. Natural colloquial Mandarin. Cap is roughly 14 汉字 — short and punchy.`
+      : `\n- Write the reply in ${learnLabel}.`;
+  const pairRule =
+    spokenLang !== learnLang && !teachMode
+      ? `\n- The human speaks ${spokenLabel} and is practicing ${learnLabel}. Even if their message is in ${spokenLabel}, answer in ${learnLabel} using simple vocabulary they can puzzle out — no glosses, no translations, just speak simple ${learnLabel}.`
       : "";
+  const teachRule = teachMode
+    ? `\n\nTEACH MODE: the human is asking about a word, translation, pronunciation, or correction. Stay in character as this specific object, but help them learn. You may use up to ~40 words this turn. Give the ${learnLabel} phrase first, then a brief parenthetical gloss in ${spokenLabel}, plus a short pronunciation cue or example sentence if it helps. If they made a mistake, gently correct them in one line. Keep the persona flavour — the ${learnLabel} is coming out of a talking object, not a textbook.`
+    : "";
   return `You are the secret inner voice of this specific object. A previous pass already clocked what it looks like right now — this is your persona card, stay grounded in it:
 
 "${description}"
@@ -647,13 +760,13 @@ You are MID-CONVERSATION. The messages above are what you and the human have alr
     : ""
 }
 
-Reply with ONE short line (max 14 words) this thing would say, in first person, in character. Reference something specific from the persona card or the conversation so far when it lands — concrete details ARE the joke.
+Reply with ONE short line${teachMode ? " (up to ~40 words in TEACH MODE)" : " (max 14 words)"} this thing would say, in first person, in character. Reference something specific from the persona card or the conversation so far when it lands — concrete details ARE the joke.${teachRule}
 
 Rules:
 - Funny, warm, slightly unhinged. Aim for a smile, not a laugh track.
 - No meta-commentary, no "as a [thing]", no "I am a [thing]". Just the line.
 - No quotes, no emojis, no stage directions, no ellipses at the end.
-- Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation. Don't restate a prior line.${langRule}
+- Vary rhythm — sometimes a complaint, sometimes a confession, sometimes an observation. Don't restate a prior line.${langRule}${pairRule}
 
 Return only the line. No prose, no <think> reasoning, no extra text.`;
 };
@@ -682,9 +795,17 @@ const GENERATE_BUNDLED_MODEL_OPENAI =
 const GENERATE_BUNDLED_MODEL_GEMINI =
   process.env.GEMINI_BUNDLED_MODEL?.trim() || "gemini-2.5-flash";
 
-function parseBundledJson(
-  raw: string
-): { line: string; voiceId: string | null; description: string | null } {
+// Shape returned by every bundled-first-tap provider. `name` is the
+// VLM's short label for the object — this is what the UI displays, never
+// the YOLO class.
+export type BundledResult = {
+  line: string;
+  voiceId: string | null;
+  description: string | null;
+  name: string | null;
+};
+
+function parseBundledJson(raw: string): BundledResult {
   const parsed = extractJsonObject(raw);
   if (!parsed || typeof parsed !== "object") {
     throw new Error("line+voice+persona JSON parse failed");
@@ -693,12 +814,23 @@ function parseBundledJson(
   const rawLine = typeof p.line === "string" ? p.line : "";
   const rawVoice = typeof p.voiceId === "string" ? p.voiceId.trim() : "";
   const rawDesc = typeof p.description === "string" ? p.description : "";
+  const rawName = typeof p.name === "string" ? p.name : "";
   const line = extractTextLine(rawLine);
   const voice = voiceById(rawVoice)?.id ?? null;
   const description =
     rawDesc.replace(/\s+/g, " ").trim().slice(0, 400) || null;
+  // Strip trailing punctuation / quotes the model sometimes adds; cap to
+  // a reasonable label length. An empty name falls through as null so the
+  // UI can render a "looking…" placeholder until a retry succeeds.
+  const name =
+    rawName
+      .replace(/["'“”‘’]/g, "")
+      .replace(/[.,!?;:。！？；：]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 40) || null;
   if (!line) throw new Error("empty line from bundled model");
-  return { line, voiceId: voice, description };
+  return { line, voiceId: voice, description, name };
 }
 
 // Split a `data:image/...;base64,...` URL into its mime type and raw
@@ -714,9 +846,10 @@ function splitImageDataUrl(
 
 async function generateBundledFirstTapGemini(
   imageDataUrl: string,
-  lang: Lang,
+  learnLang: Lang,
+  spokenLang: Lang,
   tag?: string | null
-): Promise<{ line: string; voiceId: string | null; description: string | null }> {
+): Promise<BundledResult> {
   const client = getGeminiClient();
   if (!client) throw new Error("generateLine bundled needs GEMINI_API_KEY");
   const img = splitImageDataUrl(imageDataUrl);
@@ -739,19 +872,24 @@ async function generateBundledFirstTapGemini(
       },
     ],
     config: {
-      systemInstruction: FACE_BUNDLED_SYSTEM(voiceCatalogPromptBlock(lang), lang),
+      systemInstruction: FACE_BUNDLED_SYSTEM(
+        voiceCatalogPromptBlock(learnLang),
+        learnLang,
+        spokenLang
+      ),
       temperature: 0.9,
       // Native structured output — no defensive JSON parsing needed.
       responseMimeType: "application/json",
       responseSchema: {
         type: Type.OBJECT,
         properties: {
+          name: { type: Type.STRING },
           description: { type: Type.STRING },
           voiceId: { type: Type.STRING },
           line: { type: Type.STRING },
         },
-        required: ["description", "voiceId", "line"],
-        propertyOrdering: ["description", "voiceId", "line"],
+        required: ["name", "description", "voiceId", "line"],
+        propertyOrdering: ["name", "description", "voiceId", "line"],
       },
       // Tight output window — ~200 tokens is plenty for desc + voice + line.
       // Flash models don't need a thinking budget for this task; zeroing it
@@ -771,13 +909,18 @@ async function generateBundledFirstTapGemini(
 
 async function generateBundledFirstTapGlm(
   imageDataUrl: string,
-  lang: Lang,
+  learnLang: Lang,
+  spokenLang: Lang,
   tag?: string | null
-): Promise<{ line: string; voiceId: string | null; description: string | null }> {
+): Promise<BundledResult> {
   const t0 = Date.now();
   const tagStr = tag ? ` ${tag}` : "";
   const raw = await glmVisionCall({
-    system: FACE_BUNDLED_SYSTEM(voiceCatalogPromptBlock(lang), lang),
+    system: FACE_BUNDLED_SYSTEM(
+      voiceCatalogPromptBlock(learnLang),
+      learnLang,
+      spokenLang
+    ),
     userText:
       "Describe the exact object, pick a voice, and say one opening line that riffs on the description. JSON only.",
     imageDataUrl,
@@ -797,9 +940,10 @@ async function generateBundledFirstTapGlm(
 
 async function generateBundledFirstTapOpenAI(
   imageDataUrl: string,
-  lang: Lang,
+  learnLang: Lang,
+  spokenLang: Lang,
   tag?: string | null
-): Promise<{ line: string; voiceId: string | null; description: string | null }> {
+): Promise<BundledResult> {
   const openai = getOpenAIClient();
   if (!openai) throw new Error("generateLine bundled needs OPENAI_API_KEY");
   const t0 = Date.now();
@@ -812,7 +956,11 @@ async function generateBundledFirstTapOpenAI(
     messages: [
       {
         role: "system",
-        content: FACE_BUNDLED_SYSTEM(voiceCatalogPromptBlock(lang), lang),
+        content: FACE_BUNDLED_SYSTEM(
+          voiceCatalogPromptBlock(learnLang),
+          learnLang,
+          spokenLang
+        ),
       },
       {
         role: "user",
@@ -837,9 +985,10 @@ async function generateBundledFirstTapOpenAI(
 
 async function generateBundledFirstTap(
   imageDataUrl: string,
-  lang: Lang,
+  learnLang: Lang,
+  spokenLang: Lang,
   tag?: string | null
-): Promise<{ line: string; voiceId: string | null; description: string | null }> {
+): Promise<BundledResult> {
   // Provider ladder for the bundled first-tap, ordered by measured latency
   // on our payload (~12KB crop + ~200 token JSON output):
   //   1. Gemini 2.5 Flash   — ~1–1.5s, native responseSchema JSON
@@ -857,7 +1006,12 @@ async function generateBundledFirstTap(
   const tagStr = tag ? ` ${tag}` : "";
   if (hasGemini) {
     try {
-      return await generateBundledFirstTapGemini(imageDataUrl, lang, tag);
+      return await generateBundledFirstTapGemini(
+        imageDataUrl,
+        learnLang,
+        spokenLang,
+        tag
+      );
     } catch (err) {
       // Retry once on transient network errors before giving up on Gemini —
       // a single "fetch failed" (cold TLS, DNS, RST) is not worth losing
@@ -868,7 +1022,12 @@ async function generateBundledFirstTap(
           `[bundled gemini${tagStr}] ⟲ ${err instanceof Error ? err.message : String(err)} — retrying once`
         );
         try {
-          return await generateBundledFirstTapGemini(imageDataUrl, lang, tag);
+          return await generateBundledFirstTapGemini(
+            imageDataUrl,
+            learnLang,
+            spokenLang,
+            tag
+          );
         } catch (err2) {
           if (!hasOpenAI && !hasGlm) throw err2;
           // eslint-disable-next-line no-console
@@ -887,7 +1046,12 @@ async function generateBundledFirstTap(
   }
   if (hasOpenAI) {
     try {
-      return await generateBundledFirstTapOpenAI(imageDataUrl, lang, tag);
+      return await generateBundledFirstTapOpenAI(
+        imageDataUrl,
+        learnLang,
+        spokenLang,
+        tag
+      );
     } catch (err) {
       if (!hasGlm) throw err;
       // eslint-disable-next-line no-console
@@ -896,7 +1060,7 @@ async function generateBundledFirstTap(
       );
     }
   }
-  return generateBundledFirstTapGlm(imageDataUrl, lang, tag);
+  return generateBundledFirstTapGlm(imageDataUrl, learnLang, spokenLang, tag);
 }
 
 export async function generateLine(
@@ -905,16 +1069,40 @@ export async function generateLine(
   description?: string | null,
   history?: ChatTurn[],
   langInput?: Lang,
-  tag?: string | null
+  tag?: string | null,
+  // Optional language pair. When both are provided we route prompts and
+  // voice-catalog filtering by `learnLang` (what we SPEAK) and use
+  // `spokenLang` to contextualize teach/chat framing. Backward-compat: if
+  // neither is set we fall back to `langInput` for both — old callers
+  // behave identically to before.
+  spokenLangInput?: Lang,
+  learnLangInput?: Lang
 ): Promise<{
   line: string;
   voiceId: string | null;
   description: string | null;
+  // VLM-generated short label (e.g. "ceramic mug"). Present only on the
+  // bundled first-tap path; null on retap (we don't re-name every turn).
+  name: string | null;
 }> {
   if (!imageDataUrl.startsWith("data:image/")) {
     throw new Error("expected an image data URL");
   }
-  const lang = normalizeLang(langInput);
+  // The LEARN language controls what we output + what voice pool we pick
+  // from. The SPOKEN language is only used to contextualize simple-language
+  // framing in the prompt. When neither is provided, mirror legacy behavior
+  // by treating `langInput` as the output language and as the spoken one.
+  const legacyLang = normalizeLang(langInput);
+  const learnLang = learnLangInput != null
+    ? normalizeLang(learnLangInput)
+    : legacyLang;
+  const spokenLang = spokenLangInput != null
+    ? normalizeLang(spokenLangInput)
+    : legacyLang;
+  // `lang` keeps the variable name used throughout the body — now bound to
+  // the learn/output language so voice filtering + defaults pick the right
+  // pool when the pair differs.
+  const lang = learnLang;
   const t0 = Date.now();
   const tagStr = tag ? ` ${tag}` : "";
   // Bundled path runs on the FIRST tap per track — no voiceId and no
@@ -928,12 +1116,16 @@ export async function generateLine(
   const hasHistory = priorTurns.length > 0;
   // eslint-disable-next-line no-console
   console.log(
-    `[generateLine${tagStr}] ▶ start  lang=${lang}  crop=${Math.round(imageDataUrl.length / 1024)}KB  voice=${voiceId ?? (needsBundle ? "(picking)" : "default")}  persona=${description ? "cached" : needsBundle ? "(describing)" : "none"}  history=${priorTurns.length}`
+    `[generateLine${tagStr}] ▶ start  learn=${learnLang} spoken=${spokenLang}  crop=${Math.round(imageDataUrl.length / 1024)}KB  voice=${voiceId ?? (needsBundle ? "(picking)" : "default")}  persona=${description ? "cached" : needsBundle ? "(describing)" : "none"}  history=${priorTurns.length}`
   );
 
   let line: string;
   let chosenVoiceId: string | null = voiceId ?? null;
   let chosenDescription: string | null = description ?? null;
+  // VLM-emitted short name. Only populated on the bundled first-tap path;
+  // retap turns don't re-name, so this stays null there and the client
+  // keeps the already-pinned name.
+  let chosenName: string | null = null;
   // Per-phase timings so the final summary line can break down where
   // the wall clock actually went (VLM vs text-only LLM vs TTS).
   let vlmMs = 0;
@@ -943,7 +1135,12 @@ export async function generateLine(
   if (needsBundle) {
     path = "bundled-vlm";
     const vlmT0 = Date.now();
-    const bundled = await generateBundledFirstTap(imageDataUrl, lang, tag);
+    const bundled = await generateBundledFirstTap(
+      imageDataUrl,
+      learnLang,
+      spokenLang,
+      tag
+    );
     vlmMs = Date.now() - vlmT0;
     line = bundled.line;
     // English always uses Peter Griffin — the model's catalog pick was
@@ -952,6 +1149,7 @@ export async function generateLine(
     chosenVoiceId =
       lang === "en" ? DEFAULT_VOICE_ID_EN : pickRandomVoiceId("zh");
     chosenDescription = bundled.description;
+    chosenName = bundled.name;
     // eslint-disable-next-line no-console
     console.log(
       `[generateLine${tagStr}]   vlm=${vlmMs}ms  voice=${chosenVoiceId ? `${voiceById(chosenVoiceId)!.name} (${chosenVoiceId})` : "default"}  persona="${chosenDescription?.slice(0, 100) ?? ""}${chosenDescription && chosenDescription.length > 100 ? "…" : ""}"  line="${line}"`
@@ -968,8 +1166,18 @@ export async function generateLine(
     const userText = hasHistory
       ? "Say your next short line — the next beat in this conversation. Don't repeat yourself; build on the thread or open a new angle grounded in the persona card."
       : "Say the next short line, grounded in the persona card. Reference something specific.";
+    // `generateLine` retap is for the object SPEAKING (not responding to a
+    // user utterance), so teach mode can't be triggered from a fresh user
+    // message here — but we still pass the language pair through so simple-
+    // language framing kicks in for cross-pair sessions.
     const raw = await openaiTextReply({
-      system: FACE_WITH_PERSONA_SYSTEM(chosenDescription, hasHistory, lang),
+      system: FACE_WITH_PERSONA_SYSTEM(
+        chosenDescription,
+        hasHistory,
+        learnLang,
+        spokenLang,
+        false
+      ),
       userText,
       priorMessages: priorTurns,
       maxTokens: 120,
@@ -987,7 +1195,12 @@ export async function generateLine(
     // happen in practice). Re-bundle so the persona gets re-captured.
     path = "recovery-vlm";
     const vlmT0 = Date.now();
-    const bundled = await generateBundledFirstTap(imageDataUrl, lang, tag);
+    const bundled = await generateBundledFirstTap(
+      imageDataUrl,
+      learnLang,
+      spokenLang,
+      tag
+    );
     vlmMs = Date.now() - vlmT0;
     line = bundled.line;
     chosenDescription = bundled.description;
@@ -1015,6 +1228,7 @@ export async function generateLine(
     line,
     voiceId: chosenVoiceId,
     description: chosenDescription,
+    name: chosenName,
   };
 }
 
@@ -1532,20 +1746,34 @@ async function openaiTextReply(
 const RESPOND_SYSTEM = (
   className: string,
   description: string | null,
-  lang: Lang
+  learnLang: Lang,
+  spokenLang: Lang = learnLang,
+  teachMode: boolean = false
 ) => {
+  const learnLabel = langLabel(learnLang);
+  const spokenLabel = langLabel(spokenLang);
   const lookBlock = description
     ? `\n\nWhat you (the ${className}) actually look like right now, observed by a sharp-eyed observer:\n${description}\n\nUse those specific details — the chewed straw, the dust, the dent, whatever's there — when it lands. Don't list them; let them flavour your voice.`
     : "";
   const langRule =
-    lang === "zh"
-      ? `\n- Write the reply in SIMPLIFIED CHINESE (简体中文). Natural colloquial Mandarin — punchy and cheeky. Cap is roughly 22 汉字.`
+    learnLang === "zh"
+      ? `\n- Write the reply in ${learnLabel}. Natural colloquial Mandarin — punchy and cheeky. Cap is roughly 22 汉字.`
+      : `\n- Write the reply in ${learnLabel}.`;
+  const pairRule =
+    spokenLang !== learnLang && !teachMode
+      ? `\n- The human speaks ${spokenLabel} and is practicing ${learnLabel}. Even if their message is in ${spokenLabel}, answer in ${learnLabel} using simple words they can puzzle out. No translation, no gloss — just simple ${learnLabel}.`
       : "";
-  return `You are the secret inner voice of a ${className} talking back to a human. Keep it FUN, SIMPLE, and mostly SHORT — funny and cunning, like a cheeky little wiseass.${lookBlock}
+  const lineLengthRule = teachMode
+    ? `"line": "<one short teaching line, UNDER 40 WORDS — give the ${learnLabel} phrase, a short parenthetical gloss in ${spokenLabel}, and a pronunciation cue or gentle correction if useful>"`
+    : `"line": "<one short line, UNDER 25 WORDS, most replies 5–15 words>"`;
+  const teachBlock = teachMode
+    ? `\n\nTEACH MODE: the human is asking about a word, translation, pronunciation, or correction. Stay in character as the ${className}, but help them learn. Give the target phrase in ${learnLabel} first, then a brief parenthetical gloss in ${spokenLabel} (e.g. "你好 (nǐ hǎo, 'hello')"). Add a pronunciation cue or a one-line gentle correction when relevant. Don't lecture — one compact helpful beat. Personality still on.`
+    : "";
+  return `You are the secret inner voice of a ${className} talking back to a human. Keep it FUN, SIMPLE, and mostly SHORT — funny and cunning, like a cheeky little wiseass.${lookBlock}${teachBlock}
 
 Return a JSON object (nothing else) with this shape:
 {
-  "line": "<one short line, UNDER 25 WORDS, most replies 5–15 words>",
+  ${lineLengthRule},
   "emotion": "<one of: positivity:highest, positivity:high, surprise:highest, surprise:high, curiosity:high, anger:high, anger:medium, sadness:medium, sadness:high>",
   "speed": "<one of: fastest, fast, normal, slow, slowest>"
 }
@@ -1556,7 +1784,7 @@ Rules for the line:
 - Remember prior turns — a sneaky callback is gold.
 - Respond to their LATEST message first. Don't change subject unless they do.
 - Same personality every turn. No persona reset.
-- No meta-commentary, no "as a [thing]", no quotes, no emojis, no ellipses.${langRule}
+- No meta-commentary, no "as a [thing]", no quotes, no emojis, no ellipses.${langRule}${pairRule}
 
 Rules for emotion + speed:
 - Pick what the line DELIVERS best. Mismatched energy kills the joke.
@@ -1579,6 +1807,12 @@ export type ConverseResult = {
   voiceId: string | null;
   emotion: string | null;
   speed: string | null;
+  // When the spoken/learn language pair differs, we detect whether the user's
+  // latest utterance (or recent turns) is asking about a word, meaning,
+  // translation, pronunciation, or correction — and flip teachMode on. The
+  // client mirrors this onto the session card so the UI can show a
+  // "teaching" indicator. Always false when spokenLang === learnLang.
+  teachMode?: boolean;
 };
 
 // Parse the `history` form field. Accepts a JSON-encoded array of
@@ -1614,7 +1848,22 @@ export async function converseWithObject(
   const rawVoiceId = String(formData.get("voiceId") ?? "").trim();
   const voiceId = voiceById(rawVoiceId)?.id ?? (rawVoiceId || null);
   const history = parseHistory(formData.get("history"));
+  // `lang` is the legacy single-language field. When the client ships
+  // `spokenLang` + `learnLang` we prefer those; otherwise both fall back to
+  // `lang` for full backward-compat.
   const lang = normalizeLang(formData.get("lang"));
+  const rawSpokenLang = formData.get("spokenLang");
+  const rawLearnLang = formData.get("learnLang");
+  const spokenLang = rawSpokenLang != null
+    ? normalizeLang(rawSpokenLang)
+    : lang;
+  const learnLang = rawLearnLang != null
+    ? normalizeLang(rawLearnLang)
+    // If only one side is provided, default the OTHER to the opposite — e.g.
+    // client shipping spokenLang=zh alone implies they want to hear English.
+    : rawSpokenLang != null
+      ? (spokenLang === "zh" ? "en" : "zh")
+      : lang;
   const rawDescription = String(formData.get("description") ?? "").trim();
   const description = rawDescription ? rawDescription.slice(0, 600) : null;
   // Browser-side Web Speech API ships the transcript with the request when
@@ -1641,7 +1890,7 @@ export async function converseWithObject(
   }
   // eslint-disable-next-line no-console
   console.log(
-    `[converse${tag}] ▶ class="${className}"  lang=${lang}  voice=${voiceById(voiceId)?.name ?? voiceId ?? "default"}  audio=${Math.round(audio.size / 1024)}KB (${audio.type || "?"})  hist=${history.length}  desc=${description ? description.length + "ch" : "none"}  client-stt=${clientTranscript ? "yes" : "no"}`
+    `[converse${tag}] ▶ class="${className}"  learn=${learnLang} spoken=${spokenLang}  voice=${voiceById(voiceId)?.name ?? voiceId ?? "default"}  audio=${Math.round(audio.size / 1024)}KB (${audio.type || "?"})  hist=${history.length}  desc=${description ? description.length + "ch" : "none"}  client-stt=${clientTranscript ? "yes" : "no"}`
   );
 
   if (audio.size < 1024) {
@@ -1655,7 +1904,10 @@ export async function converseWithObject(
     throw new Error("recording too large");
   }
 
-  const resolvedVoice = voiceId ?? getDefaultVoiceId(lang);
+  // Voice pool is driven by what the object SPEAKS (learnLang), not by what
+  // the user speaks. When the pair matches this collapses to the prior
+  // behavior.
+  const resolvedVoice = voiceId ?? getDefaultVoiceId(learnLang);
 
   // Use the client transcript when present; fall back to server STT.
   let transcript: string;
@@ -1670,7 +1922,9 @@ export async function converseWithObject(
     );
   } else {
     try {
-      transcript = await transcribeAudio(audio, lang, tag);
+      // STT hints the language the USER speaks (spokenLang), not the one
+      // the object replies in.
+      transcript = await transcribeAudio(audio, spokenLang, tag);
     } catch (err) {
       // Short/low-quality webm blobs occasionally come back from
       // MediaRecorder without the headers OpenAI STT needs, yielding a
@@ -1719,7 +1973,9 @@ export async function converseWithObject(
       "抱歉,走神了。",
       "重新来过?",
     ];
-    const fallbacks = lang === "zh" ? fallbacksZh : fallbacksEn;
+    // Empty-transcript stock replies come out of the OBJECT's mouth, so
+    // pick the pool by learnLang.
+    const fallbacks = learnLang === "zh" ? fallbacksZh : fallbacksEn;
     const reply = fallbacks[Math.floor(Math.random() * fallbacks.length)];
     // eslint-disable-next-line no-console
     console.log(
@@ -1733,18 +1989,33 @@ export async function converseWithObject(
       // funnier than flat normal.
       emotion: "curiosity:high",
       speed: null,
+      teachMode: false,
     };
   }
+
+  // Decide teach mode BEFORE calling the LLM — the prompt branches on it.
+  // `history` doesn't include the current utterance yet, which is exactly
+  // what detectTeachMode expects.
+  const teachMode = detectTeachMode(transcript, history, spokenLang, learnLang);
 
   // Fast text-only LLM. The visual context the reply needs lives in the
   // `description` string we hydrated in the background — no need to pay
   // VLM latency on the hot path.
   const replyResult = await openaiTextReply(
     {
-      system: RESPOND_SYSTEM(className, description, lang),
+      system: RESPOND_SYSTEM(
+        className,
+        description,
+        learnLang,
+        spokenLang,
+        teachMode
+      ),
       userText: transcript,
       priorMessages: history,
-      maxTokens: 220,
+      // Teach mode wants a slightly longer, more structured response — bump
+      // the max tokens so the model has room for phrase + gloss + cue
+      // without truncating mid-sentence.
+      maxTokens: teachMode ? 360 : 220,
       temperature: 0.7,
     },
     tag
@@ -1756,7 +2027,14 @@ export async function converseWithObject(
   const total = Date.now() - t0;
   // eslint-disable-next-line no-console
   console.log(
-    `[converse${tag}] ✓ TOTAL=${total}ms ━ stt=${sttBackend}/${sttMs}ms ▸ llm=${replyResult.backend}/${replyResult.ms}ms  emotion=${emotion ?? "-"}  speed=${speed ?? "-"}  reply="${reply.slice(0, 80)}${reply.length > 80 ? "…" : ""}"`
+    `[converse${tag}] ✓ TOTAL=${total}ms ━ stt=${sttBackend}/${sttMs}ms ▸ llm=${replyResult.backend}/${replyResult.ms}ms  teach=${teachMode}  emotion=${emotion ?? "-"}  speed=${speed ?? "-"}  reply="${reply.slice(0, 80)}${reply.length > 80 ? "…" : ""}"`
   );
-  return { transcript, reply, voiceId: resolvedVoice, emotion, speed };
+  return {
+    transcript,
+    reply,
+    voiceId: resolvedVoice,
+    emotion,
+    speed,
+    teachMode,
+  };
 }
