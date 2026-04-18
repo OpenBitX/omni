@@ -77,8 +77,23 @@ BBOX_PAD_FRAC = float(os.environ.get("SAM2_BBOX_PAD", "0.15"))
 # 2–3× over a couple frames; beyond that it's almost always bleed.
 DRIFT_AREA_RATIO = float(os.environ.get("SAM2_DRIFT_RATIO", "3.0"))
 # Max consecutive bad frames (low score OR drift-rejected) before we
-# give up and emit "lost". Higher = stickier through brief occlusion.
+# shift from normal re-prompt retry into the reacquire tier. Higher =
+# stickier through brief occlusion. We intentionally split this into two
+# tiers instead of one threshold:
+#   tier 1  — bad_frame_streak < LOST_AFTER_BAD_FRAMES
+#     Normal retry: re-prompt with centroid + initial tap + padded box +
+#     mask_input. This handles one-frame blips and brief occlusions.
+#   tier 2  — LOST_AFTER_BAD_FRAMES <= streak < REACQUIRE_GIVEUP
+#     Reacquire: drop box + mask_input (both may be poisoned by drift)
+#     and prompt ONLY with points — last good centroid + original tap.
+#     Gives SAM2 a chance to find the object globally rather than
+#     refining within a stale bounding box. V1 parity: YOLO re-detects
+#     every frame and recovers through pans/occlusions naturally; V2
+#     needs this tier to match.
+#   tier 3  — streak >= REACQUIRE_GIVEUP
+#     Truly lost. Emit "lost" and reset the session.
 LOST_AFTER_BAD_FRAMES = int(os.environ.get("SAM2_LOST_AFTER", "5"))
+REACQUIRE_GIVEUP = int(os.environ.get("SAM2_REACQUIRE_GIVEUP", "20"))
 
 
 # =====================================================================
@@ -350,6 +365,7 @@ async def health() -> dict[str, Any]:
         "bbox_pad_frac": BBOX_PAD_FRAC,
         "drift_area_ratio": DRIFT_AREA_RATIO,
         "lost_after_bad_frames": LOST_AFTER_BAD_FRAMES,
+        "reacquire_giveup": REACQUIRE_GIVEUP,
     }
 
 
@@ -485,7 +501,7 @@ async def sam2_ws(ws: WebSocket) -> None:
                     # to a plausible region, and the mask_input gives a shape
                     # prior. Missing any one and SAM2 tends to drift into
                     # adjacent same-texture regions (shadows, cloth, skin).
-                    if sess.prev_centroid_px is None or sess.prev_bbox_xyxy is None:
+                    if sess.prev_centroid_px is None:
                         sess.reset()
                         await _send_json(ws, {"type": "lost", "reason": "no_prev_state"})
                         continue
@@ -494,37 +510,64 @@ async def sam2_ws(ws: WebSocket) -> None:
                     cx_px = min(max(cx_px, 0.0), W - 1.0)
                     cy_px = min(max(cy_px, 0.0), H - 1.0)
 
-                    # Pad the bbox so SAM2 can refine into areas the object
-                    # moved into between frames. Without padding, fast
-                    # translation makes the mask "chip off" its leading edge.
-                    box_prompt = _pad_box_xyxy(
-                        sess.prev_bbox_xyxy, W, H, BBOX_PAD_FRAC
-                    )
+                    # Reacquire mode kicks in once bad_frame_streak crosses
+                    # the tier-1 → tier-2 threshold. Box + mask_input are
+                    # both likely poisoned (that's why we're failing), so
+                    # drop them and rely on points only. The point prompts
+                    # tell SAM2 "this pixel is foreground" with no
+                    # positional constraint — it searches globally within
+                    # the whole frame.
+                    reacquire_mode = sess.bad_frame_streak >= LOST_AFTER_BAD_FRAMES
 
-                    # Build the point prompt set. Base case: just the
-                    # centroid. Recovery case (after a bad frame): ALSO
-                    # include the user's original tap, but ONLY if that
-                    # tap still lies inside the padded previous bbox —
-                    # otherwise the object has moved away from where it
-                    # was picked and the original tap now points at
-                    # background, which would actively mislead SAM2.
-                    #
-                    # This gives us a "re-lock" pass whenever tracking
-                    # wobbles: two positive points constrain the mask to
-                    # the intersection, snapping the segmentation back
-                    # to the intended object.
-                    pts: list[tuple[float, float]] = [(cx_px, cy_px)]
-                    labels: list[int] = [1]
-                    if (
-                        sess.bad_frame_streak > 0
-                        and sess.initial_tap_norm is not None
-                    ):
-                        tap_px_x = sess.initial_tap_norm[0] * W
-                        tap_px_y = sess.initial_tap_norm[1] * H
-                        bx1, by1, bx2, by2 = box_prompt
-                        if bx1 <= tap_px_x <= bx2 and by1 <= tap_px_y <= by2:
+                    if reacquire_mode:
+                        box_prompt: Optional[tuple[float, float, float, float]] = None
+                        mask_input_for_predict = None
+                        pts: list[tuple[float, float]] = [(cx_px, cy_px)]
+                        labels: list[int] = [1]
+                        # Also include the original tap whenever we have
+                        # one — two positive points constrain the mask to
+                        # their intersection, which snaps back to the
+                        # intended object if it's still in frame.
+                        if sess.initial_tap_norm is not None:
+                            tap_px_x = sess.initial_tap_norm[0] * W
+                            tap_px_y = sess.initial_tap_norm[1] * H
                             pts.append((tap_px_x, tap_px_y))
                             labels.append(1)
+                    else:
+                        if sess.prev_bbox_xyxy is None:
+                            sess.reset()
+                            await _send_json(ws, {"type": "lost", "reason": "no_prev_bbox"})
+                            continue
+
+                        # Pad the bbox so SAM2 can refine into areas the
+                        # object moved into between frames. Without padding,
+                        # fast translation makes the mask "chip off" its
+                        # leading edge.
+                        box_prompt = _pad_box_xyxy(
+                            sess.prev_bbox_xyxy, W, H, BBOX_PAD_FRAC
+                        )
+                        mask_input_for_predict = sess.prev_low_res
+
+                        # Base case: just the centroid. Tier-1 retry
+                        # (bad_frame_streak > 0 but < LOST_AFTER_BAD_FRAMES):
+                        # ALSO include the user's original tap, but ONLY
+                        # if that tap still lies inside the padded previous
+                        # bbox — otherwise the object has moved away from
+                        # where it was picked and the original tap now
+                        # points at background, which would actively
+                        # mislead SAM2.
+                        pts = [(cx_px, cy_px)]
+                        labels = [1]
+                        if (
+                            sess.bad_frame_streak > 0
+                            and sess.initial_tap_norm is not None
+                        ):
+                            tap_px_x = sess.initial_tap_norm[0] * W
+                            tap_px_y = sess.initial_tap_norm[1] * H
+                            bx1, by1, bx2, by2 = box_prompt
+                            if bx1 <= tap_px_x <= bx2 and by1 <= tap_px_y <= by2:
+                                pts.append((tap_px_x, tap_px_y))
+                                labels.append(1)
 
                     try:
                         mask, score, low_res = await _predict(
@@ -532,7 +575,7 @@ async def sam2_ws(ws: WebSocket) -> None:
                             points_xy_px=pts,
                             point_labels=labels,
                             box_xyxy=box_prompt,
-                            prev_low_res=sess.prev_low_res,
+                            prev_low_res=mask_input_for_predict,
                         )
                     except Exception as e:
                         log.exception("[ws %s] predict track failed", client)
@@ -579,7 +622,10 @@ async def sam2_ws(ws: WebSocket) -> None:
 
                     if bad:
                         sess.bad_frame_streak += 1
-                        if sess.bad_frame_streak >= LOST_AFTER_BAD_FRAMES:
+                        if sess.bad_frame_streak >= REACQUIRE_GIVEUP:
+                            # Gave the reacquire tier its full budget and
+                            # nothing stuck. Truly lost — reset the
+                            # session and tell the client.
                             reason = (
                                 "drift" if drifted else "low_score"
                                 if low_score else "empty_mask"
@@ -591,12 +637,18 @@ async def sam2_ws(ws: WebSocket) -> None:
                             # this frame is stale so it fades slightly but
                             # doesn't move. Importantly we DO NOT write to
                             # prev_low_res / prev_bbox — the next frame
-                            # re-prompts from the last good state.
+                            # re-prompts from the last good state (tier 1)
+                            # or from points only (tier 2, reacquire_mode).
+                            # The `reacquiring` flag lets the client show
+                            # a "searching…" hint and dim harder when
+                            # we've crossed into the aggressive tier.
                             await _send_json(ws, {
                                 "type": "track",
                                 "bbox": None,
                                 "score": round(score, 4),
                                 "stale": True,
+                                "reacquiring": sess.bad_frame_streak
+                                >= LOST_AFTER_BAD_FRAMES,
                             })
                         continue
 
