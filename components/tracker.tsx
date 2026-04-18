@@ -1,13 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { converseWithObject, generateLine } from "@/app/actions";
+import { converseWithObject, describeObject, generateLine } from "@/app/actions";
 import {
+  FACE_VOICE_HEIGHT,
   FACE_VOICE_WIDTH,
   FaceVoice,
   classifyShape,
   type MouthShape,
 } from "@/components/face-voice";
+import { SpeechBubble } from "@/components/speech-bubble";
 import {
   COCO_CLASSES,
   PERSON_CLASS_ID,
@@ -110,6 +112,23 @@ const FACE_NATIVE_PX = FACE_VOICE_WIDTH;
 const FACE_SCALE_MIN = 0.25;
 const FACE_SCALE_MAX = 3.0;
 
+// CSS blend mode applied to the face when it rides inside an object's
+// silhouette. `hard-light` adopts the object's color cast without crushing
+// the face detail the way `multiply` does. Easy to tune — set to `normal`
+// to turn the tint off entirely and just keep the silhouette clip.
+const FACE_BLEND_MODE = "hard-light";
+
+// Minimum eigenvalue ratio before we rotate the face to the object's long
+// axis. Below this the object is roughly round and its "orientation" is
+// quantization noise — a cup at 1.05 doesn't want a tilted face. Bananas,
+// pens, laptops sit well above 2.
+const ORIENTATION_MIN_RATIO = 1.25;
+
+// Low-pass on the per-track rotation angle. PCA output jitters by a few
+// degrees between inferences on non-rigid silhouettes; this smooths it
+// without adding perceptible lag at 3–30 hz inference.
+const ROTATION_EMA_ALPHA = 0.25;
+
 // Classes the app explicitly refuses to put a face on — it's about things,
 // not people. Mirrors the ASSESS_SYSTEM policy upstream.
 const EXCLUDED_CLASS_IDS = new Set<number>([PERSON_CLASS_ID]);
@@ -126,10 +145,6 @@ const TAP_FRAME_FRACTION = 0.55;
 // (least-recently-tapped) track gets evicted to make room. Three is the
 // sweet spot for demos: busy enough to feel alive, small enough to parse.
 const MAX_FACES = 3;
-
-// Hide the caption bubbles — audio-only mode. TTS and speak wiring continue
-// to run; we just don't render the transcript.
-const SHOW_CAPTIONS = false;
 
 // Adaptive waveform bar count. Symmetric layout around center; bumping this
 // widens the strip but does not retune the bar-to-band mapping (see readLevel).
@@ -152,6 +167,38 @@ function lerp(a: number, b: number, t: number): number {
 // Map a source-space axis-aligned box to the video element's displayed
 // pixel space. The <video> uses object-cover, so there's letterboxing on
 // one axis we need to account for.
+// Write a detection's binary mask bitmap (0/255 alpha) into a reusable
+// canvas and return a PNG data URL for CSS mask-image. Called only on
+// inference ticks (3–30 hz), never per RAF — `canvas.toDataURL` is cheap
+// at proto resolution (~1-3 ms for typical 40×60 patches) but not free.
+// Reuses the provided canvas to avoid per-tick allocation of the pixel
+// buffer. Alpha-only — RGB doesn't matter for mask-image.
+function renderMaskToDataUrl(
+  canvas: HTMLCanvasElement,
+  mask: { data: Uint8Array; w: number; h: number }
+): string | null {
+  if (mask.w < 1 || mask.h < 1) return null;
+  if (canvas.width !== mask.w) canvas.width = mask.w;
+  if (canvas.height !== mask.h) canvas.height = mask.h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  // Pack the binary mask into an RGBA ImageData. White RGB + per-pixel
+  // alpha = 0 or 255. The browser will smoothly scale this with CSS
+  // mask-size: 100% 100% so low-res proto masks (~30×40) still look clean
+  // stretched across a 300 px object.
+  const img = ctx.createImageData(mask.w, mask.h);
+  const out = img.data;
+  const src = mask.data;
+  for (let i = 0, j = 0; i < src.length; i++, j += 4) {
+    out[j] = 255;
+    out[j + 1] = 255;
+    out[j + 2] = 255;
+    out[j + 3] = src[i];
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas.toDataURL("image/png");
+}
+
 function sourceBoxToElement(
   box: { x1: number; y1: number; x2: number; y2: number },
   video: HTMLVideoElement
@@ -328,6 +375,48 @@ type TrackRefs = {
   // Auto-dismiss timer id for this track's caption once audio finishes.
   // Held per-track so a retap can cancel the prior dismissal.
   captionClearTimer: number | null;
+  // Streaming audio element for the conversation reply path. Separate from
+  // `source` (AudioBufferSourceNode) which handles the lock-time line —
+  // the streaming path uses MediaSource so playback starts as the first
+  // bytes arrive instead of waiting for the whole mp3. Stopping a track
+  // must clear BOTH.
+  streamingAudio: HTMLAudioElement | null;
+  streamingUrl: string | null;
+  // Fish.audio reference_id chosen by GLM on the first `generateLine` for
+  // this track. Once set, it's reused for every subsequent line and reply
+  // so the object's voice stays consistent for the whole session on it.
+  // null until the first generateLine returns (or catalog empty → stays null).
+  voiceId: string | null;
+  // Conversation memory for this object. Populated in order: first line
+  // from generateLine → user utterance (whisper transcript) → assistant
+  // reply from converseWithObject → ... GLM sees this thread so the object
+  // remembers what was said and replies coherently.
+  history: { role: "user" | "assistant"; content: string }[];
+  // Rich visual description of the object — hydrated in the background by
+  // describeObject right after lock and refreshed after every conversation
+  // turn. Lets converseWithObject stay text-only on the hot path while
+  // still getting funnier-than-classname context (chewed straw, dust, etc.)
+  description: string | null;
+  // Bumped each time we kick off a describeObject call. The handler
+  // compares its captured gen against the latest before storing, so a
+  // slow describe response can't overwrite a fresher one.
+  descriptionGen: number;
+  // Silhouette clipping — the face is clipped to this shape so it reads
+  // as painted onto the object instead of pasted over it. Updated only
+  // on YOLO inference ticks (3–30 hz), never per RAF.
+  //   maskCanvas  — offscreen canvas holding the alpha bitmap. Sized to
+  //                 the detection's mask patch in proto resolution.
+  //   maskDataUrl — PNG data URL of the canvas; used as CSS mask-image.
+  //                 Regenerated each inference tick. Small (few KB).
+  //   maskSrcBox  — source-pixel rect the mask covers; projected to
+  //                 element space each render tick.
+  maskCanvas: HTMLCanvasElement | null;
+  maskDataUrl: string | null;
+  maskSrcBox: { x1: number; y1: number; x2: number; y2: number } | null;
+  // smoothedBox center at the moment the mask was captured. Render applies
+  // (renderBox.cx - maskAnchor.cx) so the silhouette glides with the face
+  // during inter-inference extrapolation instead of snapping at inference rate.
+  maskAnchor: { cx: number; cy: number } | null;
 };
 
 // How long a caption stays on screen after its voice line finishes. Long
@@ -350,7 +439,196 @@ type TrackUI = {
   caption: string | null;
   thinking: boolean;
   speaking: boolean;
+  // Silhouette clip. `maskDataUrl` is null until the first inference tick
+  // after lock produces a mask for this track (or if the seg head didn't
+  // supply one). When null, the face falls back to unclipped render.
+  maskDataUrl: string | null;
+  maskLeft: number;
+  maskTop: number;
+  maskWidth: number;
+  maskHeight: number;
 };
+
+// Stream an mp3 response body into a MediaSource SourceBuffer and play it
+// through the track's analyser so the mouth syncs. Runs at module scope
+// (not a hook) because the logic is pure browser plumbing and keeps the
+// hot-path useCallback readable. Resolves when the 'ended' event fires or
+// the caller supersedes (callGen mismatch).
+async function playViaMediaSource(args: {
+  ctx: AudioContext;
+  track: TrackRefs;
+  trackId: string;
+  callGen: number;
+  respBody: ReadableStream<Uint8Array>;
+  mediaSourceCtor: typeof MediaSource;
+  ensureAnalyser: () => void;
+  scheduleCaptionClear: () => void;
+  setSpeaking: (on: boolean) => void;
+  tStart: number;
+}): Promise<void> {
+  const {
+    ctx,
+    track,
+    trackId,
+    callGen,
+    respBody,
+    mediaSourceCtor,
+    ensureAnalyser,
+    scheduleCaptionClear,
+    setSpeaking,
+    tStart,
+  } = args;
+
+  const mediaSource = new mediaSourceCtor();
+  const url = URL.createObjectURL(mediaSource);
+  const audioEl = new Audio();
+  audioEl.preload = "auto";
+  audioEl.crossOrigin = "anonymous";
+  audioEl.src = url;
+
+  track.streamingAudio = audioEl;
+  track.streamingUrl = url;
+
+  await new Promise<void>((resolve, reject) => {
+    const onOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const onErr = () => {
+      cleanup();
+      reject(new Error("MediaSource open failed"));
+    };
+    const cleanup = () => {
+      mediaSource.removeEventListener("sourceopen", onOpen);
+      mediaSource.removeEventListener("error", onErr);
+    };
+    mediaSource.addEventListener("sourceopen", onOpen, { once: true });
+    mediaSource.addEventListener("error", onErr, { once: true });
+  });
+
+  if (callGen !== track.speakGen) {
+    try {
+      await respBody.cancel();
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  const sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
+  sourceBuffer.mode = "sequence";
+
+  // Wire the audio element into the track's analyser so the mouth syncs
+  // to THIS stream. One MediaElementAudioSourceNode per element per ctx.
+  ensureAnalyser();
+  const mediaElSource = ctx.createMediaElementSource(audioEl);
+  mediaElSource.connect(track.analyser!);
+
+  let started = false;
+  let endedFired = false;
+  audioEl.addEventListener("ended", () => {
+    endedFired = true;
+    if (track.streamingAudio === audioEl) {
+      track.streamingAudio = null;
+      if (track.streamingUrl) {
+        try {
+          URL.revokeObjectURL(track.streamingUrl);
+        } catch {
+          // ignore
+        }
+        track.streamingUrl = null;
+      }
+      setSpeaking(false);
+      scheduleCaptionClear();
+    }
+  });
+
+  const reader = respBody.getReader();
+
+  const appendChunk = (chunk: Uint8Array) =>
+    new Promise<void>((resolve, reject) => {
+      const onUpdate = () => {
+        sourceBuffer.removeEventListener("updateend", onUpdate);
+        sourceBuffer.removeEventListener("error", onErr);
+        resolve();
+      };
+      const onErr = () => {
+        sourceBuffer.removeEventListener("updateend", onUpdate);
+        sourceBuffer.removeEventListener("error", onErr);
+        reject(new Error("SourceBuffer append failed"));
+      };
+      sourceBuffer.addEventListener("updateend", onUpdate);
+      sourceBuffer.addEventListener("error", onErr);
+      try {
+        // chunk.buffer can be SharedArrayBuffer per TS lib types; SourceBuffer
+        // wants a plain ArrayBuffer. Copy into a fresh ArrayBuffer to satisfy
+        // the type and guarantee the append sees a stable buffer.
+        const copy = new Uint8Array(chunk.byteLength);
+        copy.set(chunk);
+        sourceBuffer.appendBuffer(copy.buffer);
+      } catch (e) {
+        sourceBuffer.removeEventListener("updateend", onUpdate);
+        sourceBuffer.removeEventListener("error", onErr);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (callGen !== track.speakGen) {
+        // Retap while streaming — abandon and let stopTrackAudio clean up.
+        try {
+          await reader.cancel();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      await appendChunk(value);
+      // Kick off playback the moment the first chunk is decodable.
+      if (!started) {
+        started = true;
+        // eslint-disable-next-line no-console
+        console.log(
+          `[stream:${trackId}] first chunk → playing after ${Math.round(performance.now() - tStart)}ms (${value.byteLength}B)`
+        );
+        setSpeaking(true);
+        try {
+          await audioEl.play();
+        } catch (err) {
+          // Autoplay policies should be satisfied (user gesture triggered
+          // recording), but swallow + log just in case.
+          // eslint-disable-next-line no-console
+          console.log(
+            `[stream:${trackId}] audioEl.play() rejected: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+    }
+    // Signal end-of-stream to MediaSource so the audio element can
+    // schedule its 'ended' event properly.
+    if (mediaSource.readyState === "open") {
+      try {
+        mediaSource.endOfStream();
+      } catch {
+        // ignore
+      }
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+      `[stream:${trackId}] done streaming after ${Math.round(performance.now() - tStart)}ms  ended=${endedFired}`
+    );
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[stream:${trackId}] ✖ ${err instanceof Error ? err.message : String(err)}`
+    );
+    throw err;
+  }
+}
 
 export function Tracker() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -386,6 +664,15 @@ export function Tracker() {
   const recordedChunksRef = useRef<BlobPart[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
   const recordedBlobRef = useRef<Blob | null>(null);
+  // Browser-side Web Speech API. Runs in parallel with MediaRecorder so the
+  // transcript is usually already final by the time the user releases the
+  // talk button — saves the entire server STT roundtrip (~700–1300ms).
+  // Falls back to server STT silently when SpeechRecognition isn't
+  // available (Firefox, some embedded webviews) or yields nothing.
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const speechTranscriptPartsRef = useRef<string[]>([]);
+  const speechFinishedRef = useRef<Promise<void> | null>(null);
+  const resolveSpeechFinishedRef = useRef<(() => void) | null>(null);
   const talkAnalyserRef = useRef<AnalyserNode | null>(null);
   const talkFreqDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const talkSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -683,6 +970,233 @@ export function Tracker() {
     }, ms);
   }, []);
 
+  // --- Background rich description -------------------------------------
+  //
+  // YOLO gives us "cup"; this fetches a juicy sentence or two (chewed straw,
+  // dust film, dent, etc.) that converseWithObject uses to write funnier
+  // replies without paying vision latency on the hot path. Fire-and-forget:
+  // a stale response can't overwrite a fresher one thanks to descriptionGen.
+  const refreshTrackDescription = useCallback(
+    (trackId: string, cropDataUrl: string) => {
+      const track = tracksRef.current.find((t) => t.id === trackId);
+      if (!track || !cropDataUrl) return;
+      const gen = ++track.descriptionGen;
+      const t0 = performance.now();
+      // eslint-disable-next-line no-console
+      console.log(
+        `[describe:${trackId}] → describeObject  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  gen=${gen}`
+      );
+      describeObject(cropDataUrl, track.className)
+        .then(({ description }) => {
+          // Track may have been evicted while we waited; bail if so.
+          const current = tracksRef.current.find((t) => t.id === trackId);
+          if (!current) return;
+          // A fresher describe kicked off while this one was in flight.
+          if (gen !== current.descriptionGen) {
+            // eslint-disable-next-line no-console
+            console.log(
+              `[describe:${trackId}] ← superseded (gen ${gen} vs ${current.descriptionGen})`
+            );
+            return;
+          }
+          current.description = description || null;
+          // eslint-disable-next-line no-console
+          console.log(
+            `[describe:${trackId}] ← ${Math.round(performance.now() - t0)}ms  "${(description || "").slice(0, 100)}"`
+          );
+        })
+        .catch((err) => {
+          // Non-fatal — converseWithObject just falls back to the bare class.
+          // eslint-disable-next-line no-console
+          console.log(
+            `[describe:${trackId}] ✖ ${err instanceof Error ? err.message : String(err)}`
+          );
+        });
+    },
+    []
+  );
+
+  // Stop whatever a track is currently saying — both the
+  // AudioBufferSource (lock-time line) and the streaming HTMLAudioElement
+  // (conversation reply). Called from retap, eviction, etc.
+  const stopTrackAudio = useCallback((track: TrackRefs) => {
+    if (track.source) {
+      try {
+        track.source.stop();
+      } catch {
+        // already stopped
+      }
+      track.source = null;
+    }
+    if (track.streamingAudio) {
+      try {
+        track.streamingAudio.pause();
+      } catch {
+        // ignore
+      }
+      track.streamingAudio.src = "";
+      track.streamingAudio = null;
+    }
+    if (track.streamingUrl) {
+      try {
+        URL.revokeObjectURL(track.streamingUrl);
+      } catch {
+        // ignore
+      }
+      track.streamingUrl = null;
+    }
+  }, []);
+
+  // --- Streaming TTS playback -------------------------------------------
+  //
+  // The conversation hot path. We used to synthesize the whole mp3
+  // server-side, base64-encode it, pass it through a server action, fetch
+  // the data URL, and only then decode + play — burning ~600–1500ms of
+  // dead air. This helper fetches `/api/tts/stream` instead, feeds the
+  // bytes into a MediaSource SourceBuffer, and starts playback the moment
+  // the first chunk lands. Audio element → MediaElementSource → track.
+  // analyser → gain → destination keeps lip-sync intact.
+  //
+  // MediaSource isn't everywhere (notably older iOS), so we fall back to
+  // buffering the whole blob and going through the existing
+  // AudioBufferSource path — same code that speakOnTrack uses.
+  const playStreamingReply = useCallback(
+    async (
+      trackId: string,
+      callGen: number,
+      text: string,
+      voiceId: string | null
+    ): Promise<void> => {
+      const ctx = ensureAudioCtx();
+      const track = tracksRef.current.find((t) => t.id === trackId);
+      if (!ctx || !track) return;
+
+      const ensureAnalyser = () => {
+        if (track.analyser) return;
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.4;
+        const gain = ctx.createGain();
+        gain.gain.value = track.opacity;
+        analyser.connect(gain);
+        gain.connect(ctx.destination);
+        track.analyser = analyser;
+        track.gain = gain;
+        track.freqData = new Uint8Array(
+          new ArrayBuffer(analyser.frequencyBinCount)
+        );
+        track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+      };
+
+      const scheduleCaptionClear = () => {
+        if (track.captionClearTimer != null) {
+          clearTimeout(track.captionClearTimer);
+        }
+        track.captionClearTimer = window.setTimeout(() => {
+          track.captionClearTimer = null;
+          setTracksUI((prev) =>
+            prev.map((t) =>
+              t.id === trackId ? { ...t, caption: null } : t
+            )
+          );
+        }, CAPTION_LINGER_MS);
+      };
+
+      const t0 = performance.now();
+      // eslint-disable-next-line no-console
+      console.log(
+        `[stream:${trackId}] → /api/tts/stream text=${text.length}ch voice=${voiceId ?? "default"}`
+      );
+
+      const resp = await fetch("/api/tts/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voiceId: voiceId ?? "" }),
+      });
+      if (callGen !== track.speakGen) {
+        // Retap while we were awaiting headers — drop.
+        try {
+          await resp.body?.cancel();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      if (!resp.ok || !resp.body) {
+        const err = await resp.text().catch(() => "");
+        throw new Error(`tts stream ${resp.status}: ${err.slice(0, 120)}`);
+      }
+      const backend = resp.headers.get("X-Tts-Backend") ?? "stream";
+      setLastTtsBackend(
+        backend === "fish" ? "fish" : backend === "openai" ? "openai" : "none"
+      );
+      // eslint-disable-next-line no-console
+      console.log(
+        `[stream:${trackId}] headers in ${Math.round(performance.now() - t0)}ms backend=${backend}`
+      );
+
+      const mediaSourceCtor: typeof MediaSource | null =
+        typeof window !== "undefined" &&
+        typeof window.MediaSource !== "undefined" &&
+        window.MediaSource.isTypeSupported?.("audio/mpeg")
+          ? window.MediaSource
+          : null;
+
+      if (mediaSourceCtor) {
+        await playViaMediaSource({
+          ctx,
+          track,
+          trackId,
+          callGen,
+          respBody: resp.body,
+          mediaSourceCtor,
+          ensureAnalyser,
+          scheduleCaptionClear,
+          setSpeaking: (on: boolean) =>
+            setTracksUI((prev) =>
+              prev.map((t) =>
+                t.id === trackId ? { ...t, speaking: on } : t
+              )
+            ),
+          tStart: t0,
+        });
+      } else {
+        // Fallback: buffer the whole mp3, decode, play via AudioBufferSource.
+        // Loses the streaming latency win but keeps the app functional on
+        // browsers without MediaSource (older iOS, etc.).
+        // eslint-disable-next-line no-console
+        console.log(
+          `[stream:${trackId}] MediaSource unavailable — buffering full mp3 as fallback`
+        );
+        const buf = await resp.arrayBuffer();
+        if (callGen !== track.speakGen) return;
+        const audioBuf = await ctx.decodeAudioData(buf);
+        if (callGen !== track.speakGen) return;
+        ensureAnalyser();
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuf;
+        source.connect(track.analyser!);
+        source.onended = () => {
+          if (track.source === source) {
+            track.source = null;
+            setTracksUI((prev) =>
+              prev.map((t) =>
+                t.id === trackId ? { ...t, speaking: false } : t
+              )
+            );
+            scheduleCaptionClear();
+          }
+        };
+        track.source = source;
+        setTracksUI((prev) =>
+          prev.map((t) => (t.id === trackId ? { ...t, speaking: true } : t))
+        );
+        source.start();
+      }
+    },
+    [ensureAudioCtx]
+  );
+
   // --- Per-track speak ---------------------------------------------------
   //
   // Each track owns its own audio source + analyser, so three objects can
@@ -705,16 +1219,10 @@ export function Tracker() {
         track.captionClearTimer = null;
       }
 
-      // Stop whatever this track was already saying; let other tracks
-      // keep going. Concurrent voices = feature, not bug.
-      if (track.source) {
-        try {
-          track.source.stop();
-        } catch {
-          // already stopped
-        }
-        track.source = null;
-      }
+      // Stop whatever this track was already saying (buffer source OR
+      // streaming element); other tracks keep going — concurrent voices
+      // are a feature.
+      stopTrackAudio(track);
       // UI: thinking=true, speaking=false, caption cleared.
       setTracksUI((prev) =>
         prev.map((t) =>
@@ -727,19 +1235,43 @@ export function Tracker() {
       try {
         // eslint-disable-next-line no-console
         console.log(
-          `[speak:${trackId}] → generateLine  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB`
+          `[speak:${trackId}] → generateLine  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  voice=${track.voiceId ?? "(picking)"}  persona=${track.description ? "cached" : "(new)"}`
         );
         const t0 = performance.now();
-        const { line, audioDataUrl, backend } = await generateLine(cropDataUrl);
+        const {
+          line,
+          voiceId: chosenVoiceId,
+          description: chosenDescription,
+          audioDataUrl,
+          backend,
+        } = await generateLine(cropDataUrl, track.voiceId, track.description);
         if (callGen !== track.speakGen) {
           // eslint-disable-next-line no-console
           console.log(`[speak:${trackId}] ← superseded (speakGen mismatch)`);
           return;
         }
         setLastTtsBackend(backend);
+        // Pin the voice on first return — every subsequent speak/talk on
+        // this track passes this id back so the same Fish voice speaks the
+        // whole session. Once set, we never overwrite it.
+        if (!track.voiceId && chosenVoiceId) {
+          track.voiceId = chosenVoiceId;
+        }
+        // Pin the persona card from the first tap. Don't clobber a richer
+        // description with a later-tap re-describe; the background describe
+        // pass handles ongoing refresh (and uses descriptionGen to race-guard).
+        if (!track.description && chosenDescription) {
+          track.description = chosenDescription;
+        }
+        // Record what the object said into its own memory so a later
+        // conversation turn can call back to it.
+        track.history = [
+          ...track.history,
+          { role: "assistant" as const, content: line },
+        ].slice(-16);
         // eslint-disable-next-line no-console
         console.log(
-          `[speak:${trackId}] ← ${Math.round(performance.now() - t0)}ms  backend=${backend}  line="${line}"`
+          `[speak:${trackId}] ← ${Math.round(performance.now() - t0)}ms  backend=${backend}  voice=${track.voiceId ?? "default"}  line="${line}"`
         );
 
         setTracksUI((prev) =>
@@ -836,7 +1368,7 @@ export function Tracker() {
         }
       }
     },
-    [ensureAudioCtx, showRejection]
+    [ensureAudioCtx, showRejection, stopTrackAudio]
   );
 
   // --- Tracking + lip-sync RAF ------------------------------------------
@@ -987,17 +1519,65 @@ export function Tracker() {
           );
           const opacity = t.opacity;
           const shape = t.shape;
+
+          // Project the silhouette clip into element space, offset by how
+          // far the tracker thinks the object has moved since the mask was
+          // captured. This keeps the mask glued to the object during the
+          // inter-inference glide instead of lagging at inference rate.
+          let maskDataUrl: string | null = null;
+          let maskLeft = 0;
+          let maskTop = 0;
+          let maskWidth = 0;
+          let maskHeight = 0;
+          if (t.maskDataUrl && t.maskSrcBox && t.maskAnchor) {
+            const dx = renderBox.cx - t.maskAnchor.cx;
+            const dy = renderBox.cy - t.maskAnchor.cy;
+            const projected = sourceBoxToElement(
+              {
+                x1: t.maskSrcBox.x1 + dx,
+                y1: t.maskSrcBox.y1 + dy,
+                x2: t.maskSrcBox.x2 + dx,
+                y2: t.maskSrcBox.y2 + dy,
+              },
+              v
+            );
+            if (projected) {
+              maskDataUrl = t.maskDataUrl;
+              maskLeft = projected.left;
+              maskTop = projected.top;
+              maskWidth = projected.width;
+              maskHeight = projected.height;
+            }
+          }
+
           if (
             ui.left === left &&
             ui.top === top &&
             ui.scale === scale &&
             ui.opacity === opacity &&
-            ui.shape === shape
+            ui.shape === shape &&
+            ui.maskDataUrl === maskDataUrl &&
+            ui.maskLeft === maskLeft &&
+            ui.maskTop === maskTop &&
+            ui.maskWidth === maskWidth &&
+            ui.maskHeight === maskHeight
           ) {
             return ui;
           }
           changed = true;
-          return { ...ui, left, top, scale, opacity, shape };
+          return {
+            ...ui,
+            left,
+            top,
+            scale,
+            opacity,
+            shape,
+            maskDataUrl,
+            maskLeft,
+            maskTop,
+            maskWidth,
+            maskHeight,
+          };
         });
         return changed ? next : prev;
       });
@@ -1094,6 +1674,32 @@ export function Tracker() {
               }
             }
             t.lastUpdatedAt = now;
+
+            // Refresh the silhouette clip now that smoothedBox is current.
+            // Skipped in the `suspect` branch above because that match is
+            // likely a neighbor, not our object — we'd rather keep the
+            // last-good silhouette than paint the face onto the wrong shape.
+            // maskAnchor = smoothedBox center at capture; the render RAF
+            // offsets the silhouette by (renderBox.cx - maskAnchor.cx) so
+            // the clip glides with the face between inferences instead of
+            // jumping at 3–30 hz.
+            if (match.mask) {
+              if (!t.maskCanvas) t.maskCanvas = document.createElement("canvas");
+              const url = renderMaskToDataUrl(t.maskCanvas, match.mask);
+              if (url) {
+                t.maskDataUrl = url;
+                t.maskSrcBox = {
+                  x1: match.x1,
+                  y1: match.y1,
+                  x2: match.x2,
+                  y2: match.y2,
+                };
+                t.maskAnchor = {
+                  cx: t.smoothedBox.cx,
+                  cy: t.smoothedBox.cy,
+                };
+              }
+            }
           }
         } else {
           t.missedFrames++;
@@ -1176,15 +1782,9 @@ export function Tracker() {
         track.captionClearTimer = null;
       }
 
-      // Stop whatever this track was saying so the reply owns the airwaves.
-      if (track.source) {
-        try {
-          track.source.stop();
-        } catch {
-          // already stopped
-        }
-        track.source = null;
-      }
+      // Stop whatever this track was saying (buffer source OR streaming
+      // audio element) so the fresh reply owns the airwaves.
+      stopTrackAudio(track);
 
       setTracksUI((prev) =>
         prev.map((t) =>
@@ -1194,13 +1794,9 @@ export function Tracker() {
         )
       );
 
-      // Fresh crop of the current smoothed box so the model sees WHERE the
-      // object is right now (for spatial/context reasoning in the reply).
-      const cropDataUrl = captureBoxFrame(track.smoothedBox);
-
       try {
         const formData = new FormData();
-        // Match the file extension to the recorder's MIME type so Whisper's
+        // Match the file extension to the recorder's MIME type so the STT
         // backend picks the right decoder.
         const filename =
           blob.type.includes("mp4")
@@ -1210,27 +1806,52 @@ export function Tracker() {
               : "talk.webm";
         formData.append("audio", blob, filename);
         formData.append("className", track.className);
-        if (cropDataUrl) formData.append("imageDataUrl", cropDataUrl);
+        if (track.voiceId) formData.append("voiceId", track.voiceId);
+        // Rich visual notes hydrated in the background by describeObject.
+        // This is what lets converseWithObject stay text-only on the hot
+        // path (no vision call) while still getting funnier-than-classname
+        // context — the chewed straw, dust, dent, etc.
+        if (track.description) formData.append("description", track.description);
+        // Full conversation so far — object's prior lines + user turns.
+        // The server re-caps to 16; we cap here so the payload stays small.
+        formData.append(
+          "history",
+          JSON.stringify(track.history.slice(-16))
+        );
 
         // eslint-disable-next-line no-console
         console.log(
-          `[talk:${trackId}] → converseWithObject  class="${track.className}"  audio=${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  crop=${cropDataUrl ? Math.round(cropDataUrl.length / 1024) + "KB" : "none"}`
+          `[talk:${trackId}] → converseWithObject  class="${track.className}"  audio=${Math.round(blob.size / 1024)}KB (${blob.type || "?"})  voice=${track.voiceId ?? "default"}  history=${track.history.length}  desc=${track.description ? track.description.length + "ch" : "none"}`
         );
         const t0 = performance.now();
-        const { transcript, reply, audioDataUrl, backend } =
+        const { transcript, reply, voiceId: replyVoiceId } =
           await converseWithObject(formData);
-        setLastTtsBackend(backend);
         if (callGen !== track.speakGen) {
           // eslint-disable-next-line no-console
           console.log(`[talk:${trackId}] ← superseded (speakGen mismatch)`);
           return;
         }
+        // Commit the exchange to this track's memory so future turns see
+        // the full thread. Cap to the same 16 turns the server enforces.
+        const nextHistory = [...track.history];
+        if (transcript)
+          nextHistory.push({ role: "user" as const, content: transcript });
+        if (reply)
+          nextHistory.push({ role: "assistant" as const, content: reply });
+        track.history = nextHistory.slice(-16);
         // eslint-disable-next-line no-console
         console.log(
-          `[talk:${trackId}] ← ${Math.round(performance.now() - t0)}ms  backend=${backend}  heard="${transcript}"  reply="${reply}"`
+          `[talk:${trackId}] ← ${Math.round(performance.now() - t0)}ms  heard="${transcript}"  reply="${reply}"  history=${track.history.length}`
         );
 
-        // Echo what Whisper heard so the user has an instant signal that
+        // Fire-and-forget: refresh the description off a fresh crop so the
+        // NEXT conversation turn sees the current visual state (user moved
+        // closer, opened a drawer, put hoodies on the chair, etc.). Runs
+        // in the background — doesn't block audio playback below.
+        const freshCrop = captureBoxFrame(track.smoothedBox);
+        if (freshCrop) refreshTrackDescription(trackId, freshCrop);
+
+        // Echo what STT heard so the user has an instant signal that
         // their voice message landed — even before the reply starts playing.
         if (transcript) {
           setHeardText(transcript);
@@ -1249,55 +1870,12 @@ export function Tracker() {
           )
         );
 
-        if (!audioDataUrl) return;
+        if (!reply) return;
 
-        const resp = await fetch(audioDataUrl);
-        const buf = await resp.arrayBuffer();
-        const audioBuf = await ctx.decodeAudioData(buf);
-        if (callGen !== track.speakGen) return;
-
-        // Lazy-init this track's analyser on first speak/talk.
-        if (!track.analyser) {
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 1024;
-          analyser.smoothingTimeConstant = 0.4;
-          analyser.connect(ctx.destination);
-          track.analyser = analyser;
-          track.freqData = new Uint8Array(
-            new ArrayBuffer(analyser.frequencyBinCount)
-          );
-          track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
-        }
-
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuf;
-        source.connect(track.analyser);
-        source.onended = () => {
-          if (track.source === source) {
-            track.source = null;
-            setTracksUI((prev) =>
-              prev.map((t) =>
-                t.id === trackId ? { ...t, speaking: false } : t
-              )
-            );
-            if (track.captionClearTimer != null) {
-              clearTimeout(track.captionClearTimer);
-            }
-            track.captionClearTimer = window.setTimeout(() => {
-              track.captionClearTimer = null;
-              setTracksUI((prev) =>
-                prev.map((t) =>
-                  t.id === trackId ? { ...t, caption: null } : t
-                )
-              );
-            }, CAPTION_LINGER_MS);
-          }
-        };
-        track.source = source;
-        setTracksUI((prev) =>
-          prev.map((t) => (t.id === trackId ? { ...t, speaking: true } : t))
-        );
-        source.start();
+        // Kick off the streaming TTS — bytes start flowing into the audio
+        // element as Fish generates them. No base64 round-trip, no "wait
+        // for full mp3" gap between LLM done and mouth moving.
+        await playStreamingReply(trackId, callGen, reply, replyVoiceId ?? track.voiceId);
       } catch (e) {
         if (callGen !== track.speakGen) return;
         const msg = e instanceof Error ? e.message : "talk failed";
@@ -1326,7 +1904,14 @@ export function Tracker() {
         }
       }
     },
-    [captureBoxFrame, ensureAudioCtx, showRejection]
+    [
+      captureBoxFrame,
+      ensureAudioCtx,
+      playStreamingReply,
+      refreshTrackDescription,
+      showRejection,
+      stopTrackAudio,
+    ]
   );
 
   // Hit-test a tap against existing tracks' smoothed boxes. Returns the
@@ -1518,6 +2103,16 @@ export function Tracker() {
         source: null,
         shape: "X",
         captionClearTimer: null,
+        streamingAudio: null,
+        streamingUrl: null,
+        voiceId: null,
+        history: [],
+        description: null,
+        descriptionGen: 0,
+        maskCanvas: null,
+        maskDataUrl: null,
+        maskSrcBox: null,
+        maskAnchor: null,
       };
 
       // LRU eviction when the slots are full.
@@ -1532,6 +2127,23 @@ export function Tracker() {
           } catch {
             // already stopped
           }
+        }
+        if (oldest.streamingAudio) {
+          try {
+            oldest.streamingAudio.pause();
+          } catch {
+            // ignore
+          }
+          oldest.streamingAudio.src = "";
+          oldest.streamingAudio = null;
+        }
+        if (oldest.streamingUrl) {
+          try {
+            URL.revokeObjectURL(oldest.streamingUrl);
+          } catch {
+            // ignore
+          }
+          oldest.streamingUrl = null;
         }
         if (oldest.analyser) {
           try {
@@ -1571,11 +2183,20 @@ export function Tracker() {
           caption: null,
           thinking: false,
           speaking: false,
+          maskDataUrl: null,
+          maskLeft: 0,
+          maskTop: 0,
+          maskWidth: 0,
+          maskHeight: 0,
         },
       ]);
 
       setTapFrame(null);
       void speakOnTrack(newId, dataUrl);
+      // Hydrate rich visual context in the background while the first line
+      // is being generated, so the FIRST conversation turn already has
+      // something funnier than the bare classname to work with.
+      refreshTrackDescription(newId, dataUrl);
     },
     [
       captureBoxFrame,
@@ -1584,6 +2205,7 @@ export function Tracker() {
       errorMsg,
       findTrackAtPoint,
       phase,
+      refreshTrackDescription,
       showRejection,
       speakOnTrack,
     ]
@@ -1839,19 +2461,88 @@ export function Tracker() {
       />
 
       {/* Face overlays — one per track. Positioned by RAF via state. */}
-      {tracksUI.map((t) => (
-        <div
-          key={t.id}
-          className="pointer-events-none absolute left-0 top-0 will-change-transform"
-          style={{
-            transformOrigin: "0 0",
-            transform: `translate(${t.left}px, ${t.top}px) translate(-50%, -50%) scale(${t.scale})`,
-            opacity: t.opacity,
-          }}
-        >
-          <FaceVoice shape={t.shape} />
-        </div>
-      ))}
+      {tracksUI.map((t) => {
+        // Bubble scale: tied to the face, clamped so tiny objects don't
+        // produce unreadable 8px text and huge objects don't drown the frame.
+        const bubbleScale = Math.max(0.6, Math.min(1.3, t.scale * 0.85));
+        // Gap between the face's visual top and the bubble's tail, in CSS px.
+        const faceHalfH = (FACE_VOICE_HEIGHT / 2) * t.scale;
+        const BUBBLE_GAP = 16;
+        const bubbleTop = t.top - faceHalfH - BUBBLE_GAP;
+        // Max width scales with face width so a mug gets a pill and a sofa
+        // gets a paragraph. Native units; the outer scale transform handles
+        // the rest.
+        const bubbleMaxWidth = Math.max(140, FACE_VOICE_WIDTH * 1.1);
+        // Once the first inference after lock lands, `maskDataUrl` is set
+        // and the face renders INSIDE the object's silhouette (clipped +
+        // blend-moded into the surface). Until then, fall back to the
+        // unclipped float so the face appears instantly on tap instead of
+        // waiting for YOLO.
+        const clipped = t.maskDataUrl && t.maskWidth > 0 && t.maskHeight > 0;
+        return (
+          <div key={t.id}>
+            {clipped ? (
+              <div
+                className="pointer-events-none absolute will-change-transform"
+                style={{
+                  left: t.maskLeft,
+                  top: t.maskTop,
+                  width: t.maskWidth,
+                  height: t.maskHeight,
+                  WebkitMaskImage: `url(${t.maskDataUrl})`,
+                  WebkitMaskSize: "100% 100%",
+                  WebkitMaskRepeat: "no-repeat",
+                  maskImage: `url(${t.maskDataUrl})`,
+                  maskSize: "100% 100%",
+                  maskRepeat: "no-repeat",
+                  mixBlendMode: FACE_BLEND_MODE,
+                  opacity: t.opacity,
+                }}
+              >
+                {/* Inner: face positioned at its anchor in element coords,
+                    expressed relative to the mask wrapper's origin. */}
+                <div
+                  style={{
+                    position: "absolute",
+                    left: t.left - t.maskLeft,
+                    top: t.top - t.maskTop,
+                    transformOrigin: "0 0",
+                    transform: `translate(-50%, -50%) scale(${t.scale})`,
+                  }}
+                >
+                  <FaceVoice shape={t.shape} />
+                </div>
+              </div>
+            ) : (
+              <div
+                className="pointer-events-none absolute left-0 top-0 will-change-transform"
+                style={{
+                  transformOrigin: "0 0",
+                  transform: `translate(${t.left}px, ${t.top}px) translate(-50%, -50%) scale(${t.scale})`,
+                  opacity: t.opacity,
+                }}
+              >
+                <FaceVoice shape={t.shape} />
+              </div>
+            )}
+            <div
+              className="pointer-events-none absolute left-0 top-0 will-change-transform"
+              style={{
+                transformOrigin: "50% 100%",
+                transform: `translate(${t.left}px, ${bubbleTop}px) translate(-50%, -100%) scale(${bubbleScale})`,
+                opacity: t.opacity,
+              }}
+            >
+              <SpeechBubble
+                caption={t.caption}
+                thinking={t.thinking}
+                speaking={t.speaking}
+                maxWidth={bubbleMaxWidth}
+              />
+            </div>
+          </div>
+        );
+      })}
 
       {/* Breathing boxes (ready phase only). */}
       {breathingBoxes.map((b) => (
@@ -2174,59 +2865,6 @@ export function Tracker() {
         </div>
       )}
 
-      {/* Caption stack — one bubble per face with a caption, labeled by
-          the object class. Stacks at the bottom above the talk button. */}
-      {SHOW_CAPTIONS && tracksUI.some((t) => t.caption) && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-[max(env(safe-area-inset-bottom),22px)] px-5 pb-[148px]">
-          <div className="mx-auto flex max-w-md flex-col items-center gap-2">
-            {tracksUI
-              .filter((t) => t.caption)
-              .map((t) => (
-                <div
-                  key={t.id}
-                  className="w-full rounded-[22px] bg-white/95 px-5 py-3 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.55)] ring-1 ring-white/80 backdrop-blur-xl"
-                  style={{
-                    animation:
-                      "bubble-in 440ms cubic-bezier(0.16,1,0.3,1) both",
-                  }}
-                >
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <span className="rounded-full bg-[color:var(--ink)]/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.22em] text-[color:var(--ink-muted)]">
-                      {t.className}
-                    </span>
-                    {t.speaking && (
-                      <span className="flex gap-1">
-                        <span
-                          className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
-                          style={{
-                            animation: "soft-pulse 1s ease-in-out infinite",
-                          }}
-                        />
-                        <span
-                          className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
-                          style={{
-                            animation:
-                              "soft-pulse 1s ease-in-out 0.15s infinite",
-                          }}
-                        />
-                        <span
-                          className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]"
-                          style={{
-                            animation:
-                              "soft-pulse 1s ease-in-out 0.3s infinite",
-                          }}
-                        />
-                      </span>
-                    )}
-                  </div>
-                  <p className="serif-italic text-balance text-center text-[17px] leading-[1.35] text-[color:var(--ink)]">
-                    &ldquo;{t.caption}&rdquo;
-                  </p>
-                </div>
-              ))}
-          </div>
-        </div>
-      )}
       {/* Hold-to-talk button (unchanged). */}
       <div
         className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 px-5 pb-[max(env(safe-area-inset-bottom),22px)] pt-3"

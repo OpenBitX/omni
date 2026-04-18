@@ -116,12 +116,33 @@ export function FaceVoice({ shape }: FaceVoiceProps) {
 // frequency-domain buffers from an AnalyserNode (fftSize=1024), returns the
 // 9-way mouth-shape classification the PNG atlas expects.
 //
-// Thresholds are their originals — good enough for a demo, and tuneable in
-// isolation without touching the rendering layer.
+// Thresholds are their originals — kept for callers that don't hold state.
+// Prefer `classifyShapeSmooth` for real playback; it adds an envelope
+// follower, adaptive peak-normalized openness, and shape hysteresis so the
+// mouth doesn't flicker on noise and stays in sync even when different TTS
+// backends deliver very different output levels.
 export function classifyShape(
   timeBuf: Uint8Array<ArrayBuffer>,
   freqBuf: Uint8Array<ArrayBuffer>
 ): { shape: MouthShape; rms: number; centroid: number; midEnergy: number } {
+  const { rms, centroid, midEnergy } = extractFeatures(timeBuf, freqBuf);
+
+  let shape: MouthShape;
+  if (rms < 0.02) shape = "X";
+  else if (rms < 0.06) shape = "A";
+  else if (centroid > 0.55) shape = rms > 0.18 ? "C" : "B";
+  else if (centroid < 0.25) shape = rms > 0.2 ? "D" : "F";
+  else if (midEnergy > 0.5) shape = "E";
+  else if (rms > 0.25) shape = "D";
+  else shape = "C";
+
+  return { shape, rms, centroid, midEnergy };
+}
+
+function extractFeatures(
+  timeBuf: Uint8Array<ArrayBuffer>,
+  freqBuf: Uint8Array<ArrayBuffer>
+): { rms: number; centroid: number; midEnergy: number } {
   // RMS over normalized time-domain samples.
   let s = 0;
   for (let i = 0; i < timeBuf.length; i++) {
@@ -144,15 +165,107 @@ export function classifyShape(
   }
   const centroid = total > 0 ? weighted / total / freqBuf.length : 0;
   const midEnergy = total > 0 ? mids / total : 0;
+  return { rms, centroid, midEnergy };
+}
 
-  let shape: MouthShape;
-  if (rms < 0.02) shape = "X";
-  else if (rms < 0.06) shape = "A";
-  else if (centroid > 0.55) shape = rms > 0.18 ? "C" : "B";
-  else if (centroid < 0.25) shape = rms > 0.2 ? "D" : "F";
-  else if (midEnergy > 0.5) shape = "E";
-  else if (rms > 0.25) shape = "D";
-  else shape = "C";
+// Per-track state held across RAF frames. One instance per talking face.
+// Keeps an envelope follower + adaptive peak so openness is normalized to
+// whatever this TTS backend's actual output level is, plus hysteresis on
+// the chosen shape so single-frame spikes don't flick the mouth.
+export type LipSyncState = {
+  envelope: number;    // Asymmetric-follower RMS envelope (fast attack / slow release)
+  centroid: number;    // EMA-smoothed spectral centroid
+  midEnergy: number;   // EMA-smoothed mid-band energy fraction
+  peak: number;        // Rolling peak of envelope — used to normalize openness
+  prevShape: MouthShape;
+  heldFrames: number;  // Frames we've been on prevShape
+};
 
-  return { shape, rms, centroid, midEnergy };
+export function createLipSyncState(): LipSyncState {
+  return {
+    envelope: 0,
+    centroid: 0,
+    midEnergy: 0,
+    peak: 0,
+    prevShape: "X",
+    heldFrames: 0,
+  };
+}
+
+// Tuned for an RAF loop at ~60 fps with AnalyserNode.smoothingTimeConstant=0.4.
+// Attack/release are per-frame blend factors (not time-constants).
+const ENV_ATTACK = 0.55;         // fast — mouth opens promptly on syllable onsets
+const ENV_RELEASE = 0.15;        // slow — don't slam shut between syllables
+const SPECTRAL_ALPHA = 0.3;      // EMA for centroid / mid
+const PEAK_ATTACK = 0.6;         // peak follows envelope up quickly
+const PEAK_DECAY = 0.0015;       // and drifts down slowly (~1s to halve)
+const PEAK_FLOOR = 0.04;         // never normalize against a silence-level peak
+const SILENCE_ENV = 0.012;       // below this → closed mouth (X)
+const MIN_HOLD_FRAMES = 2;       // hysteresis — require 2 frames before reclassifying an open shape
+
+// Stateful, smoothed lip-sync classifier. Maintains an envelope follower
+// whose openness is divided by a rolling peak, so quiet TTS still opens
+// the mouth and loud TTS doesn't sit on the widest shape the whole line.
+// Closed→open transitions are immediate (responsiveness); open→other-open
+// transitions wait MIN_HOLD_FRAMES (stability).
+export function classifyShapeSmooth(
+  state: LipSyncState,
+  timeBuf: Uint8Array<ArrayBuffer>,
+  freqBuf: Uint8Array<ArrayBuffer>
+): MouthShape {
+  const { rms, centroid, midEnergy } = extractFeatures(timeBuf, freqBuf);
+
+  // Asymmetric envelope follower on instantaneous RMS.
+  const a = rms > state.envelope ? ENV_ATTACK : ENV_RELEASE;
+  state.envelope = state.envelope + a * (rms - state.envelope);
+  state.centroid = state.centroid + SPECTRAL_ALPHA * (centroid - state.centroid);
+  state.midEnergy = state.midEnergy + SPECTRAL_ALPHA * (midEnergy - state.midEnergy);
+
+  // Adaptive peak. Fast up, slow down, clamped to a floor so we don't
+  // amplify DC/background noise into a wide-open mouth during silence.
+  if (state.envelope > state.peak) {
+    state.peak = state.peak + PEAK_ATTACK * (state.envelope - state.peak);
+  } else {
+    state.peak = Math.max(PEAK_FLOOR, state.peak - PEAK_DECAY);
+  }
+
+  // Normalized openness in [0, 1].
+  const openness = Math.min(1, state.envelope / Math.max(state.peak, PEAK_FLOOR));
+
+  let next: MouthShape;
+  if (state.envelope < SILENCE_ENV) {
+    next = "X";
+  } else if (openness < 0.2) {
+    next = "A";
+  } else if (state.centroid > 0.5) {
+    // Bright / front vowels + fricatives — wide but not tall.
+    next = openness > 0.65 ? "C" : "B";
+  } else if (state.centroid < 0.28) {
+    // Dark / back vowels — rounded, tall.
+    next = openness > 0.7 ? "D" : "F";
+  } else if (state.midEnergy > 0.48) {
+    next = "E";
+  } else {
+    next = openness > 0.75 ? "D" : "C";
+  }
+
+  // Hysteresis. Closing or opening-from-closed is always immediate (feels
+  // sluggish otherwise). Lateral moves between open shapes require a few
+  // frames of agreement so a single jittery spectrum doesn't flap the
+  // mouth shape at 60 Hz.
+  const prev = state.prevShape;
+  const instantTransition =
+    next === "X" || prev === "X" || next === prev;
+  if (instantTransition) {
+    state.prevShape = next;
+    state.heldFrames = next === prev ? state.heldFrames + 1 : 0;
+    return next;
+  }
+  state.heldFrames += 1;
+  if (state.heldFrames < MIN_HOLD_FRAMES) {
+    return prev;
+  }
+  state.prevShape = next;
+  state.heldFrames = 0;
+  return next;
 }
