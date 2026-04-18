@@ -23,7 +23,19 @@ export async function POST(req: Request) {
   const description =
     typeof body.description === "string" ? body.description : null;
   const history = Array.isArray(body.history) ? body.history : [];
-  const lang = body.lang === "zh" ? "zh" : "en";
+  const lang: "en" | "zh" = body.lang === "zh" ? "zh" : "en";
+  // Optional language-pair fields. Missing side infers as the opposite of
+  // the side that IS present; missing both collapses to `lang` (legacy).
+  const spokenLangProvided = body.spokenLang === "zh" || body.spokenLang === "en";
+  const learnLangProvided = body.learnLang === "zh" || body.learnLang === "en";
+  const spokenLang: "en" | "zh" = spokenLangProvided
+    ? body.spokenLang
+    : lang;
+  const learnLang: "en" | "zh" = learnLangProvided
+    ? body.learnLang
+    : spokenLangProvided
+      ? (spokenLang === "zh" ? "en" : "zh")
+      : lang;
   const tag =
     typeof body.tag === "string" && body.tag.trim()
       ? body.tag.trim().slice(0, 32)
@@ -41,7 +53,9 @@ export async function POST(req: Request) {
       description,
       history,
       lang,
-      tag
+      tag,
+      spokenLang,
+      learnLang
     );
     // eslint-disable-next-line no-console
     console.log(

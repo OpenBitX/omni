@@ -18,11 +18,20 @@ import {
   type MouthShape,
 } from "@/components/face-voice";
 import { SpeechBubble } from "@/components/speech-bubble";
+import { CapturePopup, type CaptureItem } from "@/components/capture-popup";
 import {
   addSessionCard,
+  appendCardHistory,
+  cardDisplayName,
   clearSessionCards,
+  setCardImageStatus,
+  setCardGeneratedImage,
+  setCardLanguages,
+  setCardTeachMode,
+  useSessionCards,
   type SessionCard,
 } from "@/lib/session-cards";
+import { type AppLang } from "@/lib/lang-detect";
 import {
   COCO_CLASSES,
   PERSON_CLASS_ID,
@@ -668,6 +677,54 @@ export function Tracker() {
     langRef.current = lang;
   }, [lang]);
 
+  // Spoken / learn language pair. The user speaks Chinese (hardcoded; the
+  // product is aimed at a ZH-native audience). The existing top-right
+  // toggle controls `learnLang`: when it matches spokenLang (zh), the
+  // object replies in Chinese and teach-mode stays off; when flipped to
+  // EN, the object introduces itself + replies in English and teach-mode
+  // engages the moment the user asks how to say something.
+  //
+  // Navigator detection is intentionally gone — we commit to a language
+  // default rather than guessing. The STT path still uses spokenLang, so
+  // audio routes correctly regardless of UI toggle state.
+  const [spokenLang] = useState<AppLang>("zh");
+  const [learnLang, setLearnLang] = useState<AppLang>(lang as AppLang);
+  const spokenLangRef = useRef<AppLang>("zh");
+  const learnLangRef = useRef<AppLang>(lang as AppLang);
+  useEffect(() => {
+    learnLangRef.current = learnLang;
+  }, [learnLang]);
+  // The top-right EN/中 toggle drives `lang`; mirror it to learnLang so
+  // one control is responsible for the learn-target. spokenLang stays zh.
+  useEffect(() => {
+    setLearnLang(lang as AppLang);
+  }, [lang]);
+
+  // Subscribe to the card store so the "collect to gallery" button can
+  // reflect per-track generatedImageStatus.
+  const sessionCards = useSessionCards();
+
+  // Capture popup state. `pendingCapture` is set the instant a YOLO box
+  // is tapped so the popup appears at the same moment the face spawns —
+  // not 3–5s later when the VLM finishes. It carries just the crop +
+  // class name; the popup renders an "preparing…" disabled-collect state
+  // until the matching SessionCard lands in the store, at which point
+  // the popup upgrades seamlessly (same trackId, no remount).
+  type PendingCapture = {
+    trackId: string;
+    className: string;
+    imageDataUrl: string;
+    createdAt: number;
+  };
+  const [pendingCapture, setPendingCapture] = useState<PendingCapture | null>(
+    null
+  );
+  // Dismissal is keyed by trackId so pending→card upgrades don't revive
+  // a dismissed popup.
+  const [dismissedTrackIds, setDismissedTrackIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
+
   // --- Push-to-talk state (UI only, decoupled from per-track voice) -----
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
@@ -1174,6 +1231,8 @@ export function Tracker() {
     // Full-reset also wipes the session gallery — the × button handles
     // per-card removal; this is the "clean slate" demo hard-reset.
     clearSessionCards();
+    setDismissedTrackIds(new Set());
+    setPendingCapture(null);
     // Bump generation so any in-flight tap's generateLine/TTS drops silent.
     generationRef.current++;
     // Invalidate any staged group turn + in-flight prepare; scene is gone.
@@ -1298,7 +1357,11 @@ export function Tracker() {
       console.log(
         `[describe:${trackId}${tag}] → describeObject  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  gen=${gen}`
       );
-      describeObject(cropDataUrl, track.className, langRef.current, tapTag)
+      // Describe in the learn-target language so the downstream persona
+      // card + retap lines stay consistent with what the user wants to
+      // hear (e.g. learnLang=en → object description is in English even
+      // when the user speaks Chinese).
+      describeObject(cropDataUrl, track.className, learnLangRef.current, tapTag)
         .then(({ description }) => {
           // Track may have been evicted while we waited; bail if so.
           const current = tracksRef.current.find((t) => t.id === trackId);
@@ -1685,6 +1748,10 @@ export function Tracker() {
         let line: string;
         let chosenVoiceId: string | null;
         let chosenDescription: string | null;
+        // VLM-emitted short name for this specific object. Hoisted so
+        // both branches (first-tap bundled + retap text-only) can stash
+        // it onto the new SessionCard below.
+        let chosenName: string | null = null;
         let preopenedForTts:
           | { respBody: ReadableStream<Uint8Array>; backend: string }
           | undefined;
@@ -1714,6 +1781,8 @@ export function Tracker() {
                 description: track.description,
                 history: track.history.slice(-32),
                 lang: langRef.current,
+                spokenLang: spokenLangRef.current,
+                learnLang: learnLangRef.current,
                 turnId: tapTag.replace(/^#/, "").slice(0, 16),
               }),
               signal: speakCtrl.signal,
@@ -1752,6 +1821,7 @@ export function Tracker() {
             line?: string;
             voiceId?: string | null;
             description?: string | null;
+            name?: string | null;
           };
           try {
             // Decode as UTF-8 — the server base64-encodes UTF-8 bytes, and
@@ -1794,6 +1864,10 @@ export function Tracker() {
             typeof meta.description === "string" && meta.description.trim()
               ? meta.description.trim()
               : null;
+          chosenName =
+            typeof meta.name === "string" && meta.name.trim()
+              ? meta.name.trim()
+              : null;
           // 204 = no TTS backend configured. Caption-only degraded mode;
           // leave preopenedForTts undefined so we don't try to stream.
           if (speakResp.status === 200 && speakResp.body) {
@@ -1808,13 +1882,18 @@ export function Tracker() {
           // Retap path: text-only generateLine, then /api/tts/stream via
           // playStreamingReply (unchanged).
           const result = await Promise.race([
+            // Signature extended with the spoken/learn language pair.
+            // When both are provided the retap prompt biases output
+            // toward `learnLang` so the user gets practice input.
             generateLine(
               cropDataUrl,
               track.voiceId,
               track.description,
               track.history.slice(-32),
               langRef.current,
-              tapTag
+              tapTag,
+              spokenLangRef.current,
+              learnLangRef.current
             ),
             new Promise<never>((_, reject) =>
               setTimeout(
@@ -1841,6 +1920,7 @@ export function Tracker() {
           line = result.line;
           chosenVoiceId = result.voiceId;
           chosenDescription = result.description;
+          chosenName = result.name ?? null;
         }
         capturedLine = line;
         // Pin the voice on first return — every subsequent speak/talk on
@@ -1874,12 +1954,21 @@ export function Tracker() {
             trackId,
             createdAt: Date.now(),
             className: track.className,
+            objectName: chosenName ?? undefined,
             description: chosenDescription,
             voiceId: chosenVoiceId,
             line,
             imageDataUrl: cropDataUrl,
+            spokenLang: spokenLangRef.current,
+            learnLang: learnLangRef.current,
           };
           addSessionCard(newCard);
+          // Seed the card's persisted history with the opening line so
+          // the Runware prompt builder has context even if no conversation
+          // happens before the user hits collect.
+          appendCardHistory({ trackId }, [
+            { role: "assistant", content: line },
+          ]);
         }
         // Record what the object said into its own memory so a later
         // conversation turn can call back to it.
@@ -2572,9 +2661,20 @@ export function Tracker() {
               ? "talk.ogg"
               : "talk.webm";
         formData.append("audio", blob, filename);
-        formData.append("className", track.className);
+        // Prefer the VLM's specific name from the card store; fall back
+        // to the YOLO class only when the card hasn't landed yet. The
+        // server uses this as the subject label in prompts — richer
+        // names keep the persona on-topic across a session.
+        {
+          const card = sessionCards.find((c) => c.trackId === track.id);
+          const subject =
+            card?.objectName?.trim() || card?.className || track.className;
+          formData.append("className", subject);
+        }
         formData.append("turnId", tid);
         formData.append("lang", langRef.current);
+        formData.append("spokenLang", spokenLangRef.current);
+        formData.append("learnLang", learnLangRef.current);
         if (track.voiceId) formData.append("voiceId", track.voiceId);
         // Rich visual notes hydrated in the background by describeObject.
         // This is what lets converseWithObject stay text-only on the hot
@@ -2596,18 +2696,43 @@ export function Tracker() {
         );
 
         const t0 = performance.now();
+        const converseResp = (await converseWithObject(formData)) as {
+          transcript: string;
+          reply: string;
+          voiceId: string | null;
+          emotion?: string | null;
+          speed?: string | null;
+          teachMode?: boolean;
+        };
         const {
           transcript,
           reply,
           voiceId: replyVoiceId,
           emotion: replyEmotion,
           speed: replySpeed,
-        } = await converseWithObject(formData);
+          teachMode: replyTeachMode,
+        } = converseResp;
         const converseMs = Math.round(performance.now() - t0);
         if (callGen !== track.speakGen) {
           // eslint-disable-next-line no-console
           console.log(`[converse #${tid}] ✗ superseded (speakGen mismatch)`);
           return;
+        }
+        // spokenLang is locked to zh (product target audience); no
+        // per-utterance refinement. We still use detectLangFromText when
+        // debugging but don't mutate state from it.
+        // Persist the turn into the gallery card's history so the Runware
+        // prompt builder has real conversation context, and mirror the
+        // current language pair onto the card.
+        appendCardHistory({ trackId }, [
+          ...(transcript
+            ? [{ role: "user" as const, content: transcript }]
+            : []),
+          ...(reply ? [{ role: "assistant" as const, content: reply }] : []),
+        ]);
+        setCardLanguages(trackId, spokenLangRef.current, learnLangRef.current);
+        if (typeof replyTeachMode === "boolean") {
+          setCardTeachMode(trackId, replyTeachMode);
         }
         // Commit the exchange to this track's memory so future turns see
         // the full thread. Cap to the same 16 turns the server enforces.
@@ -2740,6 +2865,60 @@ export function Tracker() {
     ]
   );
 
+  // --- Collect to gallery ------------------------------------------------
+  //
+  // Fire-and-forget: trigger the Runware pipeline on the parallel
+  // /api/runware/generate endpoint and update card status in the store.
+  // We don't await the result in the caller — the gallery page reads the
+  // "pending → done" transition off the card store and renders a shimmer
+  // until the image URL arrives, so the user can keep chatting here.
+  const handleCollect = useCallback(
+    async (trackId: string) => {
+      const card = sessionCards.find((c) => c.trackId === trackId);
+      if (!card) {
+        showRejection("not captured yet — tap again", 2000);
+        return;
+      }
+      if (card.generatedImageStatus === "pending") return;
+      if (card.generatedImageStatus === "done") return;
+      setCardImageStatus(card.id, "pending");
+      try {
+        const resp = await fetch("/api/runware/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            cardId: card.id,
+            className: card.className,
+            description: card.description,
+            history: card.history ?? [],
+            spokenLang: spokenLangRef.current,
+            learnLang: learnLangRef.current,
+            // Let the VLM see the actual crop so it can write a prompt with
+            // details you couldn't guess from className alone.
+            imageDataUrl: card.imageDataUrl,
+          }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ error: "unknown" }));
+          setCardImageStatus(card.id, "failed", {
+            error: String(err.error ?? "unknown"),
+          });
+          return;
+        }
+        const { imageUrl, prompt } = (await resp.json()) as {
+          imageUrl: string;
+          prompt: string;
+        };
+        setCardGeneratedImage(card.id, imageUrl, prompt);
+      } catch (e) {
+        setCardImageStatus(card.id, "failed", {
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    },
+    [sessionCards, showRejection]
+  );
+
   // --- Group chat -------------------------------------------------------
   //
   // Two-stage pipeline:
@@ -2765,6 +2944,18 @@ export function Tracker() {
   //   2. Otherwise (or 30% of the time under #1): quietest track wins;
   //      ties broken by older lastTapAt so a freshly-tapped object doesn't
   //      steal the floor from a track that's barely spoken.
+  // Resolve the user-facing label for a track — prefers the VLM's
+  // objectName (stored on the session card) over the YOLO class. Used
+  // everywhere a name flows into an LLM prompt or a user-facing string
+  // so the model never echoes a raw detector class like "cup".
+  const nameForTrack = useCallback(
+    (t: TrackRefs): string => {
+      const card = sessionCards.find((c) => c.trackId === t.id);
+      return card?.objectName?.trim() || card?.className || t.className;
+    },
+    [sessionCards]
+  );
+
   const pickGroupSpeaker = useCallback((): TrackRefs | null => {
     const tracks = tracksRef.current;
     if (tracks.length < 1) return null;
@@ -2823,7 +3014,7 @@ export function Tracker() {
       tracks.length === 1 ? "followup" : "chat";
     const peers = tracks
       .filter((t) => t.id !== pick.id)
-      .map((t) => ({ name: t.className, description: t.description ?? null }));
+      .map((t) => ({ name: nameForTrack(t), description: t.description ?? null }));
     const recentTurns = groupHistoryRef.current.slice(-16).map((t) => ({
       speaker: t.speaker,
       line: t.line,
@@ -2839,7 +3030,7 @@ export function Tracker() {
       );
       const { line, emotion, speed, addressing } = await groupLine({
         speaker: {
-          name: pick.className,
+          name: nameForTrack(pick),
           description: pick.description ?? null,
         },
         peers,
@@ -2895,7 +3086,7 @@ export function Tracker() {
       if (gen !== groupGenRef.current) return;
       preparedTurnRef.current = {
         trackId: pick.id,
-        speakerName: pick.className,
+        speakerName: nameForTrack(pick),
         line,
         voiceId: pick.voiceId,
         audioBlob,
@@ -3140,7 +3331,7 @@ export function Tracker() {
       const peers = tracks
         .filter((t) => t.id !== pick.id)
         .map((t) => ({
-          name: t.className,
+          name: nameForTrack(t),
           description: t.description ?? null,
         }));
       const recentTurns = groupHistoryRef.current.slice(-16).map((t) => ({
@@ -3163,7 +3354,7 @@ export function Tracker() {
       );
       const { line, emotion, speed, addressing } = await groupLine({
         speaker: {
-          name: speaker.className,
+          name: nameForTrack(speaker),
           description: speaker.description ?? null,
         },
         peers,
@@ -3564,6 +3755,23 @@ export function Tracker() {
       seedBoxEMA(boxEma, lockBox);
       const newId = `t${nextTrackIdRef.current++}`;
       const nowTs = performance.now();
+      // Seed the capture popup NOW so it appears the same instant the
+      // face does — not 3–5s later when the VLM returns. The popup's
+      // collect button stays disabled ("preparing…") until the matching
+      // SessionCard lands in the store. Resetting dismissedTrackIds for
+      // this id lets the user retap a previously-dismissed object.
+      setPendingCapture({
+        trackId: newId,
+        className: tapped.className,
+        imageDataUrl: dataUrl,
+        createdAt: Date.now(),
+      });
+      setDismissedTrackIds((prev) => {
+        if (!prev.has(newId)) return prev;
+        const next = new Set(prev);
+        next.delete(newId);
+        return next;
+      });
       const newTrack: TrackRefs = {
         id: newId,
         classId: tapped.classId,
@@ -3853,7 +4061,8 @@ export function Tracker() {
       //   3. If Whisper also fails or is empty, the server-side STT in
       //      converseWithObject is the last-resort fallback.
       const turnId = turnIdRef.current;
-      const lang = langRef.current;
+      // STT always uses the spoken language (not the learn-target).
+      const lang = spokenLangRef.current;
       void (async () => {
         const finished = speechFinishedRef.current;
         if (finished) {
@@ -3942,7 +4151,8 @@ export function Tracker() {
         }
         setHeardText(null);
         const sr = new SR();
-        sr.lang = langRef.current === "zh" ? "zh-CN" : "en-US";
+        // Always recognize the user's spoken language, not the learn-target.
+        sr.lang = spokenLangRef.current === "zh" ? "zh-CN" : "en-US";
         sr.continuous = true;
         // Stream partials as the user speaks so the "you said" bubble updates
         // live. Final chunks still land in speechTranscriptPartsRef for the
@@ -4090,19 +4300,70 @@ export function Tracker() {
   const micBusy = anyThinking || anySpeaking;
 
   // Which face the mic is aimed at — the most-recently-tapped one. Drives
-  // the button label so the user sees "talk to the cup" before they press.
+  // the button label so the user sees "talk to the mug" before they press.
+  // Prefers the VLM's objectName (from the card store) over the YOLO class
+  // so the label matches everything else in the UI; falls back to a neutral
+  // "it" when no card has landed yet.
   const talkTargetClass: string | null = useMemo(() => {
     if (tracksUI.length === 0) return null;
     let best: TrackRefs | null = null;
     for (const t of tracksRef.current) {
       if (!best || t.lastTapAt > best.lastTapAt) best = t;
     }
-    return best?.className ?? null;
-    // Invalidate on track add/remove. lastTapAt churn within tracksRef
-    // is intentionally not a dep — it'd trigger every tap without changing
-    // the target, since the last-tap-wins order is already stable.
+    if (!best) return null;
+    const card = sessionCards.find((c) => c.trackId === best!.id);
+    if (card) return cardDisplayName(card);
+    return learnLang === "zh" ? "它" : "it";
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tracksUI]);
+  }, [tracksUI, sessionCards, learnLang]);
+
+  // Unified popup item: prefer the pending capture (so the popup appears
+  // instantly on tap), upgrade to the stored card as soon as its trackId
+  // matches. Falls back to the newest non-dismissed card when nothing is
+  // pending, so dismissed popups don't leave stale state behind.
+  const activeCaptureItem: CaptureItem | null = useMemo(() => {
+    const placeholderName = learnLang === "zh" ? "识别中…" : "looking…";
+    if (pendingCapture) {
+      if (dismissedTrackIds.has(pendingCapture.trackId)) return null;
+      const card = sessionCards.find(
+        (c) => c.trackId === pendingCapture.trackId
+      );
+      if (card) {
+        return {
+          trackId: card.trackId,
+          // Never show the YOLO class — use the VLM's name, falling
+          // back to a neutral language-appropriate placeholder.
+          className: cardDisplayName(card),
+          imageDataUrl: card.imageDataUrl,
+          cardId: card.id,
+          status: (card.generatedImageStatus ?? "idle") as CaptureItem["status"],
+        };
+      }
+      return {
+        trackId: pendingCapture.trackId,
+        // While the VLM is in flight we intentionally don't surface the
+        // YOLO class — it would be "cup" / "chair", defeating the whole
+        // point of VLM-named cards. Show a language-appropriate
+        // placeholder and let the popup upgrade when the name arrives.
+        className: placeholderName,
+        imageDataUrl: pendingCapture.imageDataUrl,
+        cardId: null,
+        status: "preparing",
+      };
+    }
+    for (let i = sessionCards.length - 1; i >= 0; i--) {
+      const c = sessionCards[i];
+      if (dismissedTrackIds.has(c.trackId)) continue;
+      return {
+        trackId: c.trackId,
+        className: cardDisplayName(c),
+        imageDataUrl: c.imageDataUrl,
+        cardId: c.id,
+        status: (c.generatedImageStatus ?? "idle") as CaptureItem["status"],
+      };
+    }
+    return null;
+  }, [sessionCards, dismissedTrackIds, pendingCapture, learnLang]);
 
   const dotClass =
     phase === "error"
@@ -4276,10 +4537,7 @@ export function Tracker() {
           }}
         >
           <span className="serif-italic absolute -top-[26px] left-1 flex items-center gap-1 rounded-full bg-[color:var(--ink)]/75 px-2.5 py-0.5 text-[11px] font-medium text-white ring-1 ring-white/20 backdrop-blur-md">
-            <span>{b.className}</span>
-            <span className="tabular-nums text-white/60">
-              {Math.round(b.score * 100)}%
-            </span>
+            <span>{learnLang === "zh" ? "点我" : "tap me"}</span>
           </span>
         </div>
       ))}
@@ -4342,14 +4600,21 @@ export function Tracker() {
               {statusText}
             </span>
           </div>
-          {/* Language toggle — EN / 中. Drives prompts, STT and voice-catalog
-              filter. Only affects calls started AFTER the flip; in-flight
-              TTS from a prior language keeps playing (no mid-sentence cut). */}
+          {/* Learn-language toggle — 中 / EN. spokenLang is locked to zh;
+              this switches the target language the object introduces itself
+              and replies in, which also gates teach mode. Only affects
+              calls started AFTER the flip; in-flight TTS keeps playing. */}
           <div
             role="group"
-            aria-label="language"
-            className="flex items-center gap-0.5 rounded-full bg-white/15 p-0.5 ring-1 ring-white/25 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] backdrop-blur-xl"
+            aria-label="learn language"
+            className="flex items-center gap-1 rounded-full bg-white/15 p-0.5 pl-2 ring-1 ring-white/25 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] backdrop-blur-xl"
           >
+            <span
+              aria-hidden
+              className="select-none text-[9px] font-semibold uppercase tracking-[0.15em] text-white/55"
+            >
+              learn
+            </span>
             <button
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => {
@@ -4872,6 +5137,27 @@ export function Tracker() {
           </div>
         </div>
       )}
+
+      {/* Capture popup — appears the instant the user taps a YOLO box
+          (same moment the face spawns). Shows the crop + name in a
+          "preparing" state while the VLM is in flight, then upgrades
+          to an enabled "collect to gallery" button once the card lands.
+          Face/voice chat above it is unchanged — this popup is a
+          separate, intentional "collect" affordance. */}
+      <CapturePopup
+        item={activeCaptureItem}
+        onCollect={(trackId) => {
+          void handleCollect(trackId);
+        }}
+        onDismiss={(trackId) => {
+          setDismissedTrackIds((prev) => {
+            if (prev.has(trackId)) return prev;
+            const next = new Set(prev);
+            next.add(trackId);
+            return next;
+          });
+        }}
+      />
 
       {/* Hold-to-talk button (unchanged). */}
       <div

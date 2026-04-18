@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import Link from "next/link";
 import {
+  cardDisplayName,
   clearSessionCards,
   removeSessionCard,
   useSessionCards,
@@ -38,35 +39,64 @@ export default function GalleryPage() {
   const cards = useSessionCards();
 
   return (
-    <div className="min-h-dvh bg-gradient-to-br from-[#1a0f2e] via-[#2a1540] to-[#3d1a4d] pb-[max(env(safe-area-inset-bottom),24px)] pt-[max(env(safe-area-inset-top),18px)] text-white">
-      <Header hasCards={cards.length > 0} />
-      <main className="mx-auto w-full max-w-[1120px] px-4 pb-12 pt-4 sm:px-6">
-        {cards.length === 0 ? (
-          <EmptyState />
-        ) : (
-          <GalleryGrid cards={cards} />
-        )}
-      </main>
+    <div className="relative min-h-dvh overflow-hidden bg-[#120822] pb-[max(env(safe-area-inset-bottom),24px)] pt-[max(env(safe-area-inset-top),18px)] text-white">
+      {/* Ambient light — aurora blobs drifting behind everything. */}
+      <div className="aurora-layer" aria-hidden>
+        <div className="aurora-blob aurora-a" />
+        <div className="aurora-blob aurora-b" />
+        <div className="aurora-blob aurora-c" />
+        <div className="aurora-grain" />
+      </div>
+      {/* Vignette so the card column reads centered without a hard frame. */}
+      <div
+        aria-hidden
+        className="pointer-events-none fixed inset-0 z-0"
+        style={{
+          background:
+            "radial-gradient(ellipse at 50% 30%, transparent 0%, rgba(8,4,20,0.35) 65%, rgba(8,4,20,0.7) 100%)",
+        }}
+      />
+      <div className="relative z-10">
+        <Header hasCards={cards.length > 0} />
+        <main className="mx-auto w-full max-w-[1120px] px-4 pb-12 pt-4 sm:px-6">
+          {cards.length === 0 ? (
+            <EmptyState />
+          ) : (
+            <GalleryGrid cards={cards} />
+          )}
+        </main>
+      </div>
     </div>
   );
 }
 
 function Header({ hasCards }: { hasCards: boolean }) {
   return (
-    <header className="mx-auto grid w-full max-w-[560px] grid-cols-[1fr_auto_1fr] items-center gap-3 px-4 sm:px-6">
+    <header className="mx-auto grid w-full max-w-[720px] grid-cols-[1fr_auto_1fr] items-center gap-3 px-4 sm:px-6">
       <div className="justify-self-start">
         <Link
           href="/"
           aria-label="back to camera"
-          className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-[11.5px] font-medium ring-1 ring-white/20 backdrop-blur-xl transition hover:bg-white/20"
+          className="group inline-flex items-center gap-1.5 rounded-full bg-white/[0.06] px-3.5 py-2 text-[11.5px] font-medium text-white/85 ring-1 ring-white/15 backdrop-blur-xl transition hover:-translate-y-0.5 hover:bg-white/[0.12] hover:text-white"
         >
-          <span aria-hidden>←</span>
+          <span aria-hidden className="transition-transform group-hover:-translate-x-0.5">←</span>
           <span>camera</span>
         </Link>
       </div>
-      <h1 className="serif-italic justify-self-center text-[22px] font-medium leading-none text-white/95 sm:text-[26px]">
-        gallery
-      </h1>
+      <div className="justify-self-center text-center">
+        <h1
+          className="serif-italic relative text-[30px] font-medium leading-none text-white sm:text-[38px]"
+          style={{
+            textShadow:
+              "0 0 28px rgba(255,182,214,0.35), 0 2px 0 rgba(0,0,0,0.15)",
+          }}
+        >
+          gallery
+        </h1>
+        <p className="mt-2 text-[10.5px] uppercase tracking-[0.32em] text-white/45">
+          things that spoke to you
+        </p>
+      </div>
       <div className="justify-self-end">
         {hasCards && (
           <button
@@ -76,7 +106,7 @@ function Header({ hasCards }: { hasCards: boolean }) {
                 clearSessionCards();
               }
             }}
-            className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-white/80 ring-1 ring-white/20 backdrop-blur-xl transition hover:bg-white/20 hover:text-white/95"
+            className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.06] px-3.5 py-2 text-[11px] font-medium uppercase tracking-[0.18em] text-white/75 ring-1 ring-white/15 backdrop-blur-xl transition hover:-translate-y-0.5 hover:bg-white/[0.12] hover:text-white"
           >
             clear
           </button>
@@ -88,26 +118,46 @@ function Header({ hasCards }: { hasCards: boolean }) {
 
 function EmptyState() {
   return (
-    <div className="mx-auto mt-20 max-w-md rounded-[28px] bg-white/8 p-8 text-center ring-1 ring-white/15 backdrop-blur-xl">
+    <div
+      className="relative mx-auto mt-24 max-w-md overflow-hidden rounded-[32px] bg-white/[0.05] p-10 text-center ring-1 ring-white/15 backdrop-blur-2xl"
+      style={{
+        boxShadow:
+          "0 30px 80px -30px rgba(255,137,190,0.35), inset 0 1px 0 rgba(255,255,255,0.06)",
+      }}
+    >
       <div
         aria-hidden
-        className="mx-auto mb-5 grid h-14 w-14 place-items-center rounded-2xl bg-white/10 text-2xl"
+        className="pointer-events-none absolute -inset-px rounded-[32px]"
+        style={{
+          background:
+            "radial-gradient(140% 80% at 50% 0%, rgba(255,182,214,0.18), transparent 60%)",
+        }}
+      />
+      <div
+        aria-hidden
+        className="relative mx-auto mb-6 grid h-16 w-16 place-items-center rounded-[22px] bg-gradient-to-br from-pink-300/50 to-violet-400/40 text-[28px] ring-1 ring-white/20"
+        style={{
+          animation: "soft-pulse 3.2s ease-in-out infinite",
+          boxShadow: "0 18px 42px -12px rgba(255,137,190,0.5)",
+        }}
       >
         ✨
       </div>
-      <h2 className="text-[18px] font-semibold text-white/95">
-        Nothing captured yet
+      <h2 className="serif-italic relative text-[22px] leading-tight text-white/95">
+        nothing speaking yet
       </h2>
-      <p className="mt-2 text-[13.5px] leading-relaxed text-white/70">
-        Point your camera at something and tap it. The first opening line
-        the VLM writes gets saved here — and you can keep the conversation
-        going right from this page.
+      <p className="relative mt-3 text-[13px] leading-relaxed text-white/65">
+        Point your camera at something small and tap. The first thing it says
+        gets pressed like a flower — kept here, still talking, waiting for
+        you to reply.
       </p>
       <Link
         href="/"
-        className="mt-5 inline-flex items-center gap-2 rounded-full bg-pink-400/90 px-4 py-2 text-[12.5px] font-semibold text-pink-950 shadow-lg shadow-pink-400/40 transition hover:bg-pink-300"
+        className="relative mt-6 inline-flex items-center gap-2 rounded-full bg-gradient-to-br from-pink-300 to-pink-400 px-5 py-2.5 text-[12.5px] font-semibold text-pink-950 ring-1 ring-white/40 transition hover:-translate-y-0.5 hover:from-pink-200 hover:to-pink-300"
+        style={{ boxShadow: "0 14px 34px -10px rgba(255,137,190,0.65)" }}
       >
-        open camera
+        <span>open the camera</span>
+        <span aria-hidden>→</span>
       </Link>
     </div>
   );
@@ -402,12 +452,17 @@ function GalleryGrid({ cards }: { cards: readonly SessionCard[] }) {
             ? "talk.ogg"
             : "talk.webm";
         form.append("audio", blob, filename);
-        form.append("className", card.className);
+        // Pass the VLM's specific name to the server so the persona
+        // ("a chipped ceramic mug") rides through the conversation
+        // instead of the coarse YOLO class ("cup").
+        form.append("className", card.objectName?.trim() || card.className);
         form.append("voiceId", card.voiceId);
         form.append("description", card.description);
         form.append("history", JSON.stringify(history.slice(-32)));
         form.append("turnId", turnId);
-        form.append("lang", "en");
+        form.append("lang", card.learnLang ?? card.spokenLang ?? "zh");
+        if (card.spokenLang) form.append("spokenLang", card.spokenLang);
+        if (card.learnLang) form.append("learnLang", card.learnLang);
 
         const { transcript, reply, voiceId: replyVoiceId } =
           await converseWithObject(form);
@@ -574,20 +629,43 @@ function GalleryGrid({ cards }: { cards: readonly SessionCard[] }) {
           {errorMsg}
         </div>
       )}
-      <ul className="mx-auto flex w-full max-w-[560px] flex-col gap-4">
-        {cards.map((card, i) => (
-          <li key={card.id} style={{ animationDelay: `${Math.min(i, 8) * 40}ms` }} className="gallery-card-enter">
-            <CardItem
-              card={card}
-              status={statusByCard[card.id] ?? "idle"}
-              replyText={liveReplyByCard[card.id] ?? null}
-              shape={statusByCard[card.id] === "speaking" ? shape : "X"}
-              onMicPress={onMicPress}
-              onMicRelease={onMicRelease}
-              onRemove={() => removeSessionCard(card.id)}
-            />
-          </li>
-        ))}
+      <ul
+        className="gallery-list mx-auto flex w-full max-w-[620px] flex-col gap-5"
+        data-focused={activeCardId ? "true" : "false"}
+        style={{ perspective: "1200px" }}
+      >
+        {cards.map((card, i) => {
+          const cardStatus = statusByCard[card.id] ?? "idle";
+          // Deterministic pseudo-random tilt per card (polaroid feel).
+          const seed = hashSeed(card.id);
+          const tilt = ((seed % 100) / 100 - 0.5) * 2.4; // ~±1.2deg
+          const breathDelay = ((seed >> 4) % 100) / 100 * 2.2;
+          return (
+            <li
+              key={card.id}
+              data-active={cardStatus !== "idle" ? "true" : "false"}
+              className="gallery-card-enter"
+              style={
+                {
+                  ["--enter-delay"]: `${Math.min(i, 8) * 70}ms`,
+                  ["--breath-delay"]: `${breathDelay}s`,
+                  ["--tilt"]: `${tilt}deg`,
+                } as React.CSSProperties
+              }
+            >
+              <CardItem
+                card={card}
+                status={cardStatus}
+                replyText={liveReplyByCard[card.id] ?? null}
+                shape={cardStatus === "speaking" ? shape : "X"}
+                onMicPress={onMicPress}
+                onMicRelease={onMicRelease}
+                onRemove={() => removeSessionCard(card.id)}
+                heard={heardByCard[card.id] ?? null}
+              />
+            </li>
+          );
+        })}
       </ul>
     </>
   );
@@ -603,6 +681,7 @@ function CardItem({
   onMicPress,
   onMicRelease,
   onRemove,
+  heard,
 }: {
   card: SessionCard;
   status: CardStatus;
@@ -611,23 +690,90 @@ function CardItem({
   onMicPress: (cardId: string) => void;
   onMicRelease: (cardId: string) => void;
   onRemove: () => void;
+  heard: string | null;
 }) {
   const isActive = status !== "idle";
   const isSpeaking = status === "speaking";
   const isRecording = status === "recording";
   const isThinking = status === "thinking";
-  const [imgFailed, setImgFailed] = useState(false);
+  const [rawImgFailed, setRawImgFailed] = useState(false);
+  const [genImgLoaded, setGenImgLoaded] = useState(false);
+  const [genImgFailed, setGenImgFailed] = useState(false);
+  const [retryDismissed, setRetryDismissed] = useState(false);
+
+  // Pointer-driven 3D lean. Kept small (~5deg) — enough to notice, not so
+  // much it feels gimmicky. Reset on leave.
+  const leanRef = useRef<HTMLDivElement | null>(null);
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const el = leanRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const px = (e.clientX - rect.left) / rect.width - 0.5;
+    const py = (e.clientY - rect.top) / rect.height - 0.5;
+    el.style.setProperty("--lean-x", `${(-py * 5).toFixed(2)}deg`);
+    el.style.setProperty("--lean-y", `${(px * 6).toFixed(2)}deg`);
+    el.style.setProperty("--glare-x", `${((px + 0.5) * 100).toFixed(1)}%`);
+    el.style.setProperty("--glare-y", `${((py + 0.5) * 100).toFixed(1)}%`);
+    el.style.setProperty("--lean-lift", "-3px");
+  }, []);
+  const onPointerLeave = useCallback(() => {
+    const el = leanRef.current;
+    if (!el) return;
+    el.style.setProperty("--lean-x", "0deg");
+    el.style.setProperty("--lean-y", "0deg");
+    el.style.setProperty("--lean-lift", "0px");
+  }, []);
+
+  const genStatus = card.generatedImageStatus;
+  const hasGenUrl = !!card.generatedImageUrl;
+  const showGenerated =
+    hasGenUrl && genStatus === "done" && !genImgFailed;
+  const showShimmer = genStatus === "pending";
+  const showPainting = genStatus === "pending";
+  const showRetry =
+    (genStatus === "failed" || genImgFailed) && !retryDismissed;
+
+  // Reset load state when the generated URL changes so a subsequent swap
+  // fades in again.
+  useEffect(() => {
+    setGenImgLoaded(false);
+    setGenImgFailed(false);
+  }, [card.generatedImageUrl]);
+
+  const langPair =
+    card.spokenLang && card.learnLang
+      ? { spoken: card.spokenLang, learn: card.learnLang }
+      : null;
 
   return (
     <article
-      className="group relative flex items-stretch gap-4 overflow-hidden rounded-[22px] bg-white/[0.07] p-3 ring-1 ring-white/15 backdrop-blur-xl transition-[transform,box-shadow,background] duration-200 hover:bg-white/[0.1]"
+      ref={leanRef}
+      onPointerMove={onPointerMove}
+      onPointerLeave={onPointerLeave}
+      className={`group relative flex items-stretch gap-4 overflow-hidden rounded-[24px] bg-white/[0.06] p-3.5 ring-1 ring-white/15 backdrop-blur-2xl transition-[box-shadow,background,ring] duration-300 hover:bg-white/[0.1] hover:ring-white/25 ${
+        isActive ? "active-halo" : ""
+      }`}
       style={{
+        transformStyle: "preserve-3d",
+        transform:
+          "perspective(1100px) rotate(var(--tilt, 0deg)) rotateX(var(--lean-x, 0deg)) rotateY(var(--lean-y, 0deg)) translateY(var(--lean-lift, 0px))",
+        transition:
+          "transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 300ms ease, background 300ms ease",
         boxShadow: isActive
-          ? "0 18px 48px -18px rgba(255,137,190,0.55), 0 0 0 2px rgba(255,137,190,0.85)"
-          : "0 14px 40px -22px rgba(0,0,0,0.55)",
-        transform: isActive ? "translateY(-2px)" : undefined,
+          ? undefined
+          : "0 22px 60px -28px rgba(0,0,0,0.75), inset 0 1px 0 rgba(255,255,255,0.06)",
       }}
     >
+      {/* Sheen — follows the pointer. Pure CSS radial that reads as light
+          catching on a glossy card. */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 rounded-[24px] opacity-0 transition-opacity duration-300 group-hover:opacity-100"
+        style={{
+          background:
+            "radial-gradient(220px circle at var(--glare-x, 50%) var(--glare-y, 50%), rgba(255,255,255,0.12), transparent 60%)",
+        }}
+      />
       <button
         type="button"
         aria-label="remove from gallery"
@@ -641,7 +787,7 @@ function CardItem({
         className="relative aspect-square h-auto w-[108px] shrink-0 overflow-hidden rounded-[16px] bg-black/35 sm:w-[132px]"
         aria-hidden={isSpeaking ? undefined : true}
       >
-        {imgFailed ? (
+        {rawImgFailed ? (
           <div className="absolute inset-0 grid place-items-center text-[10px] uppercase tracking-widest text-white/40">
             missing
           </div>
@@ -649,11 +795,48 @@ function CardItem({
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={card.imageDataUrl}
-            alt={card.className}
+            alt={cardDisplayName(card)}
             className="absolute inset-0 h-full w-full object-cover"
             draggable={false}
-            onError={() => setImgFailed(true)}
+            onError={() => setRawImgFailed(true)}
           />
+        )}
+        {showGenerated && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={card.generatedImageUrl}
+            alt={`${cardDisplayName(card)} — illustrated`}
+            data-loaded={genImgLoaded ? "true" : "false"}
+            className="gen-image-fade absolute inset-0 h-full w-full object-cover"
+            draggable={false}
+            onLoad={() => setGenImgLoaded(true)}
+            onError={() => {
+              setGenImgFailed(true);
+              setGenImgLoaded(false);
+            }}
+          />
+        )}
+        {showShimmer && <span aria-hidden className="shimmer-overlay" />}
+        {showPainting && (
+          <div
+            className="bubble-btn pointer-events-none absolute right-1.5 top-1.5 z-10 inline-flex items-center gap-1 rounded-full bg-pink-400/80 px-2 py-0.5 text-[9.5px] font-semibold uppercase tracking-wider text-pink-950 ring-1 ring-white/40 backdrop-blur-md"
+          >
+            <span aria-hidden>✨</span>
+            <span>painting…</span>
+          </div>
+        )}
+        {showRetry && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setRetryDismissed(true);
+            }}
+            title="re-trigger from the camera to try again"
+            className="absolute bottom-1.5 right-1.5 z-10 inline-flex items-center gap-1 rounded-full bg-black/55 px-2 py-0.5 text-[9.5px] font-medium uppercase tracking-wider text-white/85 ring-1 ring-white/15 backdrop-blur-md transition hover:bg-black/75"
+          >
+            retry
+          </button>
         )}
         {isSpeaking && (
           <div
@@ -677,16 +860,48 @@ function CardItem({
         )}
       </div>
 
-      <div className="flex min-w-0 flex-1 flex-col justify-between gap-2.5 py-1">
-        <div className="flex min-w-0 flex-col gap-1">
+      <div className="relative flex min-w-0 flex-1 flex-col justify-between gap-2.5 py-1">
+        <div className="flex min-w-0 flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <span
+              className="inline-flex items-center gap-1 rounded-full bg-white/[0.05] px-2 py-0.5 text-[9.5px] font-medium uppercase tracking-[0.2em] text-white/45 ring-1 ring-white/10"
+              aria-label={`captured ${formatRelativeTime(card.createdAt)}`}
+            >
+              <span aria-hidden>·</span>
+              <span>{formatRelativeTime(card.createdAt)}</span>
+            </span>
+            {langPair && (
+              <span
+                className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-[0.12em] ring-1 ${
+                  card.teachMode
+                    ? "bg-pink-400/20 text-pink-200 ring-pink-300/30"
+                    : "bg-white/[0.05] text-white/60 ring-white/10"
+                }`}
+                aria-label={`speaks ${langPair.spoken.toUpperCase()}, learning ${langPair.learn.toUpperCase()}`}
+              >
+                <span>{langPair.spoken.toUpperCase()}</span>
+                <span aria-hidden className="opacity-60">→</span>
+                <span>{langPair.learn.toUpperCase()}</span>
+                {card.teachMode && (
+                  <span
+                    aria-hidden
+                    className="ml-0.5 rounded-full bg-pink-300/30 px-1 text-[8.5px] tracking-wide text-pink-100"
+                  >
+                    teach
+                  </span>
+                )}
+              </span>
+            )}
+          </div>
           <h2
-            className="serif-italic truncate text-[22px] leading-tight text-white/95"
-            title={card.className}
+            className="serif-italic truncate text-[26px] leading-[1.05] text-white/95"
+            title={cardDisplayName(card)}
+            style={{ textShadow: "0 0 22px rgba(255,182,214,0.18)" }}
           >
-            {card.className}
+            {cardDisplayName(card)}
           </h2>
           <p
-            className="line-clamp-2 text-[12.5px] italic leading-[1.35] text-white/60"
+            className="line-clamp-2 text-[12.5px] italic leading-[1.4] text-white/65"
             aria-live={isActive ? "polite" : undefined}
           >
             {isRecording
@@ -697,6 +912,11 @@ function CardItem({
                   ? replyText
                   : `“${card.line}”`}
           </p>
+          {heard && !isActive && (
+            <p className="mt-0.5 line-clamp-1 text-[10.5px] font-medium uppercase tracking-[0.14em] text-white/35">
+              you said: <span className="normal-case tracking-normal text-white/55">{heard}</span>
+            </p>
+          )}
         </div>
 
         <MicButton
@@ -809,6 +1029,27 @@ function MicIcon() {
       <path d="M12 18v3" />
     </svg>
   );
+}
+
+// --- Small helpers --------------------------------------------------------
+
+function hashSeed(s: string): number {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function formatRelativeTime(ms: number): string {
+  if (!ms || Number.isNaN(ms)) return "just now";
+  const diff = Date.now() - ms;
+  if (diff < 45_000) return "just now";
+  if (diff < 60 * 60_000) return `${Math.round(diff / 60_000)}m ago`;
+  if (diff < 24 * 60 * 60_000) return `${Math.round(diff / (60 * 60_000))}h ago`;
+  const d = new Date(ms);
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 // --- MediaSource streaming helper -----------------------------------------

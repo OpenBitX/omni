@@ -29,8 +29,18 @@ type SpeakBody = {
   description?: unknown;
   history?: unknown;
   lang?: unknown;
+  // New: language pair for the spoken/learn split. Either/both optional —
+  // when absent, fall back to `lang`.
+  spokenLang?: unknown;
+  learnLang?: unknown;
   turnId?: unknown;
 };
+
+function normalizeLangField(raw: unknown, fallback: Lang): Lang {
+  if (raw === "zh") return "zh";
+  if (raw === "en") return "en";
+  return fallback;
+}
 
 function coerceHistory(raw: unknown): ChatTurn[] {
   if (!Array.isArray(raw)) return [];
@@ -72,6 +82,18 @@ export async function POST(req: Request) {
       : null;
   const history = coerceHistory(payload.history);
   const lang: Lang = payload.lang === "zh" ? "zh" : "en";
+  // Language pair. If only one side is present we infer the other as the
+  // opposite — matches the server-action fallback in `converseWithObject`.
+  const spokenLangProvided = payload.spokenLang === "zh" || payload.spokenLang === "en";
+  const learnLangProvided = payload.learnLang === "zh" || payload.learnLang === "en";
+  const spokenLang: Lang = spokenLangProvided
+    ? normalizeLangField(payload.spokenLang, lang)
+    : lang;
+  const learnLang: Lang = learnLangProvided
+    ? normalizeLangField(payload.learnLang, lang)
+    : spokenLangProvided
+      ? (spokenLang === "zh" ? "en" : "zh")
+      : lang;
   const turnId =
     typeof payload.turnId === "string"
       ? payload.turnId.trim().slice(0, 16) || "?"
@@ -85,6 +107,7 @@ export async function POST(req: Request) {
   let line: string;
   let chosenVoiceId: string | null = voiceId;
   let chosenDescription: string | null = description;
+  let chosenName: string | null = null;
   try {
     const result = await generateLine(
       imageDataUrl,
@@ -92,11 +115,14 @@ export async function POST(req: Request) {
       description,
       history,
       lang,
-      turnId
+      turnId,
+      spokenLang,
+      learnLang
     );
     line = result.line;
     chosenVoiceId = result.voiceId;
     chosenDescription = result.description;
+    chosenName = result.name;
   } catch (err) {
     // eslint-disable-next-line no-console
     console.log(
@@ -121,14 +147,27 @@ export async function POST(req: Request) {
   const tts = await streamTts({
     text: line,
     voiceId: chosenVoiceId ?? "",
-    lang,
+    // TTS pronunciation is driven by the LEARN language (what the object
+    // speaks), not by what the user speaks.
+    lang: learnLang,
     turnId,
   });
 
+  // `/api/speak` is the first-tap opening line — teach mode can't yet be
+  // triggered from a user utterance (there isn't one), so we report it as
+  // false. Prompt still picks the simple-language framing when spoken !=
+  // learn, which is the only behavior that mattered here.
+  const teachMode = false;
   const meta = {
     line,
     voiceId: chosenVoiceId,
     description: chosenDescription,
+    // VLM-emitted short label. The client uses this as the user-facing
+    // object name everywhere — never the YOLO class.
+    name: chosenName,
+    spokenLang,
+    learnLang,
+    teachMode,
   };
   // Base64 so we can carry the (potentially non-ASCII) metadata safely in
   // an HTTP header — headers can't hold raw newlines or binary.
