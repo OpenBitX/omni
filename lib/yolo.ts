@@ -48,6 +48,21 @@ export type Detection = {
   // (sudden drop ⇒ something covered the object).
   maskCentroid?: { x: number; y: number };
   maskArea?: number;
+  // Binary silhouette at prototype resolution, cropped to the detection's
+  // box. Bytes are 0 (outside) or 255 (inside). Row-major, stride = w.
+  // The mask visually corresponds to the detection's {x1,y1,x2,y2} source
+  // rect. Populated only by the seg head. Used for clipping the talking
+  // face to the object's silhouette so it reads as painted-on, not pasted.
+  mask?: { data: Uint8Array; w: number; h: number };
+  // Orientation of the mask's long axis, in radians, in screen space (y
+  // axis points down). Computed via PCA on the binary silhouette in the
+  // same pass as mask decode. Angle is in [-π/2, π/2] — principal axis is
+  // 180° ambiguous, so we fold to that range.
+  //   axisRatio = sqrt(lambda1 / lambda2) — 1.0 for a circle, growing with
+  //   elongation. Callers should only rotate when axisRatio is comfortably
+  //   above 1 (round objects have a meaningless principal angle).
+  principalAngle?: number;
+  axisRatio?: number;
 };
 
 // Head type selects the post-processing branch.
@@ -697,12 +712,27 @@ function postprocessYoloSegDetr(
     const py2 = Math.min(mh, Math.ceil(p.y2 * inputToProtoY));
     if (px2 <= px1 || py2 <= py1) continue;
 
+    // Capture the binary silhouette alongside the centroid decode so we
+    // only touch each mask pixel once. Dimensions in proto space.
+    const maskW = px2 - px1;
+    const maskH = py2 - py1;
+    const maskData = new Uint8Array(maskW * maskH);
+
     let centroidX = 0;
     let centroidY = 0;
     let totalMass = 0;
     let abovePixels = 0;
+    // PCA sums (unweighted, over above-threshold pixels). Used for
+    // principal-axis orientation so the face tilts to match a banana on
+    // its side. Same pass — negligible extra cost.
+    let sumX = 0;
+    let sumY = 0;
+    let sumXX = 0;
+    let sumYY = 0;
+    let sumXY = 0;
     for (let y = py1; y < py2; y++) {
       const rowOff = y * mw;
+      const maskRowOff = (y - py1) * maskW;
       for (let x = px1; x < px2; x++) {
         // Dot product across the 32 coefs × 32 protos at this pixel.
         let s = 0;
@@ -717,9 +747,37 @@ function postprocessYoloSegDetr(
             centroidY += y * v;
             totalMass += v;
             abovePixels++;
+            maskData[maskRowOff + (x - px1)] = 255;
+            sumX += x;
+            sumY += y;
+            sumXX += x * x;
+            sumYY += y * y;
+            sumXY += x * y;
           }
         }
       }
+    }
+
+    // Orientation via PCA on the binary silhouette. Closed-form angle for
+    // a 2x2 symmetric covariance matrix avoids eigenvector branching; the
+    // ratio is sqrt(λ1/λ2) for the usual major/minor axis scaling.
+    // Needs enough pixels to be statistically meaningful — below ~20 the
+    // covariance is dominated by quantization noise.
+    let principalAngle: number | undefined;
+    let axisRatio: number | undefined;
+    if (abovePixels > 20) {
+      const invN = 1 / abovePixels;
+      const meanX = sumX * invN;
+      const meanY = sumY * invN;
+      const covXX = sumXX * invN - meanX * meanX;
+      const covYY = sumYY * invN - meanY * meanY;
+      const covXY = sumXY * invN - meanX * meanY;
+      principalAngle = 0.5 * Math.atan2(2 * covXY, covXX - covYY);
+      const trace = covXX + covYY;
+      const disc = Math.max(0, trace * trace * 0.25 - (covXX * covYY - covXY * covXY));
+      const lambda1 = trace * 0.5 + Math.sqrt(disc);
+      const lambda2 = trace * 0.5 - Math.sqrt(disc);
+      axisRatio = Math.sqrt(Math.max(1, lambda1) / Math.max(1, lambda2));
     }
 
     let maskCentroid: { x: number; y: number } | undefined;
@@ -747,6 +805,9 @@ function postprocessYoloSegDetr(
       className: COCO_CLASSES[p.classRaw] ?? "?",
       maskCentroid,
       maskArea: abovePixels,
+      mask: abovePixels > 0 ? { data: maskData, w: maskW, h: maskH } : undefined,
+      principalAngle,
+      axisRatio,
     });
   }
 

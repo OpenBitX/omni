@@ -64,9 +64,25 @@ body::before {
 }
 
 @keyframes bubble-in {
-  0% { opacity: 0; transform: scale(0.92) translateY(-6px); }
-  60% { opacity: 1; transform: scale(1.02) translateY(0); }
+  0% { opacity: 0; transform: scale(0.6) translateY(8px); }
+  55% { opacity: 1; transform: scale(1.06) translateY(-2px); }
+  78% { transform: scale(0.98) translateY(0); }
   100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes bubble-out {
+  0% { opacity: 1; transform: scale(1) translateY(0); }
+  100% { opacity: 0; transform: scale(0.8) translateY(6px); }
+}
+
+@keyframes tail-bob {
+  0%, 100% { transform: translateX(-50%) rotate(45deg) translateY(0); }
+  50% { transform: translateX(-50%) rotate(45deg) translateY(1.5px); }
+}
+
+@keyframes dot-bounce {
+  0%, 100% { transform: translateY(0); opacity: 0.65; }
+  50% { transform: translateY(-3px); opacity: 1; }
 }
 
 @keyframes fade-in {
