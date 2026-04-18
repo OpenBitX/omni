@@ -64,15 +64,15 @@ body::before {
 }
 
 @keyframes bubble-in {
-  0% { opacity: 0; transform: scale(0.6) translateY(8px); }
-  55% { opacity: 1; transform: scale(1.06) translateY(-2px); }
-  78% { transform: scale(0.98) translateY(0); }
-  100% { opacity: 1; transform: scale(1) translateY(0); }
+  0% { opacity: 0; transform: scale(0.6) translateY(8px) rotate(0deg); }
+  55% { opacity: 1; transform: scale(1.06) translateY(-2px) rotate(-7deg); }
+  78% { transform: scale(0.98) translateY(0) rotate(-5deg); }
+  100% { opacity: 1; transform: scale(1) translateY(0) rotate(-6deg); }
 }
 
 @keyframes bubble-out {
-  0% { opacity: 1; transform: scale(1) translateY(0); }
-  100% { opacity: 0; transform: scale(0.8) translateY(6px); }
+  0% { opacity: 1; transform: scale(1) translateY(0) rotate(-6deg); }
+  100% { opacity: 0; transform: scale(0.8) translateY(6px) rotate(-6deg); }
 }
 
 @keyframes tail-bob {

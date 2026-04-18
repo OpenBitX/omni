@@ -956,7 +956,7 @@ export function Tracker() {
   // diag panel so you can confirm Fish (vs. OpenAI fallback / caption-only)
   // is actually in play without having to listen carefully.
   const [lastTtsBackend, setLastTtsBackend] = useState<
-    "fish" | "openai" | "none" | null
+    "cartesia" | "fish" | "openai" | "none" | null
   >(null);
   const [diagOpen, setDiagOpen] = useState(false);
   const [diagError, setDiagError] = useState<string | null>(null);
@@ -997,12 +997,48 @@ export function Tracker() {
   // sit on refs so the scheduler doesn't retrigger on every render.
   const [groupChatEnabled, setGroupChatEnabled] = useState(true);
   const groupHistoryRef = useRef<
-    { speaker: string; trackId: string | null; line: string; role: "assistant" | "user"; ts: number }[]
+    {
+      speaker: string;
+      trackId: string | null;
+      line: string;
+      role: "assistant" | "user";
+      ts: number;
+      // className of the peer this turn was addressed AT (model-emitted,
+      // server-validated against the roster). null when musing aloud or
+      // talking to the human. The scheduler uses this to bias who speaks
+      // next — when A addresses B, B should answer, not whoever's been
+      // quiet longest. Without this, banter feels like parallel monologues.
+      addressing?: string | null;
+    }[]
   >([]);
   const groupLastSpokeAtRef = useRef<Record<string, number>>({});
   const groupTimerRef = useRef<number | null>(null);
   const groupInFlightRef = useRef(false);
+  // Invalidation token. External events that change what the NEXT turn
+  // should look like (mic press, track add/remove, group toggle, clear)
+  // bump this. In-flight prepare / in-flight run check the captured gen
+  // on resume and drop if mismatched. runGroupTurn itself does NOT bump —
+  // it only reads — so a clean turn isn't self-invalidated.
   const groupGenRef = useRef(0);
+  // Single-slot pre-cache for the next scheduled group turn. While the
+  // current speaker is playing, we kick off groupLine + full TTS download
+  // in the background and stash the resulting Blob here. The next turn
+  // pops this, decodes via AudioBufferSource, and plays with near-zero
+  // click-to-sound latency. Null when nothing is staged.
+  const preparedTurnRef = useRef<{
+    trackId: string;
+    speakerName: string;
+    line: string;
+    voiceId: string | null;
+    audioBlob: Blob | null; // null if TTS failed + caption-only
+    emotion: string | null;
+    speed: string | null;
+    addressing: string | null; // peer className this line is directed at
+    mode: "chat" | "followup";
+    gen: number;
+    speakerGen: number;
+  } | null>(null);
+  const preparingRef = useRef(false);
   // Boot-phase elapsed-time counter, shown in the loading overlay so the
   // user can see "hey, this takes a sec" rather than staring at a static
   // spinner. Ticks every 100ms while starting; frozen once we hit ready.
@@ -1402,6 +1438,9 @@ export function Tracker() {
     setTracksUI([]);
     // Bump generation so any in-flight tap's generateLine/TTS drops silent.
     generationRef.current++;
+    // Invalidate any staged group turn + in-flight prepare; scene is gone.
+    groupGenRef.current++;
+    preparedTurnRef.current = null;
   }, []);
 
   // stopTrackAudio is defined AFTER clearAllTracks (there's a forward ref
@@ -1654,7 +1693,9 @@ export function Tracker() {
       text: string,
       voiceId: string | null,
       turnId?: string,
-      onFirstSound?: () => void
+      onFirstSound?: () => void,
+      emotion?: string | null,
+      speed?: string | null
     ): Promise<void> => {
       const ctx = ensureAudioCtx();
       const track = tracksRef.current.find((t) => t.id === trackId);
@@ -1667,12 +1708,33 @@ export function Tracker() {
       track.lipSync = createLipSyncState();
 
       const ensureAnalyser = () => {
-        if (track.analyser) return;
+        if (track.analyser) {
+          // Restore the gain if stopTrackAudio previously ramped it down to
+          // 0 (mic-press interrupt, retap, LRU eviction). Without this, the
+          // analyser + destination chain is alive but inaudible — RAF only
+          // re-drives the gain when a source is live, and its direct
+          // `.value =` write doesn't always cancel a pending setTargetAtTime.
+          // This was the "no voice" bug on group-to-group turns after any
+          // mic press in the session.
+          if (track.gain) {
+            try {
+              const now = ctx.currentTime;
+              track.gain.gain.cancelScheduledValues(now);
+              track.gain.gain.setValueAtTime(
+                Math.max(0, track.opacity || 1),
+                now
+              );
+            } catch {
+              // ignore — scheduling failures are not fatal
+            }
+          }
+          return;
+        }
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 1024;
         analyser.smoothingTimeConstant = 0.4;
         const gain = ctx.createGain();
-        gain.gain.value = track.opacity;
+        gain.gain.value = Math.max(0, track.opacity || 1);
         analyser.connect(gain);
         gain.connect(ctx.destination);
         track.analyser = analyser;
@@ -1719,6 +1781,11 @@ export function Tracker() {
           text,
           voiceId: voiceId ?? "",
           turnId: tid,
+          lang: langRef.current,
+          // Cartesia experimental_controls — one emotion string in an
+          // array, "normal" speed omitted so the default is picked up.
+          emotion: emotion ? [emotion] : [],
+          speed: speed ?? null,
         }),
       });
       if (callGen !== track.speakGen) {
@@ -1893,10 +1960,22 @@ export function Tracker() {
         )
       );
 
+      // How long it took from physical tap to actually reaching the
+      // generateLine call. Includes detect→lock, crop capture, and any
+      // React state flushes. Usually <100ms on desktop; can balloon on
+      // mobile if an inference is contending.
+      const pressToSpeakMs = Math.round(performance.now() - pressedAt);
+
+      // Captured once generateLine returns so the catch block below can
+      // still surface the caption if the TTS streaming leg fails —
+      // otherwise a stream error after we have a valid line would leave
+      // the user with a toast and no bubble.
+      let capturedLine: string | null = null;
+
       try {
         // eslint-disable-next-line no-console
         console.log(
-          `[speak:${trackId} ${tapTag}] → generateLine  kind=${isRetap ? "retap (text-only)" : "first-tap (bundled VLM)"}  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  voice=${track.voiceId ?? "(picking)"}  persona=${track.description ? "cached" : "(new)"}  history=${track.history.length}`
+          `[speak:${trackId} ${tapTag}] → generateLine  kind=${isRetap ? "retap (text-only)" : "first-tap (bundled VLM)"}  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  voice=${track.voiceId ?? "(picking)"}  persona=${track.description ? "cached" : "(new)"}  history=${track.history.length}  press→speak=${pressToSpeakMs}ms`
         );
         const t0 = performance.now();
         // Hard cap on generateLine — a hung vision call must not strand
@@ -1931,10 +2010,8 @@ export function Tracker() {
           line,
           voiceId: chosenVoiceId,
           description: chosenDescription,
-          audioDataUrl,
-          backend,
         } = result;
-        setLastTtsBackend(backend);
+        capturedLine = line;
         // Pin the voice on first return — every subsequent speak/talk on
         // this track passes this id back so the same Fish voice speaks the
         // whole session. Once set, we never overwrite it.
@@ -1953,160 +2030,89 @@ export function Tracker() {
           ...track.history,
           { role: "assistant" as const, content: line },
         ].slice(-32);
+        // Also seed the shared group transcript so the next group turn sees
+        // the opening line as context — otherwise peers don't know what was
+        // just said and the first group line ignores the opener. Sets
+        // lastSpokeAt so the scheduler's silence clock starts ticking now.
+        {
+          const nowTs = performance.now();
+          groupHistoryRef.current.push({
+            speaker: track.className,
+            trackId,
+            line,
+            role: "assistant",
+            ts: nowTs,
+          });
+          groupHistoryRef.current = groupHistoryRef.current.slice(-48);
+          groupLastSpokeAtRef.current[trackId] = nowTs;
+        }
         // eslint-disable-next-line no-console
         console.log(
-          `[speak:${trackId} ${tapTag}] ← generateLine=${generateLineMs}ms  backend=${backend}  voice=${track.voiceId ?? "default"}  line="${line}"`
+          `[speak:${trackId} ${tapTag}] ← generateLine=${generateLineMs}ms  voice=${track.voiceId ?? "default"}  line="${line}"`
         );
 
+        // Show caption + stop spinner as soon as we have the line. There
+        // is a brief (~500–800ms) window before the first Cartesia chunk
+        // becomes audible, during which the text leads the audio — that's
+        // the unavoidable cost of streaming. But "caption now, audio
+        // shortly after" is strictly better than the alternatives
+        // (caption-only silence on autoplay block / MediaSource hang).
         setTracksUI((prev) =>
           prev.map((t) =>
             t.id === trackId ? { ...t, caption: line, thinking: false } : t
           )
         );
 
-        // Caption-only mode when TTS key is missing.
-        if (!audioDataUrl) return;
-
-        // Guard: the TTS pipeline should only ever return an audio data
-        // URL here. If a stray error/text slipped through, fail loudly
-        // instead of feeding garbage to decodeAudioData.
-        if (!/^data:audio\//i.test(audioDataUrl)) {
-          throw new Error(
-            `unexpected audio payload: ${audioDataUrl.slice(0, 48)}…`
-          );
-        }
-
-        const resp = await fetch(audioDataUrl);
-        if (!resp.ok) throw new Error(`audio fetch ${resp.status}`);
-        const buf = await resp.arrayBuffer();
-        if (callGen !== track.speakGen) return;
-
-        // On mobile Safari the resume() kicked off in the tap handler can
-        // still be pending here — feeding a suspended ctx yields silent
-        // playback with no visible error. Wait until state=running.
-        const running = await waitForAudioRunning(ctx);
-        if (!running) {
-          throw new Error(`audio context not running (state=${ctx.state})`);
-        }
-        if (callGen !== track.speakGen) return;
-
-        let audioBuf: AudioBuffer;
-        try {
-          audioBuf = await ctx.decodeAudioData(buf);
-        } catch (e) {
-          throw new Error(
-            `decodeAudioData failed: ${e instanceof Error ? e.message : String(e)}`
-          );
-        }
-        if (callGen !== track.speakGen) return;
-
-        // Lazy-init this track's analyser + gain on first speak.
-        // Chain: source → analyser → gain → destination. Gain is driven by
-        // the RAF loop from t.opacity so audio fades with the face.
-        if (!track.analyser) {
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 1024;
-          analyser.smoothingTimeConstant = 0.4;
-          const gain = ctx.createGain();
-          gain.gain.value = track.opacity;
-          analyser.connect(gain);
-          gain.connect(ctx.destination);
-          track.analyser = analyser;
-          track.gain = gain;
-          track.freqData = new Uint8Array(
-            new ArrayBuffer(analyser.frequencyBinCount)
-          );
-          track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
-        } else if (track.gain) {
-          // stopTrackAudio just ramped this down to 0 to prevent a click.
-          // Cancel the ramp and restore the gain so the RAF loop drives
-          // it for THIS utterance; otherwise the new voice comes in silent.
-          try {
-            const now = ctx.currentTime;
-            track.gain.gain.cancelScheduledValues(now);
-            track.gain.gain.setValueAtTime(Math.max(0, track.opacity), now);
-          } catch {
-            // ignore
-          }
-        }
-
-        // Reset lip-sync envelope + adaptive peak for this new line so
-        // openness normalizes against THIS utterance's level, not the
-        // previous one's (Fish.audio and OpenAI fallback can differ 2–3×).
-        track.lipSync = createLipSyncState();
-
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuf;
-        source.connect(track.analyser);
-        source.onended = () => {
-          // Only clear if still the current source — guards against a
-          // newer tap's source already having replaced this one.
-          if (track.source === source) {
-            try {
-              source.disconnect();
-            } catch {
-              // ignore
+        // Stream TTS bytes via `/api/tts/stream` + MediaSource instead of
+        // waiting for the server to synthesize the full mp3, base64 it,
+        // and ship it back in JSON. Same pipe the converse/group paths
+        // already use — first audio sample plays within the TTS ttfb
+        // (~400–800ms) rather than after the full 1.5–2.2s synth cost.
+        const tStream = performance.now();
+        let firstSoundMs = 0;
+        await playStreamingReply(
+          trackId,
+          callGen,
+          line,
+          track.voiceId,
+          tapTag.replace(/^#/, ""),
+          () => {
+            if (firstSoundMs === 0) {
+              firstSoundMs = Math.round(performance.now() - pressedAt);
             }
-            track.source = null;
-            setTracksUI((prev) =>
-              prev.map((t) =>
-                t.id === trackId ? { ...t, speaking: false } : t
-              )
-            );
-            // Schedule the caption to fade off-screen so stacked bubbles
-            // don't linger indefinitely. A retap will cancel this.
-            if (track.captionClearTimer != null) {
-              clearTimeout(track.captionClearTimer);
-            }
-            track.captionClearTimer = window.setTimeout(() => {
-              track.captionClearTimer = null;
-              setTracksUI((prev) =>
-                prev.map((t) =>
-                  t.id === trackId ? { ...t, caption: null } : t
-                )
-              );
-            }, CAPTION_LINGER_MS);
           }
-        };
-        try {
-          source.start();
-        } catch (e) {
-          try {
-            source.disconnect();
-          } catch {
-            // ignore
-          }
-          throw new Error(
-            `source.start failed: ${e instanceof Error ? e.message : String(e)}`
-          );
-        }
-        // Only publish UI state AFTER start() succeeds, so a failure path
-        // leaves no stuck speaking=true / ghost track.source.
-        track.source = source;
-        setTracksUI((prev) =>
-          prev.map((t) => (t.id === trackId ? { ...t, speaking: true } : t))
         );
-        // End-of-tap summary — one line that ties together every phase
-        // from tap press to first audible sample. `firstSound` is the
-        // only number the user feels; the rest is the breakdown.
-        const firstSound = Math.round(performance.now() - pressedAt);
-        const ttsMs = Math.max(
-          0,
-          Math.round(performance.now() - t0) - generateLineMs
-        );
+        if (callGen !== track.speakGen) return;
+        const streamMs = Math.round(performance.now() - tStream);
+        // End-of-tap summary — ties every phase from tap press to first
+        // audible sample. Layout:
+        //   press→speak   — tap bookkeeping before generateLine ran
+        //   generateLine  — server action round trip (VLM or text-only LLM)
+        //   tts-stream    — from generateLine return to playback ended
+        //   first-sound   — press → first audible PCM sample (the only
+        //                   number the user actually feels)
         // eslint-disable-next-line no-console
         console.log(
-          `[tap ${tapTag}] ◀ FIRST SOUND in ${firstSound}ms  ━  kind=${isRetap ? "retap" : "first-tap"} ▸ generateLine=${generateLineMs}ms (VLM+LLM+TTS server-side) ▸ client-audio=${ttsMs}ms ▸ backend=${backend}`
+          `[tap ${tapTag}] ◀ FIRST SOUND in ${firstSoundMs || streamMs}ms  ━  kind=${isRetap ? "retap" : "first-tap"}  ▸ press→speak=${pressToSpeakMs}ms  ▸ generateLine=${generateLineMs}ms  ▸ tts-stream=${streamMs}ms`
         );
       } catch (e) {
         if (callGen !== track.speakGen) return;
         const msg = e instanceof Error ? e.message : "line failed";
         setErrorMsg(msg);
         setDiagError(msg);
+        // If we got as far as a line but the TTS stream failed, still
+        // surface the caption so the user sees what the object would've
+        // said (caption-only degradation). Otherwise just stop the
+        // spinner — generateLine itself failed and there's nothing to show.
         setTracksUI((prev) =>
           prev.map((t) =>
             t.id === trackId
-              ? { ...t, thinking: false, speaking: false }
+              ? {
+                  ...t,
+                  thinking: false,
+                  speaking: false,
+                  caption: capturedLine ?? t.caption,
+                }
               : t
           )
         );
@@ -2121,7 +2127,13 @@ export function Tracker() {
         }
       }
     },
-    [ensureAudioCtx, showRejection, stopTrackAudio, waitForAudioRunning]
+    [
+      ensureAudioCtx,
+      playStreamingReply,
+      showRejection,
+      stopTrackAudio,
+      waitForAudioRunning,
+    ]
   );
 
   // --- Tracking + lip-sync RAF ------------------------------------------
@@ -2714,8 +2726,13 @@ export function Tracker() {
         );
 
         const t0 = performance.now();
-        const { transcript, reply, voiceId: replyVoiceId } =
-          await converseWithObject(formData);
+        const {
+          transcript,
+          reply,
+          voiceId: replyVoiceId,
+          emotion: replyEmotion,
+          speed: replySpeed,
+        } = await converseWithObject(formData);
         const converseMs = Math.round(performance.now() - t0);
         if (callGen !== track.speakGen) {
           // eslint-disable-next-line no-console
@@ -2811,7 +2828,9 @@ export function Tracker() {
                 srMs >= 0 ? `sr=${srMs}ms` : "sr=server-fallback"
               } ▸ converse=${converseMs}ms ▸ tts-ttfb=${ttsTtfb}ms`
             );
-          }
+          },
+          replyEmotion,
+          replySpeed
         );
       } catch (e) {
         if (callGen !== track.speakGen) return;
@@ -2853,19 +2872,52 @@ export function Tracker() {
 
   // --- Group chat -------------------------------------------------------
   //
-  // When ≥2 tracks are locked and groupChatEnabled is true, the scheduler
-  // picks whichever track has been quiet longest and fires one group line
-  // through the same streaming TTS path converseWithObject uses. The shared
-  // rolling transcript (groupHistoryRef) is what the server-side `groupLine`
-  // action reads to keep peers reacting to each other + to the human.
-  const runGroupTurn = useCallback(async () => {
-    if (groupInFlightRef.current) return;
+  // Two-stage pipeline:
+  //   1. `prepareGroupTurn` (background) — runs groupLine + full TTS fetch
+  //      while the CURRENT speaker is talking, stashes the result Blob in
+  //      preparedTurnRef. Callable multiple times; cheap no-op if a turn
+  //      is already staged or in flight.
+  //   2. `runGroupTurn` (foreground) — when the scheduler's timer fires,
+  //      consumes preparedTurnRef if present (decode → AudioBufferSource,
+  //      near-zero click-to-sound) or falls back to inline generate +
+  //      streaming TTS for the very first turn of a session.
+  //
+  // Invalidation: external events (mic press, track add/evict, group-off,
+  // clear) bump groupGenRef and null preparedTurnRef. Anything in flight
+  // compares its captured gen on resume and drops silently if mismatched.
+
+  // Shared speaker-pick logic. Two-layer:
+  //   1. If the LAST turn was addressed AT a specific peer (and that peer
+  //      is still locked and isn't the speaker of the last turn), that
+  //      peer wins ~70% of the time — "A insulted me, I answer." The 30%
+  //      escape hatch lets a third track cut in occasionally so it doesn't
+  //      become a deterministic tennis match.
+  //   2. Otherwise (or 30% of the time under #1): quietest track wins;
+  //      ties broken by older lastTapAt so a freshly-tapped object doesn't
+  //      steal the floor from a track that's barely spoken.
+  const pickGroupSpeaker = useCallback((): TrackRefs | null => {
     const tracks = tracksRef.current;
-    if (tracks.length < 2) return;
-    // Pick the track that has been quiet for the longest. Ties broken by
-    // lastTapAt (older first) so a freshly-tapped object doesn't steal the
-    // floor from a track that has barely spoken.
-    const now = performance.now();
+    if (tracks.length < 1) return null;
+
+    // Layer 1: reactive addressing.
+    const lastTurn = groupHistoryRef.current[groupHistoryRef.current.length - 1];
+    if (
+      lastTurn &&
+      lastTurn.role === "assistant" &&
+      lastTurn.addressing &&
+      tracks.length >= 2 &&
+      Math.random() < 0.7
+    ) {
+      const target = lastTurn.addressing.toLowerCase();
+      const addressed = tracks.find(
+        (t) =>
+          t.className.toLowerCase() === target &&
+          t.id !== lastTurn.trackId
+      );
+      if (addressed) return addressed;
+    }
+
+    // Layer 2: quietest-wins round-robin.
     let pick: TrackRefs | null = null;
     let oldestSpokeAt = Infinity;
     for (const t of tracks) {
@@ -2873,28 +2925,364 @@ export function Tracker() {
       if (last < oldestSpokeAt) {
         oldestSpokeAt = last;
         pick = t;
-      } else if (last === oldestSpokeAt && pick && t.lastTapAt < pick.lastTapAt) {
+      } else if (
+        last === oldestSpokeAt &&
+        pick &&
+        t.lastTapAt < pick.lastTapAt
+      ) {
         pick = t;
       }
     }
+    return pick;
+  }, []);
+
+  // Background: generate the next group line + TTS blob and stash. The
+  // prospective history includes any already-prepared-but-not-played turn
+  // so the model sees the true upcoming context, not the state as of the
+  // last played line. We never bump groupGenRef here — only read.
+  const prepareGroupTurn = useCallback(async () => {
+    if (preparingRef.current) return;
+    if (preparedTurnRef.current) return;
+    const tracks = tracksRef.current;
+    if (tracks.length < 1) return;
+    // Prospective pick: if a turn is staged (shouldn't happen given the
+    // guard above, defensive) skip it from selection for "who speaks next".
+    const pick = pickGroupSpeaker();
     if (!pick) return;
-    // Peers for the prompt — everyone who isn't the current speaker.
+    const mode: "chat" | "followup" =
+      tracks.length === 1 ? "followup" : "chat";
     const peers = tracks
-      .filter((t) => t.id !== pick!.id)
+      .filter((t) => t.id !== pick.id)
       .map((t) => ({ name: t.className, description: t.description ?? null }));
     const recentTurns = groupHistoryRef.current.slice(-16).map((t) => ({
       speaker: t.speaker,
       line: t.line,
       role: t.role,
     }));
-    groupInFlightRef.current = true;
-    const turnGen = ++groupGenRef.current;
-    const speaker = pick;
-    const callGen = ++speaker.speakGen;
+    preparingRef.current = true;
+    const gen = groupGenRef.current;
+    const speakerGen = pick.speakGen;
     try {
       // eslint-disable-next-line no-console
       console.log(
-        `[group] ▶ turn speaker=${speaker.className} (${speaker.id}) peers=${peers.length} history=${recentTurns.length}`
+        `[group:prep] ▶ speaker=${pick.className} (${pick.id}) mode=${mode} peers=${peers.length} history=${recentTurns.length}`
+      );
+      const { line, emotion, speed, addressing } = await groupLine({
+        speaker: {
+          name: pick.className,
+          description: pick.description ?? null,
+        },
+        peers,
+        recentTurns,
+        mode,
+        lang: langRef.current,
+      });
+      if (gen !== groupGenRef.current) {
+        // eslint-disable-next-line no-console
+        console.log(`[group:prep] ← stale after groupLine`);
+        return;
+      }
+      // Fetch the full TTS audio as a Blob (no MediaSource streaming —
+      // we want the whole file ready so playback is click-to-sound fast).
+      let audioBlob: Blob | null = null;
+      try {
+        const resp = await fetch("/api/tts/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: line,
+            voiceId: pick.voiceId ?? "",
+            turnId: `gp${gen}`,
+            lang: langRef.current,
+            emotion: emotion ? [emotion] : [],
+            speed: speed ?? null,
+          }),
+        });
+        if (gen !== groupGenRef.current) {
+          try {
+            await resp.body?.cancel();
+          } catch {
+            // ignore
+          }
+          // eslint-disable-next-line no-console
+          console.log(`[group:prep] ← stale after tts headers`);
+          return;
+        }
+        if (resp.ok && resp.body) {
+          audioBlob = await resp.blob();
+        } else {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[group:prep] tts non-ok ${resp.status} — caption-only fallback`
+          );
+        }
+      } catch (ttsErr) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[group:prep] tts fetch fail — caption-only: ${ttsErr instanceof Error ? ttsErr.message : String(ttsErr)}`
+        );
+      }
+      if (gen !== groupGenRef.current) return;
+      preparedTurnRef.current = {
+        trackId: pick.id,
+        speakerName: pick.className,
+        line,
+        voiceId: pick.voiceId,
+        audioBlob,
+        emotion,
+        speed,
+        addressing,
+        mode,
+        gen,
+        speakerGen,
+      };
+      // eslint-disable-next-line no-console
+      console.log(
+        `[group:prep] ✓ ready speaker=${pick.className} (${pick.id}) addressing=${addressing ?? "-"} audio=${audioBlob ? `${Math.round(audioBlob.size / 1024)}KB` : "null"} line="${line}"`
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[group:prep] ✖ ${err instanceof Error ? err.message : String(err)}`
+      );
+    } finally {
+      preparingRef.current = false;
+    }
+  }, [pickGroupSpeaker]);
+
+  // Decode the prepared Blob and play via AudioBufferSource. Returns a
+  // promise that resolves when playback ends. Mirrors the lock-time buffer
+  // path in speakOnTrack so lip-sync + gain + caption-clear all work.
+  const playPreparedTurn = useCallback(
+    async (prepared: NonNullable<typeof preparedTurnRef.current>) => {
+      const ctx = ensureAudioCtx();
+      const track = tracksRef.current.find((t) => t.id === prepared.trackId);
+      if (!ctx || !track) throw new Error("prepared track not found");
+
+      const callGen = ++track.speakGen;
+      if (track.captionClearTimer != null) {
+        clearTimeout(track.captionClearTimer);
+        track.captionClearTimer = null;
+      }
+      stopTrackAudio(track);
+      track.lipSync = createLipSyncState();
+
+      // Lazy analyser + restore gain (same pattern as speakOnTrack).
+      if (!track.analyser) {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.4;
+        const gain = ctx.createGain();
+        gain.gain.value = Math.max(0, track.opacity || 1);
+        analyser.connect(gain);
+        gain.connect(ctx.destination);
+        track.analyser = analyser;
+        track.gain = gain;
+        track.freqData = new Uint8Array(
+          new ArrayBuffer(analyser.frequencyBinCount)
+        );
+        track.timeData = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+      } else if (track.gain) {
+        try {
+          const now = ctx.currentTime;
+          track.gain.gain.cancelScheduledValues(now);
+          track.gain.gain.setValueAtTime(
+            Math.max(0, track.opacity || 1),
+            now
+          );
+        } catch {
+          // ignore
+        }
+      }
+
+      const running = await waitForAudioRunning(ctx);
+      if (!running) throw new Error(`audio ctx not running (${ctx.state})`);
+      if (callGen !== track.speakGen) return;
+
+      if (!prepared.audioBlob) {
+        // Caption-only fallback — no audio, just let the UI linger on the
+        // caption and then clear it.
+        if (track.captionClearTimer != null) {
+          clearTimeout(track.captionClearTimer);
+        }
+        track.captionClearTimer = window.setTimeout(() => {
+          track.captionClearTimer = null;
+          setTracksUI((prev) =>
+            prev.map((t) =>
+              t.id === prepared.trackId ? { ...t, caption: null } : t
+            )
+          );
+        }, CAPTION_LINGER_MS);
+        return;
+      }
+
+      const arrayBuf = await prepared.audioBlob.arrayBuffer();
+      if (callGen !== track.speakGen) return;
+      let audioBuf: AudioBuffer;
+      try {
+        audioBuf = await ctx.decodeAudioData(arrayBuf);
+      } catch (e) {
+        throw new Error(
+          `decodeAudioData failed: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
+      if (callGen !== track.speakGen) return;
+      if (!track.analyser) throw new Error("analyser vanished");
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuf;
+      source.connect(track.analyser);
+
+      const ended = new Promise<void>((resolve) => {
+        source.onended = () => {
+          if (track.source === source) {
+            try {
+              source.disconnect();
+            } catch {
+              // ignore
+            }
+            track.source = null;
+            setTracksUI((prev) =>
+              prev.map((t) =>
+                t.id === prepared.trackId ? { ...t, speaking: false } : t
+              )
+            );
+            if (track.captionClearTimer != null) {
+              clearTimeout(track.captionClearTimer);
+            }
+            track.captionClearTimer = window.setTimeout(() => {
+              track.captionClearTimer = null;
+              setTracksUI((prev) =>
+                prev.map((t) =>
+                  t.id === prepared.trackId ? { ...t, caption: null } : t
+                )
+              );
+            }, CAPTION_LINGER_MS);
+          }
+          resolve();
+        };
+      });
+
+      try {
+        source.start();
+      } catch (e) {
+        try {
+          source.disconnect();
+        } catch {
+          // ignore
+        }
+        throw new Error(
+          `source.start failed: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
+      track.source = source;
+      setTracksUI((prev) =>
+        prev.map((t) =>
+          t.id === prepared.trackId ? { ...t, speaking: true } : t
+        )
+      );
+      await ended;
+    },
+    [ensureAudioCtx, stopTrackAudio, waitForAudioRunning]
+  );
+
+  const runGroupTurn = useCallback(async () => {
+    if (groupInFlightRef.current) return;
+    const tracks = tracksRef.current;
+    if (tracks.length < 1) return;
+    groupInFlightRef.current = true;
+    // Capture the staged turn BEFORE bumping gen so its `gen` still matches.
+    // Bumping gen here cancels any in-flight prepare that was racing with
+    // us — we don't want a stale prepare result landing in preparedTurnRef
+    // after our own turn lands in groupHistoryRef and the next scheduler
+    // tick pops it without context from the line we just spoke.
+    const preparedSnapshot = preparedTurnRef.current;
+    preparedTurnRef.current = null;
+    const turnGen = ++groupGenRef.current;
+    try {
+      // Fast path: consume the staged turn. Only valid if the speaker
+      // still exists and its speakGen matches what we captured at prep.
+      const prepared = preparedSnapshot;
+      const speakerStillValid =
+        prepared != null &&
+        prepared.gen === turnGen - 1 &&
+        tracksRef.current.some(
+          (t) => t.id === prepared.trackId && t.speakGen === prepared.speakerGen
+        );
+      if (prepared && speakerStillValid) {
+        const ts = performance.now();
+        groupHistoryRef.current.push({
+          speaker: prepared.speakerName,
+          trackId: prepared.trackId,
+          line: prepared.line,
+          role: "assistant",
+          ts,
+          addressing: prepared.addressing,
+        });
+        groupHistoryRef.current = groupHistoryRef.current.slice(-48);
+        groupLastSpokeAtRef.current[prepared.trackId] = ts;
+        const speakerTrack = tracksRef.current.find(
+          (t) => t.id === prepared.trackId
+        );
+        if (speakerTrack) {
+          speakerTrack.history = [
+            ...speakerTrack.history,
+            { role: "assistant" as const, content: prepared.line },
+          ].slice(-32);
+        }
+        setTracksUI((prev) =>
+          prev.map((t) =>
+            t.id === prepared.trackId
+              ? { ...t, caption: prepared.line, thinking: false }
+              : t
+          )
+        );
+        // eslint-disable-next-line no-console
+        console.log(
+          `[group] ▶ play(cached) speaker=${prepared.speakerName} (${prepared.trackId}) line="${prepared.line}"`
+        );
+        // Kick off the NEXT prep now so it runs while this one plays.
+        void prepareGroupTurn();
+        try {
+          await playPreparedTurn(prepared);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[group] ✖ cached playback ${err instanceof Error ? err.message : String(err)}`
+          );
+          setTracksUI((prev) =>
+            prev.map((t) =>
+              t.id === prepared.trackId
+                ? { ...t, thinking: false, speaking: false }
+                : t
+            )
+          );
+        }
+        return;
+      }
+
+      // Cold path: no prep ready (first turn of a session, or invalidated).
+      // Generate + stream inline, same path converseWithObject uses.
+      const mode: "chat" | "followup" =
+        tracks.length === 1 ? "followup" : "chat";
+      const pick = pickGroupSpeaker();
+      if (!pick) return;
+      const peers = tracks
+        .filter((t) => t.id !== pick.id)
+        .map((t) => ({
+          name: t.className,
+          description: t.description ?? null,
+        }));
+      const recentTurns = groupHistoryRef.current.slice(-16).map((t) => ({
+        speaker: t.speaker,
+        line: t.line,
+        role: t.role,
+      }));
+      const speaker = pick;
+      const callGen = ++speaker.speakGen;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[group] ▶ turn(cold) speaker=${speaker.className} (${speaker.id}) mode=${mode} peers=${peers.length} history=${recentTurns.length}`
       );
       setTracksUI((prev) =>
         prev.map((t) =>
@@ -2903,22 +3291,21 @@ export function Tracker() {
             : t
         )
       );
-      const { line } = await groupLine({
+      const { line, emotion, speed, addressing } = await groupLine({
         speaker: {
           name: speaker.className,
           description: speaker.description ?? null,
         },
         peers,
         recentTurns,
+        mode,
         lang: langRef.current,
       });
       if (turnGen !== groupGenRef.current || callGen !== speaker.speakGen) {
         // eslint-disable-next-line no-console
-        console.log(`[group] ← superseded`);
+        console.log(`[group] ← superseded (cold)`);
         return;
       }
-      // Commit this line into both the shared transcript AND the speaker's
-      // own history so a solo retap stays consistent with what it just said.
       const ts = performance.now();
       groupHistoryRef.current.push({
         speaker: speaker.className,
@@ -2926,6 +3313,7 @@ export function Tracker() {
         line,
         role: "assistant",
         ts,
+        addressing,
       });
       groupHistoryRef.current = groupHistoryRef.current.slice(-48);
       speaker.history = [
@@ -2933,18 +3321,22 @@ export function Tracker() {
         { role: "assistant" as const, content: line },
       ].slice(-32);
       groupLastSpokeAtRef.current[speaker.id] = ts;
-
       setTracksUI((prev) =>
         prev.map((t) =>
           t.id === speaker.id ? { ...t, caption: line, thinking: false } : t
         )
       );
+      // Kick off next prep in parallel with this cold playback.
+      void prepareGroupTurn();
       await playStreamingReply(
         speaker.id,
         callGen,
         line,
         speaker.voiceId,
-        `g${turnGen}`
+        `g${turnGen}`,
+        undefined,
+        emotion,
+        speed
       );
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -2952,35 +3344,69 @@ export function Tracker() {
         `[group] ✖ ${err instanceof Error ? err.message : String(err)}`
       );
       setTracksUI((prev) =>
-        prev.map((t) =>
-          t.id === speaker.id
-            ? { ...t, thinking: false, speaking: false }
-            : t
-        )
+        prev.map((t) => ({ ...t, thinking: false, speaking: false }))
       );
     } finally {
       groupInFlightRef.current = false;
     }
-  }, [playStreamingReply]);
+  }, [pickGroupSpeaker, playPreparedTurn, playStreamingReply, prepareGroupTurn]);
 
-  // Scheduler: whenever the scene is idle (≥2 tracks, nothing thinking or
+  // Scheduler: whenever the scene is idle (≥1 track, nothing thinking or
   // speaking, user isn't holding the mic, no picker up) wait a beat and
-  // fire the next group turn. The short delay is load-bearing — back-to-
-  // back turns with no pause sound like a shouting match, not a chat.
+  // fire the next turn. Behavior splits on track count:
+  //   • 1 track — "follow-up" mode. Wait a random 12–20s after the last
+  //     utterance before firing, so the human has room to reply. If they
+  //     do reply (converseWithObject pushes into groupHistoryRef), the
+  //     silence clock resets naturally.
+  //   • ≥2 tracks — banter mode. Short 0.9–1.8s between lines; ~15% chance
+  //     of a 2.5–5s natural break so it doesn't read as a shouting match.
+  //     After a user line, snap back faster (500ms) so they feel heard.
+  // NOTE: the deps list deliberately uses `tracksUI.length`, NOT `tracksUI`.
+  // The RAF render loop rewrites the tracksUI array every ~16ms (positions,
+  // shapes, etc.); depending on the full array would tear this effect down
+  // every frame and clear the scheduled timer before it could ever fire.
+  // That was the bug where only one track ever replied.
+  const tracksLen = tracksUI.length;
   const anyThinkingSched = tracksUI.some((t) => t.thinking);
   const anySpeakingSched = tracksUI.some((t) => t.speaking);
   useEffect(() => {
     if (!groupChatEnabled) return;
-    if (tracksUI.length < 2) return;
+    if (tracksLen < 1) return;
     if (anyThinkingSched || anySpeakingSched) return;
     if (groupInFlightRef.current) return;
     if (isRecording) return;
     if (addHintActive) return;
     if (groupTimerRef.current != null) return;
-    // Between-turn pause. Longer after a user turn (let them feel heard);
-    // shorter between object-to-object lines to keep the banter snappy.
-    const lastTurn = groupHistoryRef.current[groupHistoryRef.current.length - 1];
-    const delay = lastTurn?.role === "user" ? 500 : 1200;
+
+    const history = groupHistoryRef.current;
+    const lastTurn = history[history.length - 1];
+    const now = performance.now();
+    const silenceMs = lastTurn ? now - lastTurn.ts : Infinity;
+
+    let delay: number;
+    if (tracksLen === 1) {
+      // Solo path — random 12–20s silence threshold then a follow-up.
+      const minWait = 12_000 + Math.random() * 8_000;
+      delay = Math.max(400, minWait - silenceMs);
+    } else if (lastTurn?.role === "user") {
+      // Respond to the human quickly so they feel heard.
+      delay = 500;
+    } else {
+      // Multi-track banter with occasional breather. 15% of the time take
+      // a 2.5–5s pause, otherwise 0.9–1.8s snap back.
+      const takeBreak = Math.random() < 0.15;
+      delay = takeBreak
+        ? 2500 + Math.random() * 2500
+        : 900 + Math.random() * 900;
+    }
+
+    // Kick off prep NOW (while waiting) so by the time the timer fires,
+    // the next turn's script + TTS are ready. The mode is decided inside
+    // prepare based on current track count; the delay-only role of the
+    // scheduler is timing. No-op if something is already staged or
+    // preparing.
+    void prepareGroupTurn();
+
     groupTimerRef.current = window.setTimeout(() => {
       groupTimerRef.current = null;
       void runGroupTurn();
@@ -2993,26 +3419,53 @@ export function Tracker() {
     };
   }, [
     groupChatEnabled,
-    tracksUI,
+    tracksLen,
     anyThinkingSched,
     anySpeakingSched,
     isRecording,
     addHintActive,
+    prepareGroupTurn,
     runGroupTurn,
   ]);
 
   // When group chat is toggled off OR the scene clears, stop any in-flight
   // scheduled turn so a flipped-off toggle kills the loop immediately.
   useEffect(() => {
-    if (groupChatEnabled && tracksUI.length >= 2) return;
+    if (groupChatEnabled && tracksLen >= 1) return;
     if (groupTimerRef.current != null) {
       clearTimeout(groupTimerRef.current);
       groupTimerRef.current = null;
     }
-    // Bumping the gen tag makes any in-flight groupLine-speaking drop its
+    // Bumping the gen tag makes any in-flight groupLine/prepare drop its
     // result when it resolves — no stale reply plays after the toggle flip.
+    // Also drop the staged turn so a re-enable starts fresh.
     groupGenRef.current++;
-  }, [groupChatEnabled, tracksUI.length]);
+    preparedTurnRef.current = null;
+  }, [groupChatEnabled, tracksLen]);
+
+  // Overlap prep with ANY ongoing playback — not just group turns. When a
+  // converse reply starts playing (or an opening line), this kicks off the
+  // next group turn's script + TTS in the background, so by the time the
+  // current audio ends, the next line is already cached. Without this, the
+  // gap between "object-answers-user" and "peer-picks-up-the-thread" is a
+  // full groupLine + TTS roundtrip (~800ms of dead air), which kills the
+  // alive-committee feel. Prep itself is idempotent — cheap no-op if
+  // something is already staged or in flight.
+  useEffect(() => {
+    if (!groupChatEnabled) return;
+    if (tracksLen < 1) return;
+    if (!anySpeakingSched) return;
+    if (isRecording) return;
+    // Fire-and-forget. prepareGroupTurn's own guards handle the no-op case
+    // when a prepare is already in flight or a turn is already staged.
+    void prepareGroupTurn();
+  }, [
+    groupChatEnabled,
+    tracksLen,
+    anySpeakingSched,
+    isRecording,
+    prepareGroupTurn,
+  ]);
 
   // Hit-test a tap against existing tracks' smoothed boxes. Returns the
   // innermost hit (smallest box containing the point) so nested tracks
@@ -3283,6 +3736,10 @@ export function Tracker() {
         maskAnchor: null,
       };
 
+      // A new peer changes who the prepared turn would have addressed —
+      // drop the pre-cache so the next prepare sees the expanded roster.
+      groupGenRef.current++;
+      preparedTurnRef.current = null;
       // LRU eviction when the slots are full. Bump speakGen first so any
       // in-flight generateLine/stream on the evictee bails at its guard.
       // Route through stopTrackAudio for the same audio teardown the
@@ -3408,16 +3865,43 @@ export function Tracker() {
 
   const startRecording = useCallback(async () => {
     if (recorderRef.current && recorderRef.current.state === "recording") return;
-    // Don't let the user open the mic while any track is still generating
-    // or speaking its line — the object speaks first, the user replies after.
-    // The visible button styling mirrors this; this is the safety net for
-    // pointer events that slip through while the disabled state is in flux.
-    if (
-      tracksUIRef.current.some((t) => t.thinking || t.speaking)
-    ) {
+    // Pressing talk while a face is mid-reply interrupts it: bump speakGen
+    // (any in-flight generateLine / streaming TTS bails at its next guard)
+    // and ramp+stop its audio. The user wanted to cut in without sitting
+    // through the rest of the line.
+    // Snapshot UI state BEFORE bumping speakGen — the in-flight speakOnTrack
+    // / sendTalkToTrack `finally` blocks won't clear `thinking` once their
+    // captured callGen no longer matches, so we have to do it ourselves.
+    const wasBusy = tracksUIRef.current.some((t) => t.thinking || t.speaking);
+    let stoppedAudio = 0;
+    for (const t of tracksRef.current) {
+      if (t.source || t.streamingAudio) stoppedAudio++;
+      t.speakGen++;
+      stopTrackAudio(t);
+      if (t.captionClearTimer != null) {
+        clearTimeout(t.captionClearTimer);
+        t.captionClearTimer = null;
+      }
+    }
+    // Drop any staged group turn + in-flight prepare — it was scripted
+    // without knowledge of what the user is about to say. The NEXT prepare
+    // (scheduled after the user's reply lands) sees the updated transcript.
+    groupGenRef.current++;
+    preparedTurnRef.current = null;
+    if (groupTimerRef.current != null) {
+      clearTimeout(groupTimerRef.current);
+      groupTimerRef.current = null;
+    }
+    if (wasBusy) {
+      setTracksUI((prev) =>
+        prev.map((t) =>
+          t.thinking || t.speaking
+            ? { ...t, speaking: false, thinking: false }
+            : t
+        )
+      );
       // eslint-disable-next-line no-console
-      console.log("[mic] ✖ blocked — object is still speaking");
-      return;
+      console.log(`[mic] ⤴ interrupted (audio-stopped=${stoppedAudio})`);
     }
     // Bump per-press correlation id so all logs for this turn share a tag.
     turnCounterRef.current += 1;
@@ -3700,7 +4184,7 @@ export function Tracker() {
     if (talkLevelRafRef.current == null) {
       talkLevelRafRef.current = requestAnimationFrame(readLevel);
     }
-  }, [ensureAudioCtx, openMicStream, pickTalkTarget, sendTalkToTrack, showRejection]);
+  }, [ensureAudioCtx, openMicStream, pickTalkTarget, sendTalkToTrack, showRejection, stopTrackAudio]);
 
   const stopRecording = useCallback(() => {
     // eslint-disable-next-line no-console
@@ -3731,10 +4215,11 @@ export function Tracker() {
   // --- Derived UI --------------------------------------------------------
   const anyThinking = tracksUI.some((t) => t.thinking);
   const anySpeaking = tracksUI.some((t) => t.speaking);
-  // Keep the ref in sync for callback paths (mic gate in startRecording).
+  // Keep the ref in sync for callback paths (startRecording snapshots it
+  // to decide whether an interrupt cleanup is needed).
   tracksUIRef.current = tracksUI;
-  // Object speaks first, user replies after — mic stays disabled while any
-  // track is generating its line or actively speaking it.
+  // Drives the mic button's aria-label only — pressing talk while busy
+  // now interrupts the current voice instead of being blocked.
   const micBusy = anyThinking || anySpeaking;
 
   // Which face the mic is aimed at — the most-recently-tapped one. Drives
@@ -4550,18 +5035,16 @@ export function Tracker() {
           />
           <button
             type="button"
-            disabled={micBusy && !isRecording}
             aria-label={
-              micBusy && !isRecording
-                ? "wait — let it finish speaking"
-                : isRecording
-                  ? "recording — release to send"
+              isRecording
+                ? "recording — release to send"
+                : micBusy
+                  ? "tap to interrupt and speak"
                   : "hold to speak"
             }
             onPointerDown={(e) => {
               e.preventDefault();
               e.stopPropagation();
-              if (micBusy) return;
               try {
                 (e.currentTarget as Element).setPointerCapture(e.pointerId);
               } catch {
@@ -4592,9 +5075,9 @@ export function Tracker() {
                 : talkFlash
                   ? "scale(1.04)"
                   : "scale(1)",
-              opacity: micBusy && !isRecording ? 0.45 : 1,
-              filter: micBusy && !isRecording ? "saturate(0.6)" : undefined,
-              cursor: micBusy && !isRecording ? "not-allowed" : undefined,
+              opacity: 1,
+              filter: undefined,
+              cursor: undefined,
               WebkitTouchCallout: "none",
               WebkitUserSelect: "none",
               userSelect: "none",
