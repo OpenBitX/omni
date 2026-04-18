@@ -1,0 +1,43 @@
+{
+  "name": "tracker-native",
+  "version": "0.1.0",
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start --dev-client",
+    "ios": "expo run:ios",
+    "android": "expo run:android",
+    "prebuild": "expo prebuild --clean",
+    "typecheck": "tsc --noEmit",
+    "api:dev": "cd .. && npm run dev -- -H 0.0.0.0 -p 3000"
+  },
+  "dependencies": {
+    "expo": "~54.0.0",
+    "expo-asset": "~11.0.0",
+    "expo-av": "~15.0.0",
+    "expo-constants": "~17.0.0",
+    "expo-file-system": "~18.0.0",
+    "expo-router": "~5.0.0",
+    "expo-speech-recognition": "^1.0.0",
+    "expo-status-bar": "~2.0.0",
+    "expo-system-ui": "~4.0.0",
+    "expo-video": "~2.0.0",
+    "react": "19.0.0",
+    "react-native": "0.76.0",
+    "react-native-executorch": "0.8.3",
+    "react-native-executorch-expo-resource-fetcher": "0.8.3",
+    "react-native-audio-api": "^0.5.0",
+    "react-native-gesture-handler": "~2.20.0",
+    "react-native-reanimated": "~3.16.0",
+    "react-native-safe-area-context": "~4.12.0",
+    "react-native-screens": "~4.1.0",
+    "react-native-svg": "15.8.0",
+    "react-native-vision-camera": "^5.0.0",
+    "react-native-worklets-core": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.0.0",
+    "@types/react-native": "~0.73.0",
+    "typescript": "~5.6.0"
+  },
+  "private": true
+}

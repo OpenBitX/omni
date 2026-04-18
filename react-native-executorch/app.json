@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "Tracker",
+    "slug": "tracker-native",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "tracker",
+    "newArchEnabled": true,
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.harryedwards.tracker",
+      "deploymentTarget": "17.0",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Tracker uses the camera to detect objects you tap and pin animated faces onto them.",
+        "NSMicrophoneUsageDescription": "Tracker uses the microphone so you can talk back to the objects.",
+        "NSSpeechRecognitionUsageDescription": "Tracker transcribes what you say so the object can reply."
+      }
+    },
+    "android": {
+      "package": "com.harryedwards.tracker",
+      "minSdkVersion": 33,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.INTERNET"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Tracker uses the camera to detect objects you tap.",
+          "enableMicrophonePermission": true,
+          "microphonePermissionText": "Tracker uses the microphone so you can talk back."
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Tracker needs the microphone to hear what you say.",
+          "speechRecognitionPermission": "Tracker transcribes speech so objects can reply."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
