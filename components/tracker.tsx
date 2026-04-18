@@ -59,53 +59,6 @@ import {
 } from "@/lib/iou";
 import { initWhisper, transcribeBlob } from "@/lib/whisper";
 
-// === Web Speech API typing ==============================================
-//
-// The DOM lib doesn't always expose SpeechRecognition (it's
-// implementation-defined) and Safari only ships the webkit-prefixed
-// variant. We declare a minimal shape locally so the code compiles
-// everywhere and feature-detect at runtime before using it.
-
-interface SpeechRecognitionResultLike {
-  isFinal: boolean;
-  0: { transcript: string; confidence?: number };
-}
-interface SpeechRecognitionResultListLike {
-  length: number;
-  [index: number]: SpeechRecognitionResultLike;
-}
-interface SpeechRecognitionEventLike extends Event {
-  resultIndex: number;
-  results: SpeechRecognitionResultListLike;
-}
-interface SpeechRecognitionErrorEventLike extends Event {
-  error: string;
-  message?: string;
-}
-interface SpeechRecognitionLike {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  maxAlternatives: number;
-  start(): void;
-  stop(): void;
-  abort(): void;
-  onresult: ((e: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((e: SpeechRecognitionErrorEventLike) => void) | null;
-  onend: ((e: Event) => void) | null;
-  onstart: ((e: Event) => void) | null;
-}
-type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
-
-function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
-  if (typeof window === "undefined") return null;
-  const w = window as unknown as {
-    SpeechRecognition?: SpeechRecognitionCtor;
-    webkitSpeechRecognition?: SpeechRecognitionCtor;
-  };
-  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
-}
-
 // === Pipeline tuning knobs ===============================================
 
 // Inference rate cap. YOLOv8n on mobile CPU-WASM sits around 3–8 FPS; on
@@ -861,22 +814,12 @@ export function Tracker() {
   const recordedChunksRef = useRef<BlobPart[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
   const recordedBlobRef = useRef<Blob | null>(null);
-  // Browser-side Web Speech API. Runs in parallel with MediaRecorder so the
-  // transcript is usually already final by the time the user releases the
-  // talk button — saves the entire server STT roundtrip (~700–1300ms).
-  // Falls back to server STT silently when SpeechRecognition isn't
-  // available (Firefox, some embedded webviews) or yields nothing.
-  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const speechTranscriptPartsRef = useRef<string[]>([]);
-  const speechFinishedRef = useRef<Promise<void> | null>(null);
-  const resolveSpeechFinishedRef = useRef<(() => void) | null>(null);
   // Per-press correlation id + timestamps so we can emit one clean
   // press-to-first-sound summary per turn that's easy to scan in the
   // dev console.
   const turnCounterRef = useRef<number>(0);
   const turnIdRef = useRef<string>("0");
   const turnPressAtRef = useRef<number>(0);
-  const turnSrFinishedAtRef = useRef<number>(0);
   // Per-tap correlation id (distinct from turn ids above which tag
   // voice-in conversation presses). Every tap mints a new `tN` tag that
   // threads through the speak → VLM → TTS → first-sound logs so one
@@ -1230,9 +1173,11 @@ export function Tracker() {
         setYoloReady(true);
         // eslint-disable-next-line no-console
         console.log("[tracker] yolo ready");
-        // Warm the on-device Whisper now so the FIRST press doesn't pay the
-        // full ~1–3s model-load cost mid-turn. Best-effort — failures fall
-        // back to Web Speech (primary) and server STT (last-resort).
+        // Warm the on-device Whisper now — it's the sole STT path, so the
+        // FIRST mic press must not pay the ~1–3s model-load cost mid-turn.
+        // On a cold cache this downloads ~40MB from the HF CDN; subsequent
+        // visits hit IndexedDB. Best-effort — a load failure just means the
+        // first turn pays the cost with its own timeout budget.
         void initWhisper().catch(() => {
           // status observable already records the error; nothing to do here
         });
@@ -2879,14 +2824,10 @@ export function Tracker() {
             const firstSoundAt = performance.now();
             const ttsTtfb = Math.round(firstSoundAt - ttsT0);
             const press = turnPressAtRef.current;
-            const sr = turnSrFinishedAtRef.current;
             const totalMs = press ? Math.round(firstSoundAt - press) : -1;
-            const srMs = press && sr ? Math.round(sr - press) : -1;
             // eslint-disable-next-line no-console
             console.log(
-              `[turn #${tid}] ◀ FIRST SOUND in ${totalMs}ms  ━  ${
-                srMs >= 0 ? `sr=${srMs}ms` : "sr=server-fallback"
-              } ▸ converse=${converseMs}ms ▸ tts-ttfb=${ttsTtfb}ms`
+              `[turn #${tid}] ◀ FIRST SOUND in ${totalMs}ms  ━  converse=${converseMs}ms ▸ tts-ttfb=${ttsTtfb}ms`
             );
           },
           replyEmotion,
@@ -4067,7 +4008,6 @@ export function Tracker() {
     turnCounterRef.current += 1;
     turnIdRef.current = String(turnCounterRef.current);
     turnPressAtRef.current = performance.now();
-    turnSrFinishedAtRef.current = 0;
     const turnId = turnIdRef.current;
     // eslint-disable-next-line no-console
     console.log(`[turn #${turnId}] ▶ press`);
@@ -4135,168 +4075,56 @@ export function Tracker() {
         talkFlashTimerRef.current = null;
       }, 650);
 
-      // STT race — keep the latency tight on the happy path:
-      //   1. Web Speech API runs DURING recording; by mic-release the
-      //      transcript is usually already final. Wait up to 500ms for
-      //      sr.onend so the partial-final settles, then ship it.
-      //   2. If SR returned nothing (Firefox, no SpeechRecognition, low
-      //      audio) — fall through to on-device Whisper. Stays in the
-      //      browser, no upload, multilingual (en + zh). ~200–800ms after
-      //      release on M-series.
-      //   3. If Whisper also fails or is empty, the server-side STT in
-      //      converseWithObject is the last-resort fallback.
+      // On-device Whisper is the sole STT path. Cap at 60s so a pathological
+      // model stall can't strand the turn forever; normal releases resolve
+      // in ~200–800ms on M-series after the model is preloaded.
       const turnId = turnIdRef.current;
-      // STT always uses the spoken language (not the learn-target).
       const lang = spokenLangRef.current;
       void (async () => {
-        const finished = speechFinishedRef.current;
-        if (finished) {
-          await Promise.race([
-            finished,
-            new Promise<void>((r) => window.setTimeout(r, 500)),
+        let transcript = "";
+        try {
+          const whisperRace = await Promise.race([
+            transcribeBlob(blob, lang, ` #${turnId}`).then((t) => ({
+              ok: true as const,
+              text: t,
+            })),
+            new Promise<{ ok: false; reason: string }>((r) =>
+              window.setTimeout(
+                () => r({ ok: false, reason: "timeout" }),
+                60000
+              )
+            ),
           ]);
-        }
-        let transcript = speechTranscriptPartsRef.current
-          .join(" ")
-          .replace(/\s+/g, " ")
-          .trim();
-        speechTranscriptPartsRef.current = [];
-        // SR latency = sr.onend timestamp - press timestamp (or now if sr
-        // never fired, which means we'll fall back to Whisper / server STT).
-        const srMs =
-          turnSrFinishedAtRef.current && turnPressAtRef.current
-            ? Math.round(turnSrFinishedAtRef.current - turnPressAtRef.current)
-            : -1;
-        let stt: "sr" | "whisper" | "server" = transcript ? "sr" : "server";
-        if (!transcript) {
-          // SR was empty or unavailable — try Whisper on-device before
-          // we ship to the server. Bounded to 6s so a model-load stall
-          // can't strand the turn; converseWithObject's server STT picks
-          // up if we time out.
-          try {
-            const whisperRace = await Promise.race([
-              transcribeBlob(blob, lang, ` #${turnId}`).then((t) => ({
-                ok: true as const,
-                text: t,
-              })),
-              new Promise<{ ok: false; reason: string }>((r) =>
-                window.setTimeout(
-                  () => r({ ok: false, reason: "timeout" }),
-                  6000
-                )
-              ),
-            ]);
-            if (whisperRace.ok && whisperRace.text) {
-              transcript = whisperRace.text;
-              stt = "whisper";
-            } else if (!whisperRace.ok) {
-              // eslint-disable-next-line no-console
-              console.log(
-                `[whisper #${turnId}] ✖ ${whisperRace.reason} — falling through to server STT`
-              );
-            }
-          } catch (err) {
+          if (whisperRace.ok) {
+            transcript = whisperRace.text.trim();
+          } else {
             // eslint-disable-next-line no-console
             console.log(
-              `[whisper #${turnId}] ✖ ${err instanceof Error ? err.message : String(err)} — falling through to server STT`
+              `[whisper #${turnId}] ✖ ${whisperRace.reason} — empty transcript`
             );
           }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[whisper #${turnId}] ✖ ${err instanceof Error ? err.message : String(err)}`
+          );
         }
         // eslint-disable-next-line no-console
         console.log(
-          `[stt #${turnId}] → handoff  source=${stt}  transcript=${transcript ? `"${transcript.slice(0, 80)}${transcript.length > 80 ? "…" : ""}" (${transcript.length}ch)` : "empty"}  ${srMs >= 0 ? `srMs=${srMs}` : "(no sr)"}`
+          `[stt #${turnId}] → handoff  transcript=${transcript ? `"${transcript.slice(0, 80)}${transcript.length > 80 ? "…" : ""}" (${transcript.length}ch)` : "empty"}`
         );
         await sendTalkToTrack(target.id, blob, transcript, turnId);
       })();
     };
 
-    // Kick off Web Speech API in parallel. By the time the user releases
-    // the talk button the transcript is usually already final, so we send
-    // it with the request and the server skips its STT call entirely.
-    const SR = getSpeechRecognitionCtor();
-    if (SR) {
-      try {
-        if (speechRecognitionRef.current) {
-          try {
-            speechRecognitionRef.current.abort();
-          } catch {
-            // ignore
-          }
-          speechRecognitionRef.current = null;
-        }
-        speechTranscriptPartsRef.current = [];
-        speechFinishedRef.current = new Promise<void>((resolve) => {
-          resolveSpeechFinishedRef.current = resolve;
-        });
-        // Cancel any pending clear-timer from the previous turn so it can't
-        // wipe the live interim text mid-speech.
-        if (heardClearTimerRef.current != null) {
-          clearTimeout(heardClearTimerRef.current);
-          heardClearTimerRef.current = null;
-        }
-        setHeardText(null);
-        const sr = new SR();
-        // Always recognize the user's spoken language, not the learn-target.
-        sr.lang = spokenLangRef.current === "zh" ? "zh-CN" : "en-US";
-        sr.continuous = true;
-        // Stream partials as the user speaks so the "you said" bubble updates
-        // live. Final chunks still land in speechTranscriptPartsRef for the
-        // server handoff; Whisper's authoritative result overwrites at end.
-        sr.interimResults = true;
-        sr.maxAlternatives = 1;
-        sr.onresult = (e) => {
-          let interim = "";
-          for (let i = e.resultIndex; i < e.results.length; i++) {
-            const r = e.results[i];
-            const t = r[0]?.transcript;
-            if (!t) continue;
-            if (r.isFinal) {
-              speechTranscriptPartsRef.current.push(t);
-            } else {
-              interim += t;
-            }
-          }
-          const live = (
-            speechTranscriptPartsRef.current.join(" ") +
-            (interim ? " " + interim : "")
-          ).trim();
-          if (live) setHeardText(live);
-        };
-        sr.onerror = (ev) => {
-          // eslint-disable-next-line no-console
-          console.log(
-            `[sr] ✖ ${ev.error}${ev.message ? ` (${ev.message})` : ""}`
-          );
-        };
-        sr.onend = () => {
-          turnSrFinishedAtRef.current = performance.now();
-          // eslint-disable-next-line no-console
-          console.log(
-            `[sr #${turnIdRef.current}] ◼ ended  parts=${speechTranscriptPartsRef.current.length}`
-          );
-          resolveSpeechFinishedRef.current?.();
-          resolveSpeechFinishedRef.current = null;
-          speechRecognitionRef.current = null;
-        };
-        sr.start();
-        speechRecognitionRef.current = sr;
-        // eslint-disable-next-line no-console
-        console.log(`[sr #${turnIdRef.current}] ▶ started`);
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.log(
-          `[sr] ✖ start failed: ${err instanceof Error ? err.message : String(err)} — falling back to server STT`
-        );
-        speechRecognitionRef.current = null;
-        speechFinishedRef.current = null;
-        resolveSpeechFinishedRef.current = null;
-      }
-    } else {
-      // No Web Speech in this browser — leave the refs unset so onstop
-      // takes the server-STT path.
-      speechFinishedRef.current = null;
-      speechTranscriptPartsRef.current = [];
+    // Clear any stale "you said" bubble from the previous turn so the
+    // in-record "listening…" placeholder (rendered by the JSX below) takes
+    // over cleanly.
+    if (heardClearTimerRef.current != null) {
+      clearTimeout(heardClearTimerRef.current);
+      heardClearTimerRef.current = null;
     }
+    setHeardText(null);
 
     recorderRef.current = mr;
     mr.start(100);
@@ -4360,16 +4188,6 @@ export function Tracker() {
       }
     }
     recorderRef.current = null;
-    // Tell SpeechRecognition to flush its buffer and emit a final result.
-    // The `onend` handler resolves `speechFinishedRef` which the recorder
-    // onstop is already awaiting (with a 500ms cap) before sending the turn.
-    if (speechRecognitionRef.current) {
-      try {
-        speechRecognitionRef.current.stop();
-      } catch {
-        // ignore — already stopped
-      }
-    }
     setIsRecording(false);
     stopTalkLevelLoop();
   }, [stopTalkLevelLoop]);
@@ -4651,24 +4469,24 @@ export function Tracker() {
       )}
 
       {/* Top wordmark + status pill + diag toggle. */}
-      <div className="absolute inset-x-0 top-0 flex items-center justify-between px-5 pt-[max(env(safe-area-inset-top),18px)]">
-        <div className="pointer-events-none flex items-center gap-2 rounded-full bg-white/15 px-3.5 py-1.5 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] ring-1 ring-white/25 backdrop-blur-xl">
+      <div className="absolute inset-x-0 top-0 flex items-start justify-between gap-2 px-3 pt-[max(env(safe-area-inset-top),18px)] sm:px-5">
+        <div className="pointer-events-none flex shrink-0 items-center gap-2 rounded-full bg-white/15 px-3 py-1.5 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] ring-1 ring-white/25 backdrop-blur-xl sm:px-3.5">
           <span className="h-1.5 w-1.5 rounded-full bg-[#ff89be] shadow-[0_0_0_3px_rgba(255,137,190,0.28)]" />
-          <span className="serif-italic text-[17px] font-medium leading-none text-white/95">
+          <span className="serif-italic text-[15px] font-medium leading-none text-white/95 sm:text-[17px]">
             omni
           </span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-1 flex-wrap items-center justify-end gap-1.5 sm:gap-2">
           <div
             className={
-              "pointer-events-none flex items-center gap-2 rounded-full px-3.5 py-1.5 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] ring-1 backdrop-blur-xl transition " +
+              "pointer-events-none flex items-center gap-2 rounded-full px-2.5 py-1.5 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] ring-1 backdrop-blur-xl transition sm:px-3.5 " +
               (phase === "error"
                 ? "bg-rose-500/30 ring-rose-200/40"
                 : "bg-white/15 ring-white/25")
             }
           >
             <span className={"h-1.5 w-1.5 rounded-full " + dotClass} />
-            <span className="text-[11.5px] font-medium tabular-nums tracking-wide text-white/90">
+            <span className="hidden text-[11.5px] font-medium tabular-nums tracking-wide text-white/90 sm:inline">
               {statusText}
             </span>
           </div>
@@ -4679,11 +4497,11 @@ export function Tracker() {
           <div
             role="group"
             aria-label="spoken language"
-            className="flex items-center gap-1 rounded-full bg-white/15 p-0.5 pl-2 ring-1 ring-white/25 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] backdrop-blur-xl"
+            className="flex items-center gap-1 rounded-full bg-white/15 p-0.5 pl-1.5 ring-1 ring-white/25 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] backdrop-blur-xl sm:pl-2"
           >
             <span
               aria-hidden
-              className="select-none text-[9px] font-semibold uppercase tracking-[0.15em] text-white/55"
+              className="hidden select-none text-[9px] font-semibold uppercase tracking-[0.15em] text-white/55 sm:inline"
             >
               speak
             </span>
@@ -5164,20 +4982,21 @@ export function Tracker() {
         </div>
       )}
 
-      {/* "You said …" transcript echo — instant signal that Whisper heard
-          the voice message. Rendered just below the status pill so it
-          overlaps the thinking + reply caption without fighting either. */}
-      {heardText && isRecording && (
+      {/* Live speech feedback. During recording the on-device Whisper path
+          can't stream partials, so we show a soft "listening…" placeholder
+          while the mic is hot; once Whisper returns, `heardText` flips to
+          the final transcript (set in sendTalkToTrack). */}
+      {(isRecording || heardText) && (
         <div
           className="pointer-events-none absolute inset-x-0 top-[132px] flex justify-center px-6"
           style={{ animation: "bubble-in 320ms cubic-bezier(0.16,1,0.3,1) both" }}
         >
           <div className="flex max-w-[min(92vw,34rem)] flex-col items-center gap-0.5 rounded-2xl bg-black/55 px-4 py-2 ring-1 ring-white/15 backdrop-blur-xl">
             <span className="text-[10px] uppercase tracking-[0.18em] text-white/55">
-              you said
+              {isRecording && !heardText ? "listening" : "you said"}
             </span>
             <span className="serif-italic text-center text-[13px] font-medium leading-snug text-white/95 break-words">
-              {heardText}
+              {heardText ?? "…"}
             </span>
           </div>
         </div>
