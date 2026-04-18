@@ -68,6 +68,29 @@ const RECONNECT_MAX_MS = 8000;
 const BOX_POS_ALPHA = 0.6;
 const BOX_SIZE_ALPHA = 0.2;
 
+// Velocity extrapolation (V1 parity). SAM2 replies land at ~8–15 fps on
+// CPU/MPS; without extrapolation the face freezes between responses and
+// visibly teleports on each update. We EMA a per-track velocity in
+// normalized units/ms, replay it every RAF, and cap the horizon so a
+// long stall (GC, network blip) doesn't fling the face off the object.
+const EXTRAP_MAX_MS = 220;
+const VELOCITY_EMA = 0.75;
+
+// Consecutive stale frames after which the next real bbox hard-snaps the
+// EMA instead of gliding. V1's LOST_AFTER_MISSES does the same — without
+// this parity the face visibly slides across the frame on reacquisition
+// after a brief occlusion.
+const SNAP_AFTER_STALE = 3;
+
+// If maskArea drops below this fraction of the track's running max, treat
+// the object as partially occluded and fade the face early. V1 reads
+// maskArea straight off the YOLO-seg head; V2 gets it from the server
+// (see `maskArea` in the track event payload).
+const OCCLUSION_AREA_FRACTION = 0.45;
+// Floor on the opacity we fade to during occlusion — we never fully
+// disappear until the server actually declares "lost", but we do dim.
+const OCCLUSION_OPACITY_MIN = 0.35;
+
 // FaceVoice is FACE_VOICE_WIDTH × FACE_VOICE_HEIGHT CSS px at scale=1.
 // Scale the face so its width ≈ `FACE_BBOX_FRACTION × min(bboxW, bboxH)`
 // in display pixels, clamped to reasonable mins/maxes.
@@ -85,8 +108,20 @@ const ERROR_LINGER_MS = 4500;
 type Phase = "idle" | "opening" | "live" | "error";
 
 type ServerEvent =
-  | { type: "initialized"; trackId: string; bbox: [number, number, number, number]; score: number }
-  | { type: "track"; bbox: [number, number, number, number] | null; score: number; stale?: boolean }
+  | {
+      type: "initialized";
+      trackId: string;
+      bbox: [number, number, number, number];
+      score: number;
+      maskArea?: number;
+    }
+  | {
+      type: "track";
+      bbox: [number, number, number, number] | null;
+      score: number;
+      stale?: boolean;
+      maskArea?: number;
+    }
   | { type: "lost"; reason: string }
   | { type: "error"; message: string };
 
@@ -101,6 +136,19 @@ type ActiveTrack = {
   ema: BoxEMA;
   // Latest smoothed box in normalized [0,1] coords.
   smoothed: Box;
+  // Velocity in normalized units / ms, EMA-smoothed from consecutive
+  // bbox arrivals. Replayed every RAF so the face glides at 60 fps
+  // instead of teleporting at the SAM2 response rate.
+  velCx: number;
+  velCy: number;
+  // performance.now() of the last real bbox (non-stale). Drives both
+  // the extrapolation horizon cap and the velocity dt.
+  lastBboxAt: number;
+  // Consecutive stale/null frames from the server. Triggers a hard EMA
+  // snap when a real bbox finally arrives (see SNAP_AFTER_STALE).
+  staleStreak: number;
+  // Rolling max maskArea (fraction of frame) for occlusion detection.
+  maxMaskArea: number;
   // Last raw bbox from the server, for debugging / visible score.
   lastScore: number;
   // Persona pinned after the first generateLine — reused for retaps +
@@ -665,6 +713,12 @@ export function TrackerV2() {
         track.id = payload.trackId;
         track.lastScore = payload.score;
         track.opacity = 1;
+        track.velCx = 0;
+        track.velCy = 0;
+        track.lastBboxAt = performance.now();
+        track.staleStreak = 0;
+        track.maxMaskArea =
+          typeof payload.maskArea === "number" ? payload.maskArea : 0;
         setTrackLocked(true);
         setLastScore(payload.score);
         return;
@@ -673,12 +727,68 @@ export function TrackerV2() {
         track.lastScore = payload.score;
         setLastScore(payload.score);
         if (payload.bbox && !payload.stale && validBbox(payload.bbox)) {
-          const b = boxFromNormalizedBbox(payload.bbox);
-          track.smoothed = smoothBox(track.ema, b);
-          track.opacity = 1;
+          const raw = boxFromNormalizedBbox(payload.bbox);
+          const now = performance.now();
+
+          // Snap on reacquire: if we've been stale for several frames and
+          // a fresh real bbox lands, the object has likely jumped from
+          // where we last saw it. Gliding there via EMA would look like
+          // the face sliding across the screen — re-seed instead. This
+          // mirrors V1 using LOST_AFTER_MISSES to drive BOTH the fade and
+          // the EMA snap; the two consequences MUST share one threshold.
+          const snap = track.staleStreak >= SNAP_AFTER_STALE;
+          if (snap) {
+            seedBoxEMA(track.ema, raw);
+            track.smoothed = raw;
+            track.velCx = 0;
+            track.velCy = 0;
+          } else {
+            const prev = track.smoothed;
+            track.smoothed = smoothBox(track.ema, raw);
+
+            // Velocity from smoothed-to-smoothed. We deliberately don't
+            // compute velocity from raw bbox — raw bboxes jitter, and
+            // jitter-driven velocity would shove the extrapolated face
+            // around every RAF. Post-EMA it's already low-pass.
+            if (track.lastBboxAt > 0) {
+              const dt = Math.max(1, now - track.lastBboxAt);
+              const sampleVx = (track.smoothed.cx - prev.cx) / dt;
+              const sampleVy = (track.smoothed.cy - prev.cy) / dt;
+              track.velCx =
+                VELOCITY_EMA * track.velCx + (1 - VELOCITY_EMA) * sampleVx;
+              track.velCy =
+                VELOCITY_EMA * track.velCy + (1 - VELOCITY_EMA) * sampleVy;
+            }
+          }
+          track.lastBboxAt = now;
+          track.staleStreak = 0;
+
+          // Occlusion signal: compare current maskArea to the rolling
+          // max. Dropping below OCCLUSION_AREA_FRACTION × max means the
+          // object is likely partially covered. We fade (but don't drop)
+          // so the face dims visibly while SAM2 is holding onto what it
+          // can — drop happens only when the server declares "lost".
+          if (typeof payload.maskArea === "number") {
+            if (payload.maskArea > track.maxMaskArea) {
+              track.maxMaskArea = payload.maskArea;
+            }
+            const occluded =
+              track.maxMaskArea > 0 &&
+              payload.maskArea / track.maxMaskArea < OCCLUSION_AREA_FRACTION;
+            track.opacity = occluded
+              ? Math.max(OCCLUSION_OPACITY_MIN, track.opacity * 0.85)
+              : 1;
+          } else {
+            track.opacity = 1;
+          }
         } else {
           // Stale / missing / malformed frame — fade slightly but don't drop.
           track.opacity = Math.max(0.5, track.opacity - 0.1);
+          track.staleStreak++;
+          // Decay velocity during stalls so we don't keep extrapolating
+          // a stale trajectory after the object has stopped moving.
+          track.velCx *= 0.8;
+          track.velCy *= 0.8;
         }
         return;
       }
@@ -960,6 +1070,11 @@ export function TrackerV2() {
         anchor,
         ema,
         smoothed: provisionalBox,
+        velCx: 0,
+        velCy: 0,
+        lastBboxAt: 0,
+        staleStreak: 0,
+        maxMaskArea: 0,
         lastScore: 0,
         voiceId: null,
         description: null,
@@ -1295,7 +1410,20 @@ export function TrackerV2() {
         } else {
           const rect = stage.getBoundingClientRect();
           const b = track.smoothed;
-          const center = applyAnchor(track.anchor, b);
+          // Extrapolate the box center from last-known velocity. Horizon
+          // capped at EXTRAP_MAX_MS so a long SAM2 stall doesn't fling
+          // the face off the object. Size is NOT extrapolated — size
+          // jitter is what we're trying to suppress with the slow size
+          // alpha in the EMA, and size velocity is rarely meaningful.
+          const now = performance.now();
+          const dt =
+            track.lastBboxAt > 0
+              ? Math.min(EXTRAP_MAX_MS, Math.max(0, now - track.lastBboxAt))
+              : 0;
+          const extrapCx = b.cx + track.velCx * dt;
+          const extrapCy = b.cy + track.velCy * dt;
+          const extrap: Box = makeBox(extrapCx, extrapCy, b.w, b.h);
+          const center = applyAnchor(track.anchor, extrap);
           const boxPxMin = Math.min(b.w * rect.width, b.h * rect.height);
           const scale = clamp(
             (boxPxMin * FACE_BBOX_FRACTION) / FACE_VOICE_WIDTH,

@@ -32,6 +32,8 @@ import {
   type SessionCard,
 } from "@/lib/session-cards";
 import { type AppLang } from "@/lib/lang-detect";
+import { readOnboardingPrefs, type Lens } from "@/lib/onboarding";
+import { OnboardingOverlay } from "@/components/onboarding-overlay";
 import {
   COCO_CLASSES,
   PERSON_CLASS_ID,
@@ -582,6 +584,10 @@ type TrackRefs = {
   // compares its captured gen against the latest before storing, so a
   // slow describe response can't overwrite a fresher one.
   descriptionGen: number;
+  // Lens snapshotted at this track's lock time. Changing the pill mid-
+  // session does NOT rewrite already-locked tracks — a mug locked in
+  // history mode keeps speaking history until it's evicted.
+  mode: Lens;
   // Silhouette clipping — the face is clipped to this shape so it reads
   // as painted onto the object instead of pasted over it. Updated only
   // on YOLO inference ticks (3–30 hz), never per RAF.
@@ -687,10 +693,13 @@ export function Tracker() {
   // Navigator detection is intentionally gone — we commit to a language
   // default rather than guessing. The STT path still uses spokenLang, so
   // audio routes correctly regardless of UI toggle state.
-  const [spokenLang] = useState<AppLang>("zh");
+  const [spokenLang, setSpokenLang] = useState<AppLang>("zh");
   const [learnLang, setLearnLang] = useState<AppLang>(lang as AppLang);
   const spokenLangRef = useRef<AppLang>("zh");
   const learnLangRef = useRef<AppLang>(lang as AppLang);
+  useEffect(() => {
+    spokenLangRef.current = spokenLang;
+  }, [spokenLang]);
   useEffect(() => {
     learnLangRef.current = learnLang;
   }, [learnLang]);
@@ -699,6 +708,91 @@ export function Tracker() {
   useEffect(() => {
     setLearnLang(lang as AppLang);
   }, [lang]);
+
+  // Active lens. Initialized from (in order) URL `?lens=` → onboarding
+  // prefs → "play". Switching mid-session rewrites the prompt for NEW taps
+  // but doesn't retroactively change already-locked tracks (each track
+  // snapshots its mode at lock time, via `TrackRefs.mode`).
+  const [mode, setMode] = useState<Lens>("play");
+  const modeRef = useRef<Lens>("play");
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+  useEffect(() => {
+    // URL takes precedence (landing links /?lens=play etc.).
+    let initial: Lens | null = null;
+    try {
+      const url = new URL(window.location.href);
+      const qs = url.searchParams.get("lens");
+      if (qs === "play" || qs === "language" || qs === "history") {
+        initial = qs;
+      }
+    } catch {
+      // ignore
+    }
+    if (!initial) {
+      const prefs = readOnboardingPrefs();
+      if (prefs) initial = prefs.lens;
+    }
+    if (initial) setMode(initial);
+  }, []);
+
+  // Lens onboarding overlay. Shown when:
+  //   (a) URL has `?onboarding=1` (landing's CTAs add it on every click —
+  //       the user asked to start fresh), OR
+  //   (b) no prior onboarding exists (first-ever visit, no `completedAt`).
+  // Initial lens for step-2 highlight comes from the same URL lens param
+  // that seeds `mode` above. Finishing clears both URL params without a
+  // navigation (history.replaceState) so back-forward stays clean.
+  const [showLensOnboarding, setShowLensOnboarding] = useState(false);
+  const [overlayLens, setOverlayLens] = useState<Lens | null>(null);
+  useEffect(() => {
+    let lensParam: Lens | null = null;
+    let forced = false;
+    try {
+      const url = new URL(window.location.href);
+      const qs = url.searchParams.get("lens");
+      if (qs === "play" || qs === "language" || qs === "history") {
+        lensParam = qs;
+      }
+      forced = url.searchParams.get("onboarding") === "1";
+    } catch {
+      // ignore
+    }
+    const prefs = readOnboardingPrefs();
+    const needed = forced || !prefs || !prefs.completedAt;
+    if (needed) {
+      setOverlayLens(lensParam);
+      setShowLensOnboarding(true);
+    }
+  }, []);
+  const handleOnboardingFinished = useCallback(
+    (completed: { lens: Lens; spokenLang: "en" | "zh" }) => {
+      setShowLensOnboarding(false);
+      setMode(completed.lens);
+      // Sync the language toggle to the user's pick so the UI matches
+      // their onboarding answer without them having to flip it again.
+      setLang(completed.spokenLang);
+      // Suppress the legacy "tap anything" bubble — the lens overlay IS
+      // the onboarding now; two consecutive overlays feels like paperwork.
+      try {
+        localStorage.setItem("tracker:onboarded:v1", "1");
+      } catch {
+        // ignore
+      }
+      // Clean the URL — no refresh, just strips `?onboarding=1&lens=…`.
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("onboarding");
+        url.searchParams.delete("lens");
+        const clean = url.pathname + (url.search ? `?${url.searchParams.toString()}` : "");
+        window.history.replaceState({}, "", clean);
+      } catch {
+        // ignore
+      }
+    },
+    []
+  );
 
   // Subscribe to the card store so the "collect to gallery" button can
   // reflect per-track generatedImageStatus.
@@ -1783,6 +1877,7 @@ export function Tracker() {
                 lang: langRef.current,
                 spokenLang: spokenLangRef.current,
                 learnLang: learnLangRef.current,
+                mode: track.mode,
                 turnId: tapTag.replace(/^#/, "").slice(0, 16),
               }),
               signal: speakCtrl.signal,
@@ -1893,7 +1988,8 @@ export function Tracker() {
               langRef.current,
               tapTag,
               spokenLangRef.current,
-              learnLangRef.current
+              learnLangRef.current,
+              track.mode
             ),
             new Promise<never>((_, reject) =>
               setTimeout(
@@ -1961,6 +2057,7 @@ export function Tracker() {
             imageDataUrl: cropDataUrl,
             spokenLang: spokenLangRef.current,
             learnLang: learnLangRef.current,
+            mode: track.mode,
           };
           addSessionCard(newCard);
           // Seed the card's persisted history with the opening line so
@@ -2675,6 +2772,7 @@ export function Tracker() {
         formData.append("lang", langRef.current);
         formData.append("spokenLang", spokenLangRef.current);
         formData.append("learnLang", learnLangRef.current);
+        formData.append("mode", track.mode);
         if (track.voiceId) formData.append("voiceId", track.voiceId);
         // Rich visual notes hydrated in the background by describeObject.
         // This is what lets converseWithObject stay text-only on the hot
@@ -2882,10 +2980,19 @@ export function Tracker() {
       if (card.generatedImageStatus === "pending") return;
       if (card.generatedImageStatus === "done") return;
       setCardImageStatus(card.id, "pending");
+
+      // Server budget is 35s; give the client 45s to cover transport +
+      // cold-start + backoff before we stop waiting and mark the card
+      // failed. Without this ceiling a stalled provider could leave the
+      // card in "pending" forever (shimmer, no retry).
+      const ac = new AbortController();
+      const timeoutMs = 45_000;
+      const timer = setTimeout(() => ac.abort(), timeoutMs);
       try {
         const resp = await fetch("/api/runware/generate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: ac.signal,
           body: JSON.stringify({
             cardId: card.id,
             className: card.className,
@@ -2908,12 +3015,22 @@ export function Tracker() {
         const { imageUrl, prompt } = (await resp.json()) as {
           imageUrl: string;
           prompt: string;
+          promptSource?: "vlm" | "heuristic";
         };
         setCardGeneratedImage(card.id, imageUrl, prompt);
       } catch (e) {
+        const aborted =
+          (e instanceof Error && e.name === "AbortError") ||
+          (e as { name?: string } | null)?.name === "AbortError";
         setCardImageStatus(card.id, "failed", {
-          error: e instanceof Error ? e.message : String(e),
+          error: aborted
+            ? "timed out"
+            : e instanceof Error
+              ? e.message
+              : String(e),
         });
+      } finally {
+        clearTimeout(timer);
       }
     },
     [sessionCards, showRejection]
@@ -3809,6 +3926,7 @@ export function Tracker() {
         maskDataUrl: null,
         maskSrcBox: null,
         maskAnchor: null,
+        mode: modeRef.current,
       };
 
       // A new peer changes who the prepared turn would have addressed —
@@ -4583,7 +4701,7 @@ export function Tracker() {
         <div className="pointer-events-none flex items-center gap-2 rounded-full bg-white/15 px-3.5 py-1.5 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] ring-1 ring-white/25 backdrop-blur-xl">
           <span className="h-1.5 w-1.5 rounded-full bg-[#ff89be] shadow-[0_0_0_3px_rgba(255,137,190,0.28)]" />
           <span className="serif-italic text-[17px] font-medium leading-none text-white/95">
-            mirror
+            omni
           </span>
         </div>
         <div className="flex items-center gap-2">
@@ -4600,10 +4718,104 @@ export function Tracker() {
               {statusText}
             </span>
           </div>
-          {/* Learn-language toggle — 中 / EN. spokenLang is locked to zh;
-              this switches the target language the object introduces itself
-              and replies in, which also gates teach mode. Only affects
-              calls started AFTER the flip; in-flight TTS keeps playing. */}
+          {/* Lens pill — Play / Language / History. Switches the soul of
+              the camera: the prompt fed to each new tap. Already-locked
+              tracks keep the mode they were locked in (snapshotted onto
+              TrackRefs.mode), so changing this mid-session only affects
+              the next object you tap. */}
+          <div
+            role="group"
+            aria-label="lens"
+            className="flex items-center gap-1 rounded-full bg-white/15 p-0.5 pl-2 ring-1 ring-white/25 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] backdrop-blur-xl"
+          >
+            <span
+              aria-hidden
+              className="select-none text-[9px] font-semibold uppercase tracking-[0.15em] text-white/55"
+            >
+              lens
+            </span>
+            {(
+              [
+                ["play", "play", "✿"],
+                ["language", "lang", "✦"],
+                ["history", "past", "♡"],
+              ] as const
+            ).map(([value, label, glyph]) => (
+              <button
+                key={value}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setMode(value);
+                }}
+                aria-pressed={mode === value}
+                className={
+                  "grid h-6 min-w-[44px] place-items-center gap-1 rounded-full px-2 text-[10.5px] font-semibold tracking-wide transition " +
+                  (mode === value
+                    ? "bg-white/85 text-[#c23a7a] shadow-sm"
+                    : "text-white/80 hover:text-white")
+                }
+                title={`${value} lens`}
+              >
+                <span aria-hidden className="text-[11px] leading-none">
+                  {glyph}
+                </span>
+                <span className="leading-none">{label}</span>
+              </button>
+            ))}
+          </div>
+          {/* Spoken-language toggle — 中 / EN. Sets the user's native
+              tongue; paired with `learn` so the user can see both at once.
+              STT routing reads `spokenLang`, so flipping this re-routes
+              the mic to the selected locale on the next utterance. */}
+          <div
+            role="group"
+            aria-label="spoken language"
+            className="flex items-center gap-1 rounded-full bg-white/15 p-0.5 pl-2 ring-1 ring-white/25 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.6)] backdrop-blur-xl"
+          >
+            <span
+              aria-hidden
+              className="select-none text-[9px] font-semibold uppercase tracking-[0.15em] text-white/55"
+            >
+              speak
+            </span>
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                setSpokenLang("zh");
+              }}
+              aria-pressed={spokenLang === "zh"}
+              className={
+                "grid h-6 min-w-[28px] place-items-center rounded-full px-2 text-[11px] font-semibold transition " +
+                (spokenLang === "zh"
+                  ? "bg-white/80 text-[#c23a7a] shadow-sm"
+                  : "text-white/80 hover:text-white")
+              }
+            >
+              中
+            </button>
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                setSpokenLang("en");
+              }}
+              aria-pressed={spokenLang === "en"}
+              className={
+                "grid h-6 min-w-[28px] place-items-center rounded-full px-2 text-[10.5px] font-semibold tracking-wide transition " +
+                (spokenLang === "en"
+                  ? "bg-white/80 text-[#c23a7a] shadow-sm"
+                  : "text-white/80 hover:text-white")
+              }
+            >
+              EN
+            </button>
+          </div>
+          {/* Learn-language toggle — 中 / EN. Switches the target
+              language the object introduces itself and replies in, which
+              also gates teach mode. Only affects calls started AFTER the
+              flip; in-flight TTS keeps playing. */}
           <div
             role="group"
             aria-label="learn language"
@@ -4652,22 +4864,11 @@ export function Tracker() {
             href="/gallery"
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
-            className="grid h-7 w-auto place-items-center rounded-full bg-white/15 px-2.5 text-[10.5px] font-semibold uppercase tracking-wider text-white/90 ring-1 ring-white/25 backdrop-blur-xl transition hover:bg-white/25"
+            className="btn-frost h-7 px-3 text-[10.5px] font-semibold uppercase tracking-wider"
             aria-label="open gallery"
           >
             gallery
           </Link>
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation();
-              setDiagOpen((o) => !o);
-            }}
-            className="grid h-7 w-7 place-items-center rounded-full bg-white/15 text-[11px] font-semibold text-white/90 ring-1 ring-white/25 backdrop-blur-xl transition hover:bg-white/25"
-            aria-label="toggle diagnostics"
-          >
-            i
-          </button>
           {tracksUI.length >= 2 && (
             <button
               onPointerDown={(e) => e.stopPropagation()}
@@ -4682,10 +4883,8 @@ export function Tracker() {
                   : "group chat off — let them riff"
               }
               className={
-                "flex h-7 items-center gap-1.5 rounded-full px-2.5 text-[11px] font-semibold backdrop-blur-xl transition " +
-                (groupChatEnabled
-                  ? "bg-gradient-to-r from-fuchsia-300 to-pink-300 text-[#7a1a4a] ring-1 ring-white/60 shadow-[0_8px_22px_-10px_rgba(236,72,153,0.7)]"
-                  : "bg-white/15 text-white/95 ring-1 ring-white/25 hover:bg-white/25")
+                "h-7 px-3 text-[11px] font-semibold " +
+                (groupChatEnabled ? "btn-frost-accent" : "btn-frost")
               }
             >
               <span aria-hidden>{groupChatEnabled ? "\u25CF" : "\u25B6"}</span>
@@ -4712,12 +4911,12 @@ export function Tracker() {
                   : `add another (${tracksUI.length}/${MAX_FACES})`
               }
               className={
-                "flex h-7 items-center gap-1.5 rounded-full px-2.5 text-[11px] font-semibold backdrop-blur-xl transition " +
+                "h-7 px-3 text-[11px] font-semibold " +
                 (tracksUI.length >= MAX_FACES
-                  ? "cursor-not-allowed bg-white/10 text-white/45 ring-1 ring-white/15"
+                  ? "btn-frost cursor-not-allowed opacity-50"
                   : addHintActive
-                    ? "bg-gradient-to-r from-pink-300 to-rose-300 text-[#7a1a4a] ring-1 ring-white/60 shadow-[0_8px_22px_-10px_rgba(236,72,153,0.7)]"
-                    : "bg-white/15 text-white/95 ring-1 ring-white/25 hover:bg-white/25")
+                    ? "btn-frost-accent"
+                    : "btn-frost")
               }
             >
               <svg
@@ -4743,7 +4942,7 @@ export function Tracker() {
                 e.stopPropagation();
                 clearAllTracks();
               }}
-              className="grid h-7 w-7 place-items-center rounded-full bg-white/15 text-white/90 ring-1 ring-white/25 backdrop-blur-xl transition hover:bg-rose-500/40 hover:ring-rose-200/50"
+              className="btn-frost btn-frost-danger h-7 w-7"
               aria-label="clear all faces"
               title="clear all (Esc)"
             >
@@ -5337,6 +5536,16 @@ export function Tracker() {
           </button>
         </div>
       </div>
+
+      {/* Lens onboarding overlay — mounts above the camera feed on
+          first-ever visit or when the landing sent us back in with
+          `?onboarding=1`. Self-unmounts after its own fade-out finishes. */}
+      {showLensOnboarding && (
+        <OnboardingOverlay
+          initialLens={overlayLens}
+          onFinished={handleOnboardingFinished}
+        />
+      )}
     </div>
   );
 }

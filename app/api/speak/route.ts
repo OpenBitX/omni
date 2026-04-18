@@ -17,7 +17,7 @@
 // saving the full client-side RTT.
 
 import { NextResponse } from "next/server";
-import { generateLine, type ChatTurn, type Lang } from "@/app/actions";
+import { generateLine, type AppMode, type ChatTurn, type Lang } from "@/app/actions";
 import { streamTts } from "@/lib/tts";
 
 export const runtime = "nodejs";
@@ -33,8 +33,14 @@ type SpeakBody = {
   // when absent, fall back to `lang`.
   spokenLang?: unknown;
   learnLang?: unknown;
+  // Lens (play / language / history). Defaults to "play" when absent.
+  mode?: unknown;
   turnId?: unknown;
 };
+
+function normalizeModeField(raw: unknown): AppMode {
+  return raw === "language" || raw === "history" ? raw : "play";
+}
 
 function normalizeLangField(raw: unknown, fallback: Lang): Lang {
   if (raw === "zh") return "zh";
@@ -94,6 +100,7 @@ export async function POST(req: Request) {
     : spokenLangProvided
       ? (spokenLang === "zh" ? "en" : "zh")
       : lang;
+  const mode = normalizeModeField(payload.mode);
   const turnId =
     typeof payload.turnId === "string"
       ? payload.turnId.trim().slice(0, 16) || "?"
@@ -117,7 +124,8 @@ export async function POST(req: Request) {
       lang,
       turnId,
       spokenLang,
-      learnLang
+      learnLang,
+      mode
     );
     line = result.line;
     chosenVoiceId = result.voiceId;

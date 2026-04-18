@@ -1,10 +1,50 @@
 import Link from "next/link";
 
 export const metadata = {
-  title: "万物拟人局 · Omni-Personal",
+  title: "Omni-Personal · Give everything a soul",
   description:
-    "Tap anything in frame. It grows a face, reads the room, and roasts you in 14 words or less.",
+    "Everything has a voice — choose what it teaches you. Tap anything in frame and it talks back in Play, Language, or History mode.",
 };
+
+type Lens = {
+  kicker: string;
+  title: string;
+  copy: string;
+  emoji: string;
+  tint: string;
+  rotate: string;
+  href: string;
+};
+
+const LENSES: Lens[] = [
+  {
+    kicker: "play",
+    title: "the cheeky one",
+    copy: "your boba, your trash can, your running shoes — all of them with a mouth and an opinion.",
+    emoji: "✿",
+    tint: "from-[#ffe4f2] to-[#ffd9bd]",
+    rotate: "-rotate-[1.5deg]",
+    href: "/?onboarding=1&lens=play",
+  },
+  {
+    kicker: "language",
+    title: "the private tutor",
+    copy: "your desk plant teaches you mandarin. the mug drills your french. fluency, one tap at a time.",
+    emoji: "✦",
+    tint: "from-[#cfd9ff] to-[#e4d1ff]",
+    rotate: "rotate-[1.5deg]",
+    href: "/?onboarding=1&lens=language",
+  },
+  {
+    kicker: "history",
+    title: "the quiet historian",
+    copy: "the park bench tells you who sat here a century ago. the lamp remembers the war.",
+    emoji: "♡",
+    tint: "from-[#ffe8a8] to-[#ffc9df]",
+    rotate: "-rotate-[1deg]",
+    href: "/?onboarding=1&lens=history",
+  },
+];
 
 type Cast = {
   emoji: string;
@@ -19,80 +59,72 @@ const CAST: Cast[] = [
   {
     emoji: "🧋",
     name: "boba cup",
-    state: "last pearls · straw chewed flat",
+    state: "play · last pearls",
     line: "keep sipping. go on. drain me dry.",
     tint: "from-[#ffe4f2] to-[#ffd9bd]",
     rotate: "-rotate-[2deg]",
   },
   {
-    emoji: "⌨️",
-    name: "keyboard",
-    state: "still on the desk",
-    line: "ease up — you're starting a forest fire. go smack your boss instead.",
-    tint: "from-[#cfd9ff] to-[#e4d1ff]",
+    emoji: "🪴",
+    name: "desk plant",
+    state: "language · mandarin · a1",
+    line: "我叫小绿。你呢？ — my name is xiao lü. yours?",
+    tint: "from-[#d9f5e4] to-[#cfe4ff]",
     rotate: "rotate-[1.5deg]",
   },
   {
-    emoji: "🗑️",
-    name: "trash can",
-    state: "in the corner, quietly seething",
-    line: "you throw out garbage. i digest the wreckage of human desire.",
-    tint: "from-[#e4d1ff] to-[#ffd1e8]",
+    emoji: "🪑",
+    name: "park bench",
+    state: "history · 1924",
+    line: "before you, a tram clerk ate lunch here every tuesday for thirty years.",
+    tint: "from-[#ffe8a8] to-[#ffc9df]",
     rotate: "-rotate-[1deg]",
   },
   {
     emoji: "👟",
     name: "running shoes",
-    state: "dusty · unmoved in weeks",
-    line: "r.i.p. 0 km. cause of death: your laziness. list me on ebay already.",
-    tint: "from-[#ffe8a8] to-[#ffc9df]",
+    state: "play · dusty",
+    line: "r.i.p. 0 km. cause of death: your laziness.",
+    tint: "from-[#e4d1ff] to-[#ffd1e8]",
     rotate: "rotate-[2deg]",
-  },
-  {
-    emoji: "🪑",
-    name: "chair",
-    state: "buried under three hoodies",
-    line: "i am a CHAIR, not your long-haired wardrobe.",
-    tint: "from-[#d9f5e4] to-[#cfe4ff]",
-    rotate: "-rotate-[2deg]",
-  },
-  {
-    emoji: "📱",
-    name: "phone",
-    state: "face-up on the desk",
-    line: "admit it — i'm the love of your life ♥",
-    tint: "from-[#ffd1e8] to-[#e5d4ff]",
-    rotate: "rotate-[1deg]",
   },
   {
     emoji: "📘",
     name: "calculus book",
-    state: "open. pen untouched.",
-    line: "stop staring. you don't get it. schrödinger's cat does calc better than you.",
+    state: "language · french",
+    line: "dérivée. repeat after me — déri·vée. un peu plus lent, oui?",
     tint: "from-[#cfe4ff] to-[#ffe4f2]",
     rotate: "-rotate-[1.5deg]",
+  },
+  {
+    emoji: "🏛️",
+    name: "museum column",
+    state: "history · doric",
+    line: "i am older than every idea in your pocket. and yet — here we both are.",
+    tint: "from-[#ffd1e8] to-[#e5d4ff]",
+    rotate: "rotate-[1deg]",
   },
 ];
 
 const PERSONAS = [
   {
-    kicker: "gen-z creators",
-    title: "for the chronically online",
-    copy: "you film everything. here's a camera that films back.",
+    kicker: "curious travellers",
+    title: "every street, a museum",
+    copy: "walk a new city. let the statues, menus, and trams tell you what they know.",
     emoji: "✿",
     tint: "from-[#ffe4f2] to-[#ffd9bd]",
   },
   {
-    kicker: "office survivors",
-    title: "for the 5pm meltdown",
-    copy: "ten seconds of stapler slander. instant serotonin.",
+    kicker: "language learners",
+    title: "immersion on your desk",
+    copy: "no app, no flashcards. your mug drills vocabulary. your plant holds conversations.",
     emoji: "✦",
     tint: "from-[#cfd9ff] to-[#e4d1ff]",
   },
   {
-    kicker: "finals-week students",
-    title: "for the dorm-group chat",
-    copy: "let the textbook drag you. it's funnier than crying.",
+    kicker: "chronically online",
+    title: "a camera that films back",
+    copy: "ten seconds of stapler slander. instant serotonin. your group chat will not recover.",
     emoji: "♡",
     tint: "from-[#ffe8a8] to-[#ffc9df]",
   },
@@ -101,7 +133,7 @@ const PERSONAS = [
 export default function LandingPage() {
   return (
     <main className="relative min-h-[100svh] overflow-hidden">
-      {/* Ambient blobs — same recipe as /mirror */}
+      {/* Ambient blobs */}
       <div
         className="blob"
         style={{
@@ -155,44 +187,41 @@ export default function LandingPage() {
               omni-personal
             </span>
             <span className="hidden text-[12px] font-medium tracking-[0.22em] text-[color:var(--ink-muted)] sm:inline">
-              · 万物拟人局
+              · 万物皆有声
             </span>
           </div>
           <div className="flex items-center gap-2 rounded-full bg-white/70 px-3 py-1.5 shadow-[0_2px_10px_-4px_rgba(42,21,64,0.15)] ring-1 ring-white/80 backdrop-blur-md">
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
             <span className="text-[11px] font-medium tracking-wide text-[color:var(--ink-soft)]">
-              beta ✿ roast-grade
+              beta ✿ three lenses
             </span>
           </div>
         </header>
 
         {/* Hero */}
-        <section className="px-6 pb-8 pt-10 text-center sm:px-8 sm:pb-12 sm:pt-14">
-          <span className="mb-6 inline-flex items-center gap-2 rounded-full bg-white/75 px-3.5 py-1.5 text-[10.5px] font-medium uppercase tracking-[0.28em] text-[color:var(--ink-muted)] shadow-[0_2px_10px_-4px_rgba(42,21,64,0.15)] ring-1 ring-white/80 backdrop-blur-md">
-            <span className="inline-block h-1 w-1 rounded-full bg-[color:var(--accent)]" />
-            tap anything. it talks back.
-          </span>
-
-          <h1 className="serif-italic mx-auto max-w-[900px] text-balance text-[48px] font-semibold leading-[0.95] tracking-[-0.02em] text-[color:var(--ink)] sm:text-[88px]">
-            every object
-            <br />
-            has{" "}
+        <section className="px-6 pb-6 pt-10 text-center sm:px-8 sm:pb-10 sm:pt-14">
+          <h1 className="serif-italic mx-auto max-w-[900px] text-balance text-[52px] font-semibold leading-[0.95] tracking-[-0.02em] text-[color:var(--ink)] sm:text-[96px]">
+            give everything
+            <br />a{" "}
             <span className="relative inline-block">
-              opinions
+              soul
               <span className="absolute -right-6 -top-2 inline-block animate-[wiggle_2.2s_ease-in-out_infinite] text-[28px] text-[color:var(--accent)] sm:-right-9 sm:text-[44px]">
                 ✿
               </span>
             </span>
           </h1>
 
-          <p className="mx-auto mt-6 max-w-[560px] text-balance text-[16px] leading-[1.55] text-[color:var(--ink-soft)] sm:text-[18px]">
-            point your camera at anything — your boba, your trash can, that
-            textbook you haven't opened. it grows a face, reads the room, and
-            roasts you out loud in 14 words or less.
+          <p className="mx-auto mt-6 max-w-[620px] text-balance text-[16px] leading-[1.55] text-[color:var(--ink-soft)] sm:text-[19px]">
+            everything has a voice —{" "}
+            <span className="serif-italic text-[color:var(--ink)]">
+              choose what it teaches you.
+            </span>{" "}
+            point your camera at the world; decide whether it plays with you,
+            tutors you, or tells you who lived here before.
           </p>
 
-          {/* Cute CTA with halo */}
-          <div className="relative mx-auto mt-11 inline-flex">
+          {/* CTA */}
+          <div className="relative mx-auto mt-9 inline-flex">
             <div
               aria-hidden
               className="absolute -inset-8 rounded-[48px] opacity-70 blur-2xl"
@@ -203,22 +232,22 @@ export default function LandingPage() {
             />
             <div className="relative flex flex-col items-center gap-3 sm:flex-row">
               <Link
-                href="/"
-                className="bubble-btn rounded-full bg-gradient-to-br from-[#ff89be] via-[#ec4899] to-[#c026d3] px-8 py-4 text-[15px] font-semibold tracking-wide text-white shadow-[0_18px_40px_-16px_rgba(236,72,153,0.55)] transition hover:scale-[1.04] active:scale-95"
+                href="/?onboarding=1"
+                className="btn-primary px-8 py-4 text-[15px] font-semibold tracking-wide"
               >
-                open camera →
+                begin →
               </Link>
               <Link
-                href="/mirror"
-                className="rounded-full bg-white/85 px-7 py-4 text-[14px] font-semibold tracking-wide text-[color:var(--ink)] shadow-[0_10px_28px_-14px_rgba(42,21,64,0.25)] ring-1 ring-white/90 backdrop-blur-md transition hover:bg-white hover:scale-[1.04] active:scale-95"
+                href="/?lens=play"
+                className="btn-ghost px-7 py-4 text-[14px] font-semibold tracking-wide"
               >
-                upload a photo ♡
+                skip, just play ♡
               </Link>
             </div>
           </div>
 
-          {/* tiny sparkle row */}
-          <div className="mt-10 flex items-center justify-center gap-5 text-[color:var(--ink-muted)]">
+          {/* sparkles */}
+          <div className="mt-8 flex items-center justify-center gap-5 text-[color:var(--ink-muted)]">
             <span className="text-[22px] animate-[blob-float_14s_ease-in-out_infinite]">
               ✿
             </span>
@@ -237,7 +266,64 @@ export default function LandingPage() {
           </div>
         </section>
 
-        {/* The cast — object gallery */}
+        {/* Three lenses — the core packaging */}
+        <section className="px-6 pb-10 sm:px-8">
+          <div className="mb-5 flex items-end justify-between">
+            <div className="flex flex-col gap-0.5">
+              <span className="text-[10.5px] font-medium uppercase tracking-[0.28em] text-[color:var(--ink-muted)]">
+                three lenses
+              </span>
+              <span className="serif-italic text-[22px] font-medium leading-none text-[color:var(--ink)] sm:text-[26px]">
+                choose what the world teaches you
+              </span>
+            </div>
+            <span className="hidden text-[11px] font-medium tracking-[0.22em] text-[color:var(--ink-muted)] sm:inline">
+              same camera · different soul
+            </span>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-3">
+            {LENSES.map((l) => (
+              <Link
+                key={l.kicker}
+                href={l.href}
+                className={`group relative overflow-hidden rounded-[28px] bg-white/75 p-6 shadow-[0_18px_36px_-22px_rgba(42,21,64,0.28)] ring-1 ring-white/80 backdrop-blur-md transition hover:-translate-y-1 hover:bg-white ${l.rotate} hover:rotate-0`}
+              >
+                <div
+                  aria-hidden
+                  className={`absolute -right-12 -top-12 h-36 w-36 rounded-full bg-gradient-to-br ${l.tint} opacity-80 blur-2xl transition group-hover:scale-110`}
+                />
+                <div className="relative flex items-center justify-between">
+                  <span className="text-[10.5px] font-medium uppercase tracking-[0.28em] text-[color:var(--ink-muted)]">
+                    {l.kicker}
+                  </span>
+                  <span className="text-[22px] text-[color:var(--accent)] transition-transform group-hover:rotate-12">
+                    {l.emoji}
+                  </span>
+                </div>
+                <h3 className="serif-italic relative mt-3 text-[26px] font-medium leading-tight text-[color:var(--ink)]">
+                  {l.title}
+                </h3>
+                <p className="relative mt-2 text-[13.5px] leading-[1.5] text-[color:var(--ink-soft)]">
+                  {l.copy}
+                </p>
+                <div className="relative mt-5 flex items-center gap-2 text-[color:var(--accent-deep)]">
+                  <span className="text-[11.5px] font-semibold uppercase tracking-[0.18em]">
+                    try this lens
+                  </span>
+                  <span
+                    aria-hidden
+                    className="transition-transform group-hover:translate-x-1"
+                  >
+                    →
+                  </span>
+                </div>
+              </Link>
+            ))}
+          </div>
+        </section>
+
+        {/* The cast — object gallery across all three lenses */}
         <section className="px-6 pb-10 sm:px-8">
           <div className="mb-5 flex items-end justify-between">
             <div className="flex flex-col gap-0.5">
@@ -245,11 +331,11 @@ export default function LandingPage() {
                 the cast
               </span>
               <span className="serif-italic text-[22px] font-medium leading-none text-[color:var(--ink)] sm:text-[26px]">
-                things that have been through it
+                a few things, each with something to say
               </span>
             </div>
             <span className="hidden text-[11px] font-medium tracking-[0.22em] text-[color:var(--ink-muted)] sm:inline">
-              tap, state, roast — &lt;500ms
+              tap · lock · listen — &lt;500ms
             </span>
           </div>
 
@@ -272,7 +358,7 @@ export default function LandingPage() {
                   </span>
                 </div>
                 <p className="relative mt-4 text-[11px] font-medium uppercase tracking-[0.22em] text-[color:var(--ink-muted)]">
-                  state · {c.state}
+                  {c.state}
                 </p>
                 <p className="serif-italic relative mt-2 text-balance text-[19px] leading-[1.25] text-[color:var(--ink)] sm:text-[20px]">
                   &ldquo;{c.line}&rdquo;
@@ -280,7 +366,7 @@ export default function LandingPage() {
                 <div className="relative mt-4 flex items-center gap-2">
                   <span className="inline-block h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]" />
                   <span className="text-[11px] font-medium tracking-wide text-[color:var(--ink-soft)]">
-                    voiced. bubble-synced. a little mean.
+                    voiced. bubble-synced. remembers you.
                   </span>
                 </div>
               </article>
@@ -288,7 +374,7 @@ export default function LandingPage() {
 
             {/* "your turn" card */}
             <Link
-              href="/"
+              href="/?onboarding=1"
               className="group relative grid min-h-[220px] place-items-center overflow-hidden rounded-[28px] bg-gradient-to-br from-[#ff89be] via-[#ec4899] to-[#c026d3] p-6 text-center text-white shadow-[0_24px_46px_-20px_rgba(236,72,153,0.55)] transition hover:-translate-y-1 hover:scale-[1.01]"
             >
               <div
@@ -304,17 +390,19 @@ export default function LandingPage() {
                   ✿
                 </span>
                 <span className="serif-italic text-[24px] font-semibold leading-tight">
-                  your desk next?
+                  what speaks
+                  <br />
+                  to you next?
                 </span>
                 <span className="text-[12px] font-medium uppercase tracking-[0.24em] opacity-90">
-                  open camera →
+                  pick a lens →
                 </span>
               </div>
             </Link>
           </div>
         </section>
 
-        {/* Personas */}
+        {/* Built for */}
         <section className="px-6 pb-10 sm:px-8">
           <div className="mb-5 flex items-end justify-between">
             <div className="flex flex-col gap-0.5">
@@ -322,7 +410,7 @@ export default function LandingPage() {
                 built for
               </span>
               <span className="serif-italic text-[22px] font-medium leading-none text-[color:var(--ink)] sm:text-[26px]">
-                anyone one roast from the edge
+                everyone one tap from a conversation
               </span>
             </div>
           </div>
@@ -356,25 +444,25 @@ export default function LandingPage() {
           </div>
         </section>
 
-        {/* How it feels / soft tech */}
+        {/* How it works */}
         <section className="px-6 pb-10 sm:px-8">
           <div className="rounded-[32px] bg-white/70 p-6 shadow-[0_18px_36px_-22px_rgba(42,21,64,0.22)] ring-1 ring-white/80 backdrop-blur-md sm:p-8">
             <div className="grid gap-6 sm:grid-cols-3">
               {[
                 {
-                  k: "one · tap",
+                  k: "one · choose",
+                  t: "pick your lens",
+                  c: "play, language, or history. a 10-second onboarding tunes the world to you. switch lenses any time.",
+                },
+                {
+                  k: "two · tap",
                   t: "one tap, one lock",
-                  c: "1–4 smart candidates light up on screen. tap the one you want. it locks in under half a second.",
+                  c: "point the camera, tap the thing. a face locks on in under half a second. it sees what you see.",
                 },
                 {
-                  k: "two · see",
-                  t: "reads the room",
-                  c: "vision model clocks the object and its current state — empty cup, dusty shoe, battered keyboard.",
-                },
-                {
-                  k: "three · speak",
-                  t: "voice + bubble, perfectly synced",
-                  c: "a stuck-on face delivers the line, bubble text crawls frame-for-frame with the audio. no lip-flap limbo.",
+                  k: "three · listen",
+                  t: "it speaks. you reply.",
+                  c: "voice streams live, bubble text crawls in sync. hold the mic, talk back, keep the thread going.",
                 },
               ].map((s) => (
                 <div key={s.k} className="flex flex-col gap-2">
@@ -397,20 +485,20 @@ export default function LandingPage() {
         <footer className="px-6 pb-[max(env(safe-area-inset-bottom),28px)] pt-2 sm:px-8">
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-full bg-white/70 px-5 py-2.5 shadow-[0_2px_10px_-4px_rgba(42,21,64,0.15)] ring-1 ring-white/80 backdrop-blur-md">
             <span className="serif-italic text-[13px] text-[color:var(--ink-soft)]">
-              万物拟人局 · a little camera with a big mouth
+              万物皆有声 · everything has a voice
             </span>
             <div className="flex items-center gap-2">
               <Link
-                href="/mirror"
-                className="rounded-full bg-white/70 px-3.5 py-1.5 text-[11.5px] font-medium text-[color:var(--ink-soft)] ring-1 ring-white/80 transition hover:bg-white hover:text-[color:var(--ink)] active:scale-95"
+                href="/gallery"
+                className="btn-ghost px-3.5 py-1.5 text-[11.5px] font-medium"
               >
-                mirror
+                gallery
               </Link>
               <Link
-                href="/"
-                className="rounded-full bg-gradient-to-br from-[#ff89be] via-[#ec4899] to-[#c026d3] px-4 py-1.5 text-[12px] font-semibold text-white transition hover:scale-[1.04] active:scale-95"
+                href="/?onboarding=1"
+                className="btn-primary px-4 py-1.5 text-[12px] font-semibold"
               >
-                open camera
+                begin
               </Link>
             </div>
           </div>

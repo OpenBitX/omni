@@ -41,8 +41,16 @@ const MAX_IMAGE_DATA_URL_BYTES = 3_000_000;
 
 // Art-style opener we expect every prompt to start with. If the VLM
 // forgets it (it sometimes does), we prepend it so Runware stays on-brand.
+// Gallery page composites these onto a wooden bookshelf via mix-blend-mode:
+// multiply, so solid pure-white backgrounds disappear into the wood tone.
 const STYLE_OPENER =
   "bold comic-book illustration, thick black outlines, flat cel-shading, retro manga × kawaii energy, vivid pastel palette.";
+
+// Tail appended to every prompt — forces the die-cut silhouette so the
+// composited thumbnail reads as a sticker sitting on the shelf, not a
+// framed painting.
+const DIE_CUT_TAIL =
+  "full character portrait, die-cut sticker, centered, isolated on solid pure white (#ffffff) background, no ground, no shadow, no scenery, clean product-shot lighting. No text, no speech bubbles, no watermarks.";
 
 // --- Prompt construction --------------------------------------------------
 
@@ -90,12 +98,11 @@ export function buildComicPrompt(input: RunwareGenerateInput): string {
   const scene = summarizeHistory(input.history ?? []);
 
   return [
-    "bold comic-book illustration, thick black outlines, flat cel-shading,",
-    "retro manga x kawaii energy, vivid pastel palette.",
+    STYLE_OPENER,
     `Center subject: ${className}, ${description}.`,
     `Scene context: ${scene}`,
-    "Subject fills the frame, expressive, alive, centered composition.",
-    "No text, no speech bubbles, no watermarks.",
+    "Anthropomorphized — give it a face, eyes, mouth, expressive posture.",
+    DIE_CUT_TAIL,
   ].join(" ");
 }
 
@@ -110,15 +117,15 @@ const VLM_PROMPT_MODEL =
   process.env.RUNWARE_PROMPT_MODEL?.trim() || "gpt-4o-mini";
 const VLM_PROMPT_TIMEOUT_MS = 12_000;
 
-const VLM_PROMPT_SYSTEM = `You are a comic-book art director. You will see a cropped photo of a real physical object and a short persona card about it. You write ONE image prompt for a text-to-image model that will produce a fun, specific cartoon portrait of THIS object — not a generic one.
+const VLM_PROMPT_SYSTEM = `You are a comic-book art director. You will see a cropped photo of a real physical object and a short persona card about it. You write ONE image prompt for a text-to-image model that will produce a fun, specific cartoon portrait of THIS object — not a generic one. The result will be composited onto a wooden bookshelf as a die-cut sticker, so the background MUST be solid pure white.
 
 Rules:
-- 55–85 words. One paragraph. No line breaks.
+- 55–90 words. One paragraph. No line breaks.
 - Start with the art style: "bold comic-book illustration, thick black outlines, flat cel-shading, retro manga × kawaii energy, vivid pastel palette."
 - Then describe the subject. Lock in 2–3 hyper-specific visual details you can actually see in the photo (a chip, a smudge, a sticker, a worn edge, a color, a reflection). These details are what make the image feel like a portrait of THIS object instead of a stock cartoon.
 - Give the object a face + posture + mood that matches the persona card and the conversation topic. Anthropomorphize: give it eyes, mouth, little arms if it fits.
-- Centered composition, subject fills the frame, expressive, alive.
-- End with: "no text, no speech bubbles, no watermarks."
+- Centered composition, full figure, subject fills the frame, expressive, alive.
+- End with EXACTLY: "full character portrait, die-cut sticker, centered, isolated on solid pure white (#ffffff) background, no ground, no shadow, no scenery, clean product-shot lighting. No text, no speech bubbles, no watermarks."
 - Do NOT include real brand names or logos. Paraphrase ("sleek black phone" not "iPhone 15 Pro").
 - Return JSON: {"prompt": "..."}.`;
 
@@ -156,16 +163,21 @@ function getOpenAI(): OpenAI | null {
 }
 
 // Ensure the crafted prompt still starts with the brand art-style opener
-// and ends with the safety clause. VLMs sometimes drop one or the other
-// when they get creative.
+// and ends with the die-cut / safety clause. VLMs sometimes drop one or
+// the other when they get creative.
 function normalizeCraftedPrompt(raw: string): string {
   const compact = raw.replace(/\s+/g, " ").trim();
   const withOpener = /^bold comic-book/i.test(compact)
     ? compact
     : `${STYLE_OPENER} ${compact}`;
-  const withSafety = /no text|no speech bubbles|no watermarks/i.test(withOpener)
+  const withDieCut = /die-cut|isolated on .*white|pure white.*background/i.test(
+    withOpener
+  )
     ? withOpener
-    : `${withOpener} No text, no speech bubbles, no watermarks.`;
+    : `${withOpener} ${DIE_CUT_TAIL}`;
+  const withSafety = /no text|no speech bubbles|no watermarks/i.test(withDieCut)
+    ? withDieCut
+    : `${withDieCut} No text, no speech bubbles, no watermarks.`;
   return withSafety.length > 1400 ? withSafety.slice(0, 1400) : withSafety;
 }
 
@@ -296,7 +308,11 @@ export async function generateComicImage(
       height: 512,
       numberResults: 1,
       outputType: "URL",
-      outputFormat: "JPEG",
+      // PNG so the solid-white background is lossless — the gallery
+      // uses mix-blend-mode: multiply to drop the white into the shelf
+      // wood, and JPEG artefacts around the subject halo badly under
+      // that blend.
+      outputFormat: "PNG",
       checkNSFW: false,
     },
   ];

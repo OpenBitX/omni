@@ -463,11 +463,18 @@ async def sam2_ws(ws: WebSocket) -> None:
                     sess.prev_bbox_xyxy = bbox_xyxy
                     sess.prev_area_px = area
                     sess.bad_frame_streak = 0
+                    # maskArea normalized to frame area (device-independent).
+                    # Client uses this to detect partial occlusion and fade
+                    # the face early — see OCCLUSION_AREA_FRACTION in the
+                    # tracker component. V1 gets the same signal from the
+                    # YOLO-seg mask head; shipping it keeps V2 at parity.
+                    mask_area_frac = area / float(H * W) if (H * W) else 0.0
                     await _send_json(ws, {
                         "type": "initialized",
                         "trackId": sess.track_id,
                         "bbox": list(bbox_cxcywh),
                         "score": round(score, 4),
+                        "maskArea": round(mask_area_frac, 6),
                     })
                     continue
 
@@ -600,10 +607,12 @@ async def sam2_ws(ws: WebSocket) -> None:
                     sess.prev_area_px = area
                     sess.bad_frame_streak = 0
                     sess.frames_tracked += 1
+                    mask_area_frac = area / float(H * W) if (H * W) else 0.0
                     await _send_json(ws, {
                         "type": "track",
                         "bbox": list(bbox_cxcywh),
                         "score": round(score, 4),
+                        "maskArea": round(mask_area_frac, 6),
                     })
                     continue
 

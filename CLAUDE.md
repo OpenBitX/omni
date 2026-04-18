@@ -72,8 +72,6 @@ Lightweight identity tracker: `iou`, `centerDistNorm`, `matchTarget`, `EMAFilter
 ### `components/face-voice.tsx`
 The "talking face" renderer. A looping `<video>` of real eyes (`public/facevoice/eyes.{webm,mp4}`) with a `<img>` mouth (9 PNG shapes `shape-A` … `shape-X` in `public/facevoice/`) swapped per audio frame. `classifyShape(analyser)` is exported and consumed by `tracker.tsx`'s RAF loop. Swap shapes at 30 fps by preloading all 9 PNGs once on mount. `FACE_VOICE_WIDTH` (280) / `FACE_VOICE_HEIGHT` (160) are the native px at scale=1; Tracker's `FACE_NATIVE_PX` must match.
 
-`components/face.tsx` and `lib/lk.ts` are the pre-YOLO generation of the face + a pure-TS Lucas-Kanade tracker. They are **orphaned** (grep shows no imports). Don't wire them back in without asking — the YOLO pipeline supersedes them.
-
 ### `app/actions.ts`
 Four server actions, provider-split by latency profile. No single model does everything — we route by "how much does latency vs quality matter for this specific call":
 
@@ -86,7 +84,7 @@ Four server actions, provider-split by latency profile. No single model does eve
 
 **`VOICE_CATALOG`** is 9 hand-curated Fish.audio `reference_id`s with per-vibe descriptions (EGirl, Elon, Anime Girl, Elephant, Sonic, Mortal Kombat, Peter Griffin, etc.). The bundled first-tap prompt inlines the catalog and asks the model to pick by object-personality match. `DEFAULT_VOICE_ID` is Peter Griffin — explicit fallback so unmatched picks sound intentional. Catalog vibes are tuned to drive selection quality; treat them like prompt text, not free-form labels.
 
-**Provider clients:** GLM via OpenAI-compatible SDK (base URL auto-picked by key shape: `<hex>.<secret>` → `open.bigmodel.cn`, `sk-…` → `api.z.ai`, override via `ZHIPU_BASE_URL`). Cerebras via OpenAI-compatible SDK at `api.cerebras.ai/v1`. OpenAI directly. **Cerebras model name is `llama3.1-8b` — no hyphens inside the version.** Groq's equivalent is `llama-3.1-8b-instant`; model names are NOT portable across providers. If you see "model does not exist" from GLM, run `node scripts/test-glm.mjs` to probe which names are currently served — `glm-4v-flash` was silently deprecated on 2026-04-18 which is why both `GLM_MODEL_DEEP` and `GLM_MODEL_FAST` now default to `glm-5v-turbo`.
+**Provider clients:** GLM via OpenAI-compatible SDK (base URL auto-picked by key shape: `<hex>.<secret>` → `open.bigmodel.cn`, `sk-…` → `api.z.ai`, override via `ZHIPU_BASE_URL`). Cerebras via OpenAI-compatible SDK at `api.cerebras.ai/v1`. OpenAI directly. **Cerebras model name is `llama3.1-8b` — no hyphens inside the version.** Groq's equivalent is `llama-3.1-8b-instant`; model names are NOT portable across providers. If you see "model does not exist" from GLM, run `node scripts/probes/test-glm.mjs` to probe which names are currently served — `glm-4v-flash` was silently deprecated on 2026-04-18 which is why both `GLM_MODEL_DEEP` and `GLM_MODEL_FAST` now default to `glm-5v-turbo`.
 
 **Defensive JSON parsing:** none of the VLMs reliably honor `response_format=json_object`, so `extractJsonObject` strips `<think>` traces, unwraps ```json fences, and slices `{…}` before parsing. Similarly `extractTextLine` cleans single-line returns. Don't remove these — they're load-bearing against model drift.
 
@@ -134,5 +132,5 @@ The Mirror client (`components/mirror.tsx`) uses a **lockstep** WS flow: a new f
   - **TTS**: `FISH_API_KEY` (+ optional `FISH_MODEL`, default `s1`) for primary character voices. Without Fish, `/api/tts/stream` falls through to OpenAI `tts-1/nova`. Without either, the stream route 503s and the client runs caption-only.
 - **Landmarks model is gitignored.** `server/shape_predictor_68_face_landmarks.dat` (~100 MB) is not committed. If a fresh checkout is missing it, download from `http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2` and `bunzip2` into `server/`. Only needed for `/mirror`.
 - **`server/.venv/` is gitignored** and not portable. Recreate with `python3 -m venv server/.venv && server/.venv/bin/pip install opencv-python dlib imutils numpy openai fastapi "uvicorn[standard]" python-multipart websockets python-dotenv`. dlib builds from source on macOS and needs `cmake` from Homebrew.
-- **`scripts/test-*.mjs`/`scripts/inspect-onnx.py`** are ad-hoc probes (Fish/GLM/YOLO/seg/ONNX schema). Not part of any automated test setup.
+- **`scripts/probes/test-*.mjs`/`scripts/probes/inspect-onnx.py`** are ad-hoc probes (Fish/GLM/YOLO/seg/ONNX schema). Not part of any automated test setup.
 - **Bubbly aesthetic is intentional** — keep blob-float, soft-pulse, wiggle-on-hover, sparkle-spin, and the pastel radial background unless the brief changes.
