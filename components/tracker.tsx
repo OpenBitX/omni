@@ -18,6 +18,11 @@ import {
 } from "@/components/face-voice";
 import { SpeechBubble } from "@/components/speech-bubble";
 import {
+  SessionGallery,
+  type CardLiveStatus,
+  type SessionCard,
+} from "@/components/session-gallery";
+import {
   COCO_CLASSES,
   PERSON_CLASS_ID,
   detect,
@@ -975,6 +980,17 @@ export function Tracker() {
     langRef.current = lang;
   }, [lang]);
 
+  // --- Session gallery: one card per first-tap capture. The card pins the
+  // crop + persona + opening line the moment the VLM returns, so the user
+  // can scroll back through everything they pointed at in this session and
+  // speak to any of them again. Cards are session-only (no persistence).
+  const [sessionCards, setSessionCards] = useState<SessionCard[]>([]);
+  // The card whose mic button is currently pressed (press-and-hold visual
+  // state). Separate from `isRecording` because the main mic button and
+  // gallery mic buttons share the underlying recorder but need distinct
+  // "this one is active" highlights.
+  const [activeCardId, setActiveCardId] = useState<string | null>(null);
+
   // --- Push-to-talk state (UI only, decoupled from per-track voice) -----
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
@@ -1365,6 +1381,48 @@ export function Tracker() {
     return unsub;
   }, []);
 
+  // --- Foreground/background recovery ------------------------------------
+  // Mobile Safari suspends AudioContexts when the tab is backgrounded and
+  // pauses the <video> element. Without this, returning to the tab leaves
+  // the camera frozen (so YOLO inferences stall) and the next tap plays
+  // with a silent analyser (so the mouth stays closed). We don't try to
+  // reset track velocity/lastUpdatedAt — EXTRAP_MAX_MS already clamps any
+  // post-resume delta, and tracks naturally reacquire via the matcher.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+      const ctx = audioCtxRef.current;
+      if (ctx && ctx.state === "suspended") {
+        ctx.resume().catch((e) => {
+          // eslint-disable-next-line no-console
+          console.log(
+            "[tracker] audio resume on foreground failed:",
+            e instanceof Error ? e.message : e
+          );
+        });
+      }
+      const v = videoRef.current;
+      if (v && v.srcObject && v.paused) {
+        v.play().catch((e) => {
+          // eslint-disable-next-line no-console
+          console.log(
+            "[tracker] video play on foreground failed:",
+            e instanceof Error ? e.message : e
+          );
+        });
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    // pageshow fires on back/forward cache restore, which visibilitychange
+    // doesn't cover on iOS Safari.
+    window.addEventListener("pageshow", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pageshow", onVisibilityChange);
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1436,6 +1494,10 @@ export function Tracker() {
     }
     tracksRef.current = [];
     setTracksUI([]);
+    // Full-reset also wipes the session gallery — the × button handles
+    // per-card removal; this is the "clean slate" demo hard-reset.
+    setSessionCards([]);
+    setActiveCardId(null);
     // Bump generation so any in-flight tap's generateLine/TTS drops silent.
     generationRef.current++;
     // Invalidate any staged group turn + in-flight prepare; scene is gone.
@@ -1695,7 +1757,13 @@ export function Tracker() {
       turnId?: string,
       onFirstSound?: () => void,
       emotion?: string | null,
-      speed?: string | null
+      speed?: string | null,
+      // Optional pre-opened response body + backend label. When the
+      // caller already has an audio stream in hand (e.g. from the
+      // /api/speak combined endpoint, which folds VLM + TTS into one
+      // response to save a client-side round-trip), we skip the
+      // /api/tts/stream POST here and jump straight to MediaSource.
+      preopened?: { respBody: ReadableStream<Uint8Array>; backend: string }
     ): Promise<void> => {
       const ctx = ensureAudioCtx();
       const track = tracksRef.current.find((t) => t.id === trackId);
@@ -1774,40 +1842,60 @@ export function Tracker() {
       }
       if (callGen !== track.speakGen) return;
 
-      const resp = await fetch("/api/tts/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          voiceId: voiceId ?? "",
-          turnId: tid,
-          lang: langRef.current,
-          // Cartesia experimental_controls — one emotion string in an
-          // array, "normal" speed omitted so the default is picked up.
-          emotion: emotion ? [emotion] : [],
-          speed: speed ?? null,
-        }),
-      });
-      if (callGen !== track.speakGen) {
-        // Retap while we were awaiting headers — drop.
-        try {
-          await resp.body?.cancel();
-        } catch {
-          // ignore
+      let respBody: ReadableStream<Uint8Array>;
+      let backend: string;
+      if (preopened) {
+        // Caller has already fetched the stream (e.g. /api/speak). Reuse it
+        // so we don't fire a redundant /api/tts/stream POST behind the user.
+        respBody = preopened.respBody;
+        backend = preopened.backend;
+        // eslint-disable-next-line no-console
+        console.log(
+          `[tts #${tid}] ◀ reusing preopened stream backend=${backend}`
+        );
+      } else {
+        const resp = await fetch("/api/tts/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text,
+            voiceId: voiceId ?? "",
+            turnId: tid,
+            lang: langRef.current,
+            // Cartesia experimental_controls — one emotion string in an
+            // array, "normal" speed omitted so the default is picked up.
+            emotion: emotion ? [emotion] : [],
+            speed: speed ?? null,
+          }),
+        });
+        if (callGen !== track.speakGen) {
+          // Retap while we were awaiting headers — drop.
+          try {
+            await resp.body?.cancel();
+          } catch {
+            // ignore
+          }
+          return;
         }
-        return;
+        if (!resp.ok || !resp.body) {
+          const err = await resp.text().catch(() => "");
+          throw new Error(`tts stream ${resp.status}: ${err.slice(0, 120)}`);
+        }
+        respBody = resp.body;
+        backend = resp.headers.get("X-Tts-Backend") ?? "stream";
+        // eslint-disable-next-line no-console
+        console.log(
+          `[tts #${tid}] ◀ headers in ${Math.round(performance.now() - t0)}ms backend=${backend}`
+        );
       }
-      if (!resp.ok || !resp.body) {
-        const err = await resp.text().catch(() => "");
-        throw new Error(`tts stream ${resp.status}: ${err.slice(0, 120)}`);
-      }
-      const backend = resp.headers.get("X-Tts-Backend") ?? "stream";
       setLastTtsBackend(
-        backend === "fish" ? "fish" : backend === "openai" ? "openai" : "none"
-      );
-      // eslint-disable-next-line no-console
-      console.log(
-        `[tts #${tid}] ◀ headers in ${Math.round(performance.now() - t0)}ms backend=${backend}`
+        backend === "fish"
+          ? "fish"
+          : backend === "openai"
+            ? "openai"
+            : backend === "cartesia"
+              ? "none"
+              : "none"
       );
 
       const mediaSourceCtor: typeof MediaSource | null =
@@ -1824,7 +1912,7 @@ export function Tracker() {
           trackId,
           turnId: tid,
           callGen,
-          respBody: resp.body,
+          respBody,
           mediaSourceCtor,
           ensureAnalyser,
           scheduleCaptionClear,
@@ -1845,7 +1933,7 @@ export function Tracker() {
         console.log(
           `[tts #${tid}] MediaSource unavailable — buffering full mp3 as fallback`
         );
-        const buf = await resp.arrayBuffer();
+        const buf = await new Response(respBody).arrayBuffer();
         if (callGen !== track.speakGen) return;
         let audioBuf: AudioBuffer;
         try {
@@ -1975,42 +2063,168 @@ export function Tracker() {
       try {
         // eslint-disable-next-line no-console
         console.log(
-          `[speak:${trackId} ${tapTag}] → generateLine  kind=${isRetap ? "retap (text-only)" : "first-tap (bundled VLM)"}  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  voice=${track.voiceId ?? "(picking)"}  persona=${track.description ? "cached" : "(new)"}  history=${track.history.length}  press→speak=${pressToSpeakMs}ms`
+          `[speak:${trackId} ${tapTag}] → ${isRetap ? "generateLine (retap, text-only)" : "/api/speak (bundled VLM + TTS in one response)"}  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  voice=${track.voiceId ?? "(picking)"}  persona=${track.description ? "cached" : "(new)"}  history=${track.history.length}  press→speak=${pressToSpeakMs}ms`
         );
         const t0 = performance.now();
-        // Hard cap on generateLine — a hung vision call must not strand
-        // the UI on "thinking=true" forever. 20s is enough slack for the
-        // slowest bundled first-tap; retap paths return in <1s.
+        // Hard cap on the whole line-generation step — a hung vision call
+        // must not strand the UI on "thinking=true" forever.
         const GENERATE_LINE_TIMEOUT_MS = 20_000;
-        const result = await Promise.race([
-          generateLine(
-            cropDataUrl,
-            track.voiceId,
-            track.description,
-            track.history.slice(-32),
-            langRef.current,
-            tapTag
-          ),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () => reject(new Error("generateLine timed out after 20s")),
-              GENERATE_LINE_TIMEOUT_MS
-            )
-          ),
-        ]);
-        // Earliest-possible supersede check — bail BEFORE any audio work
-        // if the user has already retapped.
-        if (callGen !== track.speakGen) {
-          // eslint-disable-next-line no-console
-          console.log(`[speak:${trackId} ${tapTag}] ← superseded (speakGen mismatch)`);
-          return;
+
+        // First-tap: use /api/speak to fold VLM + Cartesia into one
+        // response. Server fires TTS the instant `line` is parsed from the
+        // VLM and returns audio/mpeg with metadata in the X-Speak-Meta
+        // header, so caption + audio surface together (saves ~600ms of
+        // client-side round-trip dead air). Retap stays on the old
+        // server-action path — it's already text-only and sub-1s.
+        let line: string;
+        let chosenVoiceId: string | null;
+        let chosenDescription: string | null;
+        let preopenedForTts:
+          | { respBody: ReadableStream<Uint8Array>; backend: string }
+          | undefined;
+        let generateLineMs: number;
+
+        if (!isRetap) {
+          const speakCtrl = new AbortController();
+          const speakTimer = setTimeout(
+            () =>
+              speakCtrl.abort(
+                new Error("/api/speak timed out after 20s")
+              ),
+            GENERATE_LINE_TIMEOUT_MS
+          );
+          let speakResp: Response;
+          try {
+            speakResp = await fetch("/api/speak", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                imageDataUrl: cropDataUrl,
+                voiceId: track.voiceId,
+                description: track.description,
+                history: track.history.slice(-32),
+                lang: langRef.current,
+                turnId: tapTag.replace(/^#/, "").slice(0, 16),
+              }),
+              signal: speakCtrl.signal,
+            });
+          } finally {
+            clearTimeout(speakTimer);
+          }
+          if (callGen !== track.speakGen) {
+            try {
+              await speakResp.body?.cancel();
+            } catch {
+              // ignore
+            }
+            // eslint-disable-next-line no-console
+            console.log(
+              `[speak:${trackId} ${tapTag}] ← superseded (speakGen mismatch)`
+            );
+            return;
+          }
+          if (!speakResp.ok && speakResp.status !== 204) {
+            const errBody = await speakResp.text().catch(() => "");
+            throw new Error(
+              `/api/speak ${speakResp.status}: ${errBody.slice(0, 160)}`
+            );
+          }
+          const metaB64 = speakResp.headers.get("X-Speak-Meta") ?? "";
+          if (!metaB64) {
+            try {
+              await speakResp.body?.cancel();
+            } catch {
+              // ignore
+            }
+            throw new Error("/api/speak missing X-Speak-Meta header");
+          }
+          let meta: {
+            line?: string;
+            voiceId?: string | null;
+            description?: string | null;
+          };
+          try {
+            // Decode as UTF-8 — the server base64-encodes UTF-8 bytes, and
+            // `atob` alone returns a Latin-1 binary string that mangles
+            // non-ASCII (Chinese chars become mojibake like "ä¸­").
+            let metaJson: string;
+            if (typeof atob === "function") {
+              const bin = atob(metaB64);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              metaJson = new TextDecoder("utf-8").decode(bytes);
+            } else {
+              metaJson = Buffer.from(metaB64, "base64").toString("utf-8");
+            }
+            meta = JSON.parse(metaJson);
+          } catch (parseErr) {
+            try {
+              await speakResp.body?.cancel();
+            } catch {
+              // ignore
+            }
+            throw new Error(
+              `/api/speak meta parse failed: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`
+            );
+          }
+          if (typeof meta.line !== "string" || !meta.line.trim()) {
+            try {
+              await speakResp.body?.cancel();
+            } catch {
+              // ignore
+            }
+            throw new Error("/api/speak meta has no line");
+          }
+          line = meta.line;
+          chosenVoiceId =
+            typeof meta.voiceId === "string" && meta.voiceId.trim()
+              ? meta.voiceId.trim()
+              : null;
+          chosenDescription =
+            typeof meta.description === "string" && meta.description.trim()
+              ? meta.description.trim()
+              : null;
+          // 204 = no TTS backend configured. Caption-only degraded mode;
+          // leave preopenedForTts undefined so we don't try to stream.
+          if (speakResp.status === 200 && speakResp.body) {
+            preopenedForTts = {
+              respBody: speakResp.body,
+              backend:
+                speakResp.headers.get("X-Tts-Backend") ?? "stream",
+            };
+          }
+          generateLineMs = Math.round(performance.now() - t0);
+        } else {
+          // Retap path: text-only generateLine, then /api/tts/stream via
+          // playStreamingReply (unchanged).
+          const result = await Promise.race([
+            generateLine(
+              cropDataUrl,
+              track.voiceId,
+              track.description,
+              track.history.slice(-32),
+              langRef.current,
+              tapTag
+            ),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error("generateLine timed out after 20s")),
+                GENERATE_LINE_TIMEOUT_MS
+              )
+            ),
+          ]);
+          if (callGen !== track.speakGen) {
+            // eslint-disable-next-line no-console
+            console.log(
+              `[speak:${trackId} ${tapTag}] ← superseded (speakGen mismatch)`
+            );
+            return;
+          }
+          generateLineMs = Math.round(performance.now() - t0);
+          line = result.line;
+          chosenVoiceId = result.voiceId;
+          chosenDescription = result.description;
         }
-        const generateLineMs = Math.round(performance.now() - t0);
-        const {
-          line,
-          voiceId: chosenVoiceId,
-          description: chosenDescription,
-        } = result;
         capturedLine = line;
         // Pin the voice on first return — every subsequent speak/talk on
         // this track passes this id back so the same Fish voice speaks the
@@ -2023,6 +2237,36 @@ export function Tracker() {
         // pass handles ongoing refresh (and uses descriptionGen to race-guard).
         if (!track.description && chosenDescription) {
           track.description = chosenDescription;
+        }
+        // Session gallery: on the first tap of each track (the /api/speak
+        // branch runs only when !isRetap) save a card capturing everything
+        // the VLM just decided — crop, persona, voice, and opening line.
+        // Guarded by voiceId + description + line so a degraded no-backend
+        // run doesn't fill the gallery with half-built cards. We key by
+        // trackId so re-taps on the same track don't push duplicates
+        // (!isRetap already prevents that, but defensive double-check).
+        if (
+          !isRetap &&
+          chosenVoiceId &&
+          chosenDescription &&
+          typeof line === "string" &&
+          line.trim()
+        ) {
+          const className = track.className;
+          const newCard: SessionCard = {
+            id: `card-${trackId}-${Date.now()}`,
+            trackId,
+            createdAt: Date.now(),
+            className,
+            description: chosenDescription,
+            voiceId: chosenVoiceId,
+            line,
+            imageDataUrl: cropDataUrl,
+          };
+          setSessionCards((prev) => {
+            if (prev.some((c) => c.trackId === trackId)) return prev;
+            return [...prev, newCard];
+          });
         }
         // Record what the object said into its own memory so a later
         // conversation turn can call back to it.
@@ -2070,18 +2314,38 @@ export function Tracker() {
         // (~400–800ms) rather than after the full 1.5–2.2s synth cost.
         const tStream = performance.now();
         let firstSoundMs = 0;
-        await playStreamingReply(
-          trackId,
-          callGen,
-          line,
-          track.voiceId,
-          tapTag.replace(/^#/, ""),
-          () => {
-            if (firstSoundMs === 0) {
-              firstSoundMs = Math.round(performance.now() - pressedAt);
+        // First-tap path passes the already-open audio body from
+        // /api/speak so we skip the redundant /api/tts/stream POST.
+        if (preopenedForTts) {
+          await playStreamingReply(
+            trackId,
+            callGen,
+            line,
+            track.voiceId,
+            tapTag.replace(/^#/, ""),
+            () => {
+              if (firstSoundMs === 0) {
+                firstSoundMs = Math.round(performance.now() - pressedAt);
+              }
+            },
+            undefined,
+            undefined,
+            preopenedForTts
+          );
+        } else {
+          await playStreamingReply(
+            trackId,
+            callGen,
+            line,
+            track.voiceId,
+            tapTag.replace(/^#/, ""),
+            () => {
+              if (firstSoundMs === 0) {
+                firstSoundMs = Math.round(performance.now() - pressedAt);
+              }
             }
-          }
-        );
+          );
+        }
         if (callGen !== track.speakGen) return;
         const streamMs = Math.round(performance.now() - tStream);
         // End-of-tap summary — ties every phase from tap press to first
@@ -4212,6 +4476,52 @@ export function Tracker() {
     stopTalkLevelLoop();
   }, [stopTalkLevelLoop]);
 
+  // Gallery-card mic handlers. Instead of duplicating the whole mic stack
+  // (recorder + SR + Whisper race), a card press just aims the existing
+  // talk flow at its track: bump lastTapAt so pickTalkTarget() picks this
+  // one, then reuse startRecording(). If the track was evicted (out of
+  // frame long enough for LRU to reclaim it) the card is visually disabled
+  // and we no-op — user needs to re-tap the object to bring it back.
+  const handleCardMicPress = useCallback(
+    (cardId: string) => {
+      const card = sessionCards.find((c) => c.id === cardId);
+      if (!card) return;
+      const track = tracksRef.current.find((t) => t.id === card.trackId);
+      if (!track) {
+        showRejection("out of view — tap it again");
+        return;
+      }
+      track.lastTapAt = performance.now();
+      setActiveCardId(cardId);
+      void startRecording();
+    },
+    [sessionCards, showRejection, startRecording]
+  );
+
+  const handleCardMicRelease = useCallback(
+    (cardId: string) => {
+      if (activeCardId === cardId) {
+        setActiveCardId(null);
+      }
+      stopRecording();
+    },
+    [activeCardId, stopRecording]
+  );
+
+  const handleCardDismiss = useCallback((cardId: string) => {
+    setSessionCards((prev) => prev.filter((c) => c.id !== cardId));
+    setActiveCardId((prev) => (prev === cardId ? null : prev));
+  }, []);
+
+  // Clear the active-card highlight any time recording actually stops —
+  // covers paths like PointerLeave with no buttons down, or someone else
+  // calling stopRecording() while we were aimed at a card.
+  useEffect(() => {
+    if (!isRecording && activeCardId !== null) {
+      setActiveCardId(null);
+    }
+  }, [isRecording, activeCardId]);
+
   // --- Derived UI --------------------------------------------------------
   const anyThinking = tracksUI.some((t) => t.thinking);
   const anySpeaking = tracksUI.some((t) => t.speaking);
@@ -4221,6 +4531,18 @@ export function Tracker() {
   // Drives the mic button's aria-label only — pressing talk while busy
   // now interrupts the current voice instead of being blocked.
   const micBusy = anyThinking || anySpeaking;
+
+  // For each gallery card, is its backing track still being tracked? Used
+  // to enable/disable the card's mic button. Rebuilt only when tracksUI or
+  // the card list changes — not every render.
+  const cardStatus = useMemo<Record<string, CardLiveStatus>>(() => {
+    const liveIds = new Set(tracksUI.map((t) => t.id));
+    const out: Record<string, CardLiveStatus> = {};
+    for (const c of sessionCards) {
+      out[c.trackId] = liveIds.has(c.trackId) ? "alive" : "lost";
+    }
+    return out;
+  }, [tracksUI, sessionCards]);
 
   // Which face the mic is aimed at — the most-recently-tapped one. Drives
   // the button label so the user sees "talk to the cup" before they press.
@@ -4998,6 +5320,18 @@ export function Tracker() {
           </div>
         </div>
       )}
+
+      {/* Session gallery — horizontal strip of every object captured this
+          session. Stays above the mic button; empty until the first tap
+          completes. */}
+      <SessionGallery
+        cards={sessionCards}
+        activeCardId={activeCardId}
+        cardStatus={cardStatus}
+        onMicPress={handleCardMicPress}
+        onMicRelease={handleCardMicRelease}
+        onDismiss={handleCardDismiss}
+      />
 
       {/* Hold-to-talk button (unchanged). */}
       <div

@@ -9,6 +9,7 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "server": "server/.venv/bin/python server/server.py",
+    "server:v2": "server-v2/.venv/bin/python server-v2/server.py",
     "demo": "concurrently -k -n next,py -c cyan,magenta \"npm:dev\" \"npm:server\"",
     "postinstall": "node scripts/setup-ort.mjs"
   },
