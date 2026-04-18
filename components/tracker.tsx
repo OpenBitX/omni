@@ -1354,7 +1354,7 @@ export function Tracker() {
       try {
         // eslint-disable-next-line no-console
         console.log(
-          `[speak:${trackId}] → generateLine  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  voice=${track.voiceId ?? "(picking)"}  persona=${track.description ? "cached" : "(new)"}`
+          `[speak:${trackId}] → generateLine  class="${track.className}"  crop=${Math.round(cropDataUrl.length / 1024)}KB  voice=${track.voiceId ?? "(picking)"}  persona=${track.description ? "cached" : "(new)"}  history=${track.history.length}`
         );
         const t0 = performance.now();
         const {
@@ -1363,7 +1363,12 @@ export function Tracker() {
           description: chosenDescription,
           audioDataUrl,
           backend,
-        } = await generateLine(cropDataUrl, track.voiceId, track.description);
+        } = await generateLine(
+          cropDataUrl,
+          track.voiceId,
+          track.description,
+          track.history.slice(-32)
+        );
         if (callGen !== track.speakGen) {
           // eslint-disable-next-line no-console
           console.log(`[speak:${trackId}] ← superseded (speakGen mismatch)`);
@@ -1387,7 +1392,7 @@ export function Tracker() {
         track.history = [
           ...track.history,
           { role: "assistant" as const, content: line },
-        ].slice(-16);
+        ].slice(-32);
         // eslint-disable-next-line no-console
         console.log(
           `[speak:${trackId}] ← ${Math.round(performance.now() - t0)}ms  backend=${backend}  voice=${track.voiceId ?? "default"}  line="${line}"`
@@ -2002,7 +2007,7 @@ export function Tracker() {
         // The server re-caps to 16; we cap here so the payload stays small.
         formData.append(
           "history",
-          JSON.stringify(track.history.slice(-16))
+          JSON.stringify(track.history.slice(-32))
         );
 
         const t0 = performance.now();
@@ -2021,7 +2026,7 @@ export function Tracker() {
           nextHistory.push({ role: "user" as const, content: transcript });
         if (reply)
           nextHistory.push({ role: "assistant" as const, content: reply });
-        track.history = nextHistory.slice(-16);
+        track.history = nextHistory.slice(-32);
         // eslint-disable-next-line no-console
         console.log(
           `[converse #${tid}] ◀ client-roundtrip=${converseMs}ms  heard="${transcript.slice(0, 60)}${transcript.length > 60 ? "…" : ""}"  reply="${reply.slice(0, 60)}${reply.length > 60 ? "…" : ""}"`
