@@ -27,12 +27,22 @@ export type RunwareGenerateInput = {
 };
 
 export type RunwareGenerateResult =
-  | { ok: true; imageUrl: string; prompt: string }
-  | { ok: false; error: string };
+  | { ok: true; imageUrl: string; prompt: string; promptSource: "vlm" | "heuristic" }
+  | { ok: false; error: string; promptSource?: "vlm" | "heuristic" };
 
 const RUNWARE_ENDPOINT = "https://api.runware.ai/v1";
 const RUNWARE_MODEL = "runware:100@1";
 const REQUEST_TIMEOUT_MS = 20_000;
+
+// Max allowed image data URL size (base64 inflation ~1.37x). 3 MB covers
+// every crop the tracker produces (typical: 30–180 KB). Anything bigger is
+// almost certainly a mistake — fail fast rather than ship it to OpenAI.
+const MAX_IMAGE_DATA_URL_BYTES = 3_000_000;
+
+// Art-style opener we expect every prompt to start with. If the VLM
+// forgets it (it sometimes does), we prepend it so Runware stays on-brand.
+const STYLE_OPENER =
+  "bold comic-book illustration, thick black outlines, flat cel-shading, retro manga × kawaii energy, vivid pastel palette.";
 
 // --- Prompt construction --------------------------------------------------
 
@@ -134,16 +144,45 @@ function extractPromptField(raw: string | null | undefined): string | null {
   return null;
 }
 
-async function craftPromptFromImage(
-  input: RunwareGenerateInput
-): Promise<string | null> {
+// Module-level OpenAI client; created once per process on first use so we
+// don't pay connection churn per request.
+let _openai: OpenAI | null = null;
+function getOpenAI(): OpenAI | null {
+  if (_openai) return _openai;
   const key = process.env.OPENAI_API_KEY;
   if (!key) return null;
+  _openai = new OpenAI({ apiKey: key, timeout: VLM_PROMPT_TIMEOUT_MS });
+  return _openai;
+}
+
+// Ensure the crafted prompt still starts with the brand art-style opener
+// and ends with the safety clause. VLMs sometimes drop one or the other
+// when they get creative.
+function normalizeCraftedPrompt(raw: string): string {
+  const compact = raw.replace(/\s+/g, " ").trim();
+  const withOpener = /^bold comic-book/i.test(compact)
+    ? compact
+    : `${STYLE_OPENER} ${compact}`;
+  const withSafety = /no text|no speech bubbles|no watermarks/i.test(withOpener)
+    ? withOpener
+    : `${withOpener} No text, no speech bubbles, no watermarks.`;
+  return withSafety.length > 1400 ? withSafety.slice(0, 1400) : withSafety;
+}
+
+async function craftPromptFromImage(
+  input: RunwareGenerateInput,
+  signal?: AbortSignal
+): Promise<string | null> {
+  const client = getOpenAI();
+  if (!client) return null;
   if (!input.imageDataUrl || !input.imageDataUrl.startsWith("data:image/")) {
     return null;
   }
+  if (input.imageDataUrl.length > MAX_IMAGE_DATA_URL_BYTES) {
+    // Too large — the crop is absurd, don't pay the OpenAI vision bill.
+    return null;
+  }
 
-  const client = new OpenAI({ apiKey: key, timeout: VLM_PROMPT_TIMEOUT_MS });
   const description =
     sanitizeSnippet(input.description) || "expressive character";
   const className = sanitizeSnippet(input.className) || "object";
@@ -158,31 +197,32 @@ async function craftPromptFromImage(
   ].join("\n");
 
   try {
-    const resp = await client.chat.completions.create({
-      model: VLM_PROMPT_MODEL,
-      response_format: { type: "json_object" },
-      max_tokens: 420,
-      temperature: 0.85,
-      messages: [
-        { role: "system", content: VLM_PROMPT_SYSTEM },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: userText },
-            {
-              type: "image_url",
-              image_url: { url: input.imageDataUrl, detail: "low" },
-            },
-          ],
-        },
-      ],
-    });
+    const resp = await client.chat.completions.create(
+      {
+        model: VLM_PROMPT_MODEL,
+        response_format: { type: "json_object" },
+        max_tokens: 420,
+        temperature: 0.85,
+        messages: [
+          { role: "system", content: VLM_PROMPT_SYSTEM },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: userText },
+              {
+                type: "image_url",
+                image_url: { url: input.imageDataUrl, detail: "low" },
+              },
+            ],
+          },
+        ],
+      },
+      signal ? { signal } : undefined
+    );
     const raw = resp.choices?.[0]?.message?.content;
     const prompt = extractPromptField(typeof raw === "string" ? raw : null);
     if (!prompt) return null;
-    // Safety cap — Runware accepts long prompts but unbounded LLM output is
-    // still a footgun.
-    return prompt.length > 1200 ? prompt.slice(0, 1200) : prompt;
+    return normalizeCraftedPrompt(prompt);
   } catch {
     return null;
   }
@@ -230,7 +270,8 @@ type RunwareResponse = {
 };
 
 export async function generateComicImage(
-  input: RunwareGenerateInput
+  input: RunwareGenerateInput,
+  signal?: AbortSignal
 ): Promise<RunwareGenerateResult> {
   const apiKey = process.env.RUNWARE_API_KEY;
   if (!apiKey) {
@@ -240,8 +281,9 @@ export async function generateComicImage(
   // Prefer the VLM-crafted prompt when we have the image crop; that model
   // can lock in specific visible details ("chipped yellow lid", "peeling
   // sticker on the back") that the heuristic prompt can't reach.
-  const crafted = await craftPromptFromImage(input);
+  const crafted = await craftPromptFromImage(input, signal);
   const prompt = crafted ?? buildComicPrompt(input);
+  const promptSource: "vlm" | "heuristic" = crafted ? "vlm" : "heuristic";
   const taskUUID = uuidv4();
 
   const body = [
@@ -261,6 +303,13 @@ export async function generateComicImage(
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
+  // Chain the caller's signal so a client disconnect or overall budget
+  // expiry cancels the fetch promptly.
+  const onCallerAbort = () => ac.abort();
+  if (signal) {
+    if (signal.aborted) ac.abort();
+    else signal.addEventListener("abort", onCallerAbort, { once: true });
+  }
 
   let res: Response;
   try {
@@ -275,14 +324,22 @@ export async function generateComicImage(
     });
   } catch (err) {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onCallerAbort);
     const aborted =
       (err instanceof Error && err.name === "AbortError") ||
       (err as { name?: string } | null)?.name === "AbortError";
-    if (aborted) return { ok: false, error: "timeout" };
+    if (aborted) {
+      return {
+        ok: false,
+        error: signal?.aborted ? "cancelled" : "timeout",
+        promptSource,
+      };
+    }
     const message = err instanceof Error ? err.message : "network error";
-    return { ok: false, error: message };
+    return { ok: false, error: message, promptSource };
   }
   clearTimeout(timer);
+  if (signal) signal.removeEventListener("abort", onCallerAbort);
 
   if (!res.ok) {
     // Try to surface the provider's error message but don't crash on bad JSON.
@@ -299,25 +356,25 @@ export async function generateComicImage(
         // swallow
       }
     }
-    return { ok: false, error: detail };
+    return { ok: false, error: detail, promptSource };
   }
 
   let json: RunwareResponse;
   try {
     json = (await res.json()) as RunwareResponse;
   } catch {
-    return { ok: false, error: "invalid runware response" };
+    return { ok: false, error: "invalid runware response", promptSource };
   }
 
   if (json.errors && json.errors.length > 0) {
     const msg = json.errors[0]?.message || json.errors[0]?.code || "runware error";
-    return { ok: false, error: msg };
+    return { ok: false, error: msg, promptSource };
   }
 
   const imageUrl = json.data?.find((d) => d?.imageURL)?.imageURL;
   if (!imageUrl) {
-    return { ok: false, error: "no image url in response" };
+    return { ok: false, error: "no image url in response", promptSource };
   }
 
-  return { ok: true, imageUrl, prompt };
+  return { ok: true, imageUrl, prompt, promptSource };
 }
