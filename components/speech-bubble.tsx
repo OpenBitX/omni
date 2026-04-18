@@ -119,7 +119,7 @@ export function SpeechBubble({ caption, thinking, speaking, maxWidth }: SpeechBu
       className="relative"
       style={{
         maxWidth,
-        transformOrigin: "50% 100%",
+        transformOrigin: "50% 90%",
         // Chunky hard offset — the classic newsprint comic drop. No blur.
         filter:
           "drop-shadow(5px 5px 0 #1a1024) drop-shadow(0 8px 18px rgba(236,72,153,0.18))",

@@ -33,6 +33,7 @@ export default function RootLayout({
     <html
       lang="zh-CN"
       className={`${GeistSans.variable} ${GeistMono.variable} ${bangers.variable}`}
+      suppressHydrationWarning
     >
       <head>
         {/* Bounce insecure LAN loads up to HTTPS so navigator.mediaDevices
@@ -43,7 +44,7 @@ export default function RootLayout({
           }}
         />
       </head>
-      <body className="font-sans text-[#2a1540] antialiased">
+      <body className="font-sans text-[#2a1540] antialiased" suppressHydrationWarning>
         {children}
       </body>
     </html>

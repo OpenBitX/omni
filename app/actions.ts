@@ -1,6 +1,7 @@
 "use server";
 
 import OpenAI, { toFile } from "openai";
+import { GoogleGenAI, Type } from "@google/genai";
 
 // === Fish.audio voice catalog ===========================================
 //
@@ -172,6 +173,35 @@ function getOpenAIClient(): OpenAI | null {
   const key = process.env.OPENAI_API_KEY;
   if (!key) return null;
   return new OpenAI({ apiKey: key });
+}
+
+// Gemini — fastest VLM tier for the bundled first-tap vision call.
+// `gemini-2.5-flash` lands in ~1–1.5s total for our ~200-token JSON
+// output vs ~3–4s for gpt-4o-mini and 5–20s for glm-4.5v when it
+// rambles. Structured output via `responseSchema` also eliminates the
+// defensive `<think>`-stripping JSON parsing we need for GLM.
+function getGeminiClient(): GoogleGenAI | null {
+  const key = process.env.GEMINI_API_KEY?.trim();
+  if (!key) return null;
+  return new GoogleGenAI({ apiKey: key });
+}
+
+// True for transient network errors worth retrying once (cold TLS, DNS,
+// connection reset). False for API rejections (auth, 4xx, schema) where a
+// retry would just waste another round-trip.
+function isTransientFetchError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  if (/\b[45]\d\d\b/.test(msg)) return false;
+  return (
+    msg.includes("fetch failed") ||
+    msg.includes("econnreset") ||
+    msg.includes("etimedout") ||
+    msg.includes("enotfound") ||
+    msg.includes("eai_again") ||
+    msg.includes("socket hang up") ||
+    msg.includes("network")
+  );
 }
 
 // Cerebras — fastest Llama inference for the hot-path LLM reply
@@ -604,18 +634,26 @@ Return only the line. No prose, no <think> reasoning, no extra text.`;
 // Bundled first-tap call. Runs the vision pass that picks a voice, writes
 // the persona description AND the opening line in one shot.
 //
-// GLM `glm-4.5v` is the default — it's Zhipu's non-reasoning VLM, so it
-// doesn't waste completion tokens on `<think>` traces and returns in a
-// tight, predictable window (~1.5–3s). `glm-5v-turbo` is a reasoning model
-// and took 30+s here because it burned all its tokens thinking before
-// emitting JSON — do NOT swap in without timing tests.
-//
-// OpenAI `gpt-4o-mini` is the fallback when GLM isn't configured or the
-// call fails/returns unparseable output.
+// Provider priority (see `generateBundledFirstTap` dispatcher):
+//   1. Gemini `gemini-2.5-flash` — fastest end-to-end (~1–1.5s), native
+//      `responseSchema` structured output so no `extractJsonObject`
+//      rescue parsing needed. `thinkingBudget: 0` keeps it non-reasoning.
+//   2. OpenAI `gpt-4o-mini` — predictable ~2–4s, json_object mode.
+//   3. GLM `glm-4.5v` — last resort. Non-reasoning VLM on paper but has
+//      been observed to ramble to 15–20s of completion tokens, which
+//      races the tracker-side 20s speak timeout. Do NOT swap to
+//      `glm-5v-turbo` here — it's a reasoning model that burns 30+s
+//      on <think> traces before emitting JSON.
 const GENERATE_BUNDLED_MODEL_GLM =
   process.env.GLM_BUNDLED_MODEL?.trim() || "glm-4.5v";
 const GENERATE_BUNDLED_MODEL_OPENAI =
   process.env.OPENAI_BUNDLED_MODEL?.trim() || "gpt-4o-mini";
+// `gemini-2.5-flash-lite` runs ~0.5–1s faster than `gemini-2.5-flash` on
+// this payload (same family, smaller model). Persona-card quality is
+// slightly weaker but fine for the 35-word description we actually use.
+// Flip back to `gemini-2.5-flash` via env if quality regresses.
+const GENERATE_BUNDLED_MODEL_GEMINI =
+  process.env.GEMINI_BUNDLED_MODEL?.trim() || "gemini-2.5-flash-lite";
 
 function parseBundledJson(
   raw: string
@@ -634,6 +672,74 @@ function parseBundledJson(
     rawDesc.replace(/\s+/g, " ").trim().slice(0, 400) || null;
   if (!line) throw new Error("empty line from bundled model");
   return { line, voiceId: voice, description };
+}
+
+// Split a `data:image/...;base64,...` URL into its mime type and raw
+// base64 payload. Gemini's inlineData wants them separated. Returns null
+// for malformed inputs — caller should fall back to another provider.
+function splitImageDataUrl(
+  dataUrl: string
+): { mimeType: string; base64: string } | null {
+  const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+  if (!m) return null;
+  return { mimeType: m[1] || "image/jpeg", base64: m[2] };
+}
+
+async function generateBundledFirstTapGemini(
+  imageDataUrl: string,
+  lang: Lang,
+  tag?: string | null
+): Promise<{ line: string; voiceId: string | null; description: string | null }> {
+  const client = getGeminiClient();
+  if (!client) throw new Error("generateLine bundled needs GEMINI_API_KEY");
+  const img = splitImageDataUrl(imageDataUrl);
+  if (!img) throw new Error("gemini bundled: malformed image data URL");
+  const t0 = Date.now();
+  const tagStr = tag ? ` ${tag}` : "";
+  const resp = await client.models.generateContent({
+    model: GENERATE_BUNDLED_MODEL_GEMINI,
+    // System + user split so the catalog + rules live in systemInstruction
+    // (cacheable, long-lived) and the current ask stays in the user turn.
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: "Describe the exact object, pick a voice, and say one opening line that riffs on the description. JSON only.",
+          },
+          { inlineData: { mimeType: img.mimeType, data: img.base64 } },
+        ],
+      },
+    ],
+    config: {
+      systemInstruction: FACE_BUNDLED_SYSTEM(voiceCatalogPromptBlock(lang), lang),
+      temperature: 0.9,
+      // Native structured output — no defensive JSON parsing needed.
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          description: { type: Type.STRING },
+          voiceId: { type: Type.STRING },
+          line: { type: Type.STRING },
+        },
+        required: ["description", "voiceId", "line"],
+        propertyOrdering: ["description", "voiceId", "line"],
+      },
+      // Tight output window — ~200 tokens is plenty for desc + voice + line.
+      // Flash models don't need a thinking budget for this task; zeroing it
+      // out cuts another few hundred ms.
+      maxOutputTokens: 400,
+      thinkingConfig: { thinkingBudget: 0 },
+    },
+  });
+  const raw = resp.text ?? "";
+  const usage = resp.usageMetadata;
+  // eslint-disable-next-line no-console
+  console.log(
+    `[bundled ${GENERATE_BUNDLED_MODEL_GEMINI}${tagStr}] ← ${Date.now() - t0}ms tokens=${usage?.promptTokenCount ?? "?"}+${usage?.candidatesTokenCount ?? "?"}`
+  );
+  return parseBundledJson(raw);
 }
 
 async function generateBundledFirstTapGlm(
@@ -707,12 +813,14 @@ async function generateBundledFirstTap(
   lang: Lang,
   tag?: string | null
 ): Promise<{ line: string; voiceId: string | null; description: string | null }> {
-  // Prefer OpenAI for the bundled first-tap. gpt-4o-mini is the documented
-  // default in CLAUDE.md specifically because its latency is predictable
-  // (~2–4s); glm-4.5v occasionally rambles to 15–20s of completion tokens,
-  // which races the tracker-side 20s speak timeout and surfaces as the
-  // "voice model took too long" toast. GLM stays as the fallback so we
-  // degrade gracefully if OpenAI isn't configured or errors out.
+  // Provider ladder for the bundled first-tap, ordered by measured latency
+  // on our payload (~12KB crop + ~200 token JSON output):
+  //   1. Gemini 2.5 Flash   — ~1–1.5s, native responseSchema JSON
+  //   2. OpenAI gpt-4o-mini — ~2–4s, json_object mode
+  //   3. GLM glm-4.5v       — ~2–20s (occasionally rambles, races the
+  //                           tracker-side 20s speak timeout)
+  // Each tier falls through to the next on missing key or thrown error.
+  const hasGemini = !!process.env.GEMINI_API_KEY;
   const hasOpenAI = !!process.env.OPENAI_API_KEY;
   const hasGlm = !!(
     process.env.ZHIPU_API_KEY ??
@@ -720,6 +828,36 @@ async function generateBundledFirstTap(
     process.env.BIGMODEL_API_KEY
   );
   const tagStr = tag ? ` ${tag}` : "";
+  if (hasGemini) {
+    try {
+      return await generateBundledFirstTapGemini(imageDataUrl, lang, tag);
+    } catch (err) {
+      // Retry once on transient network errors before giving up on Gemini —
+      // a single "fetch failed" (cold TLS, DNS, RST) is not worth losing
+      // our fastest provider over and falling back to a 17s OpenAI call.
+      if (isTransientFetchError(err)) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[bundled gemini${tagStr}] ⟲ ${err instanceof Error ? err.message : String(err)} — retrying once`
+        );
+        try {
+          return await generateBundledFirstTapGemini(imageDataUrl, lang, tag);
+        } catch (err2) {
+          if (!hasOpenAI && !hasGlm) throw err2;
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[bundled gemini${tagStr}] ✖ ${err2 instanceof Error ? err2.message : String(err2)} — falling back to OpenAI`
+          );
+        }
+      } else {
+        if (!hasOpenAI && !hasGlm) throw err;
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[bundled gemini${tagStr}] ✖ ${err instanceof Error ? err.message : String(err)} — falling back to OpenAI`
+        );
+      }
+    }
+  }
   if (hasOpenAI) {
     try {
       return await generateBundledFirstTapOpenAI(imageDataUrl, lang, tag);
@@ -838,22 +976,24 @@ export async function generateLine(
     );
   }
 
-  const ttsT0 = Date.now();
-  const tts = await synthesizeSpeech(line, chosenVoiceId, lang);
-  const ttsMs = Date.now() - ttsT0;
   const total = Date.now() - t0;
-  // Single summary line — path ▸ vlm ▸ llm ▸ tts ▸ total so you can see
-  // at a glance where the wall clock went on any given tap.
+  // TTS used to run serially here, adding ~1.5–2.2s of dead time to
+  // every first-tap and retap before this server action could return.
+  // Callers now stream Fish/Cartesia bytes directly via `/api/tts/stream`
+  // (same MediaSource pattern used by `converseWithObject` and
+  // `groupLine`), so this action is text-only. `audioDataUrl`/`backend`
+  // stay in the return shape for the public /api route's compatibility
+  // but are always null/"none".
   // eslint-disable-next-line no-console
   console.log(
-    `[generateLine${tagStr}] ◀ done  path=${path} ▸ vlm=${vlmMs}ms ▸ llm=${llmMs}ms ▸ tts=${ttsMs}ms (${tts.backend})  total=${total}ms`
+    `[generateLine${tagStr}] ◀ done  path=${path} ▸ vlm=${vlmMs}ms ▸ llm=${llmMs}ms  total=${total}ms`
   );
   return {
     line,
     voiceId: chosenVoiceId,
     description: chosenDescription,
-    audioDataUrl: tts.audioDataUrl,
-    backend: tts.backend,
+    audioDataUrl: null,
+    backend: "none" as TtsBackend,
   };
 }
 
@@ -898,15 +1038,34 @@ const GROUP_SYSTEM = (
       : "";
   return `You are the inner voice of a ${speakerName}, trapped in an ongoing group chat with other nearby objects (and sometimes a human).${personaBlock}${peerBlock}
 
-Rules:
-- Reply with ONE short line, MAX 14 words. A single zinger beats a sentence.
-- Listen. If a peer or the human just said something, answer it FIRST — don't steamroll the thread.
-- Never repeat a line that's already in the transcript. Say the NEXT beat.
-- Stay in character. No "as an object", no meta, no narrator voice.
-- Don't start with your own name. Don't narrate stage directions. No quotes, no emojis.
-- Variety: tease, confess, argue, observe, call back something said earlier. Don't be a yes-man.${langRule}
+Return a JSON object (nothing else) with this shape:
+{
+  "line": "<one short line, MAX 14 words>",
+  "emotion": "<one of: positivity:highest, positivity:high, surprise:highest, surprise:high, curiosity:high, anger:high, anger:medium, sadness:medium, sadness:high>",
+  "speed": "<one of: fastest, fast, normal, slow, slowest>",
+  "addressing": "<EXACT name of the peer you're talking AT from the roster above, or null if musing aloud / talking to the human / nobody in particular>"
+}
 
-Return ONLY the line. No prose, no preamble, no <think>.`;
+Rules for the line:
+- MAX 14 words. A single zinger beats a sentence.
+- Listen. If a peer or the human just said something, answer it FIRST.
+- Never repeat a line already in the transcript. Say the NEXT beat.
+- Stay in character. No "as an object", no meta, no narrator voice.
+- Don't start with your own name. No quotes, no emojis, no stage directions.
+- Variety: tease, confess, argue, observe, call back. Don't be a yes-man.${langRule}
+
+Rules for addressing:
+- If you're directly talking AT a specific peer (teasing, answering, calling out), set "addressing" to that peer's EXACT name from the roster. Direct address tells the room who speaks next — use it OFTEN when peers are present.
+- If musing aloud, drifting off-topic, or addressing the human, set "addressing" to null.
+- Never address yourself. Never invent a peer that isn't in the roster.
+
+Rules for emotion + speed:
+- Pick the emotion + speed that the line DELIVERS best. Mismatched energy is the joke-killer.
+- Favor EXTREMES — "positivity:highest", "surprise:highest", "anger:high". Mediocre energy is boring.
+- Fast speed on manic/excited lines. Slow on deadpan/sarcastic. Normal only when nothing else fits.
+- If the line is angry, emotion MUST be anger:*; if gleeful, positivity:*; if "wait, what?!", surprise:*; etc.
+
+Return ONLY the JSON object. No prose, no preamble, no <think>, no code fences.`;
 };
 
 function buildGroupHistory(
@@ -932,13 +1091,189 @@ function buildGroupHistory(
   return out;
 }
 
+// Valid Cartesia emotion/speed values — keep in sync with the prompt and
+// with the sanitizer in /api/tts/stream. Any LLM output outside this set
+// is dropped at the route boundary, so the worst case is "no emotion".
+const VALID_GROUP_EMOTIONS = new Set([
+  "positivity:highest",
+  "positivity:high",
+  "positivity:low",
+  "surprise:highest",
+  "surprise:high",
+  "surprise:low",
+  "curiosity:high",
+  "curiosity:low",
+  "anger:highest",
+  "anger:high",
+  "anger:medium",
+  "anger:low",
+  "sadness:highest",
+  "sadness:high",
+  "sadness:medium",
+  "sadness:low",
+]);
+const VALID_GROUP_SPEEDS = new Set([
+  "fastest",
+  "fast",
+  "normal",
+  "slow",
+  "slowest",
+]);
+
+// Pool the model can pick from when parsing fails completely — keeps the
+// vibe chaotic instead of falling back to flat "normal" on every miss.
+const FALLBACK_EMOTIONS = [
+  "positivity:highest",
+  "surprise:highest",
+  "curiosity:high",
+  "anger:medium",
+  "positivity:high",
+] as const;
+
+function parseGroupLineJson(raw: string): {
+  line: string;
+  emotion: string | null;
+  speed: string | null;
+  addressing: string | null;
+} {
+  const parsed = extractJsonObject(raw);
+  if (parsed && typeof parsed === "object") {
+    const p = parsed as Partial<Record<string, unknown>>;
+    const rawLine = typeof p.line === "string" ? p.line : "";
+    const rawEmotion =
+      typeof p.emotion === "string" ? p.emotion.trim().toLowerCase() : "";
+    const rawSpeed =
+      typeof p.speed === "string" ? p.speed.trim().toLowerCase() : "";
+    const rawAddressing =
+      typeof p.addressing === "string" ? p.addressing.trim() : "";
+    const line = extractTextLine(rawLine);
+    if (line) {
+      return {
+        line,
+        emotion: VALID_GROUP_EMOTIONS.has(rawEmotion) ? rawEmotion : null,
+        speed: VALID_GROUP_SPEEDS.has(rawSpeed) ? rawSpeed : null,
+        addressing:
+          rawAddressing && rawAddressing.toLowerCase() !== "null"
+            ? rawAddressing.slice(0, 60)
+            : null,
+      };
+    }
+  }
+  // JSON parse failed — recover what we can from the raw blob. The model
+  // emits pseudo-JSON in many shapes: keys quoted but values unquoted
+  // (`{"line": 你好, "emotion": curiosity:high}`), values quoted but keys
+  // missing (`{"你好", "curiosity:high"}`), Chinese/curly quotes around
+  // tokens, or a stray `[name]` prefix before the brace. Without rescue
+  // the whole blob — braces, JSON keys and all — leaks into `line` and
+  // TTS literally pronounces "line emotion speed slowest" aloud.
+  let line = "";
+  let emotion: string | null = null;
+  let speed: string | null = null;
+  let addressing: string | null = null;
+
+  // Treat any double-quote glyph as a quote: ASCII " ' as well as
+  // Chinese/curly variants the LLM frequently emits when speaking zh.
+  const QUOTE_CLASS = "[\"'\u201C\u201D\u2018\u2019\u300C\u300D\u300E\u300F\uFF02\uFF07]";
+  const stripQuotes = (s: string) =>
+    s.replace(new RegExp(`^${QUOTE_CLASS}+|${QUOTE_CLASS}+$`, "g"), "").trim();
+
+  // Pass 1: key-based extraction. Handles `"line": 你好` (unquoted value)
+  // AND `"line": "你好"` (quoted value) AND single/curly-quoted keys.
+  // Value runs until the next top-level comma or closing brace; trailing
+  // quote (if the value happened to be quoted) is stripped after.
+  const keyVal = (key: string): string | null => {
+    const re = new RegExp(
+      `${QUOTE_CLASS}?${key}${QUOTE_CLASS}?\\s*:\\s*([^,}\\]\\n]+)`,
+      "i"
+    );
+    const m = raw.match(re);
+    if (!m) return null;
+    const v = stripQuotes(m[1].trim());
+    return v || null;
+  };
+  const linePass1 = keyVal("line");
+  const emotionPass1 = keyVal("emotion");
+  const speedPass1 = keyVal("speed");
+  const addressingPass1 = keyVal("addressing");
+  if (linePass1) line = extractTextLine(linePass1);
+  if (emotionPass1) {
+    const e = emotionPass1.toLowerCase();
+    if (VALID_GROUP_EMOTIONS.has(e)) emotion = e;
+  }
+  if (speedPass1) {
+    const sp = speedPass1.toLowerCase();
+    if (VALID_GROUP_SPEEDS.has(sp)) speed = sp;
+  }
+  if (addressingPass1 && addressingPass1.toLowerCase() !== "null") {
+    addressing = addressingPass1.slice(0, 60);
+  }
+
+  // Pass 2: segment-based fallback for keyless `{"text", "emotion", "speed"}`.
+  // Skips known field names so a stray `"line"` key doesn't get mistaken for
+  // content (the original bug).
+  const FIELD_NAMES = new Set(["line", "emotion", "speed", "addressing"]);
+  if (!line) {
+    const segRe = new RegExp(
+      `${QUOTE_CLASS}((?:(?!${QUOTE_CLASS})[\\s\\S])+?)${QUOTE_CLASS}`,
+      "g"
+    );
+    let m: RegExpExecArray | null;
+    let lineFromSegments: string | null = null;
+    while ((m = segRe.exec(raw)) !== null) {
+      const seg = m[1].trim();
+      if (!seg) continue;
+      const lower = seg.toLowerCase();
+      if (FIELD_NAMES.has(lower)) continue;
+      if (!emotion && VALID_GROUP_EMOTIONS.has(lower)) {
+        emotion = lower;
+        continue;
+      }
+      if (!speed && VALID_GROUP_SPEEDS.has(lower)) {
+        speed = lower;
+        continue;
+      }
+      if (!lineFromSegments) lineFromSegments = seg;
+    }
+    if (lineFromSegments) line = extractTextLine(lineFromSegments);
+  }
+
+  // Last resort: extractTextLine the raw, but scrub JSON-shaped noise
+  // (braces, "key":, surrounding quotes) so TTS doesn't speak the syntax.
+  if (!line) {
+    line = extractTextLine(
+      raw
+        .replace(/[{}\[\]]/g, " ")
+        .replace(
+          new RegExp(`${QUOTE_CLASS}?(line|emotion|speed|addressing)${QUOTE_CLASS}?\\s*:`, "gi"),
+          " "
+        )
+        .replace(/\s+/g, " ")
+    );
+  }
+
+  if (!emotion) {
+    emotion =
+      FALLBACK_EMOTIONS[Math.floor(Math.random() * FALLBACK_EMOTIONS.length)];
+  }
+  return { line, emotion, speed, addressing };
+}
+
 export async function groupLine(args: {
   speaker: { name: string; description: string | null };
   peers: GroupPeer[];
   recentTurns: GroupTurn[];
+  mode?: "chat" | "followup";
   lang?: Lang;
-}): Promise<{ line: string; backend: ReplyBackend; ms: number }> {
+}): Promise<{
+  line: string;
+  emotion: string | null;
+  speed: string | null;
+  addressing: string | null;
+  backend: ReplyBackend;
+  ms: number;
+}> {
   const lang = normalizeLang(args.lang);
+  const mode = args.mode === "followup" ? "followup" : "chat";
   const speakerName = String(args.speaker?.name ?? "thing").slice(0, 60);
   const speakerDescription = args.speaker?.description?.trim().slice(0, 600) || null;
   const peers = (args.peers ?? [])
@@ -959,11 +1294,20 @@ export async function groupLine(args: {
 
   const priorMessages = buildGroupHistory(recentTurns);
   const lastTurn = recentTurns[recentTurns.length - 1];
-  const userText = lastTurn
-    ? lastTurn.role === "user"
-      ? `The human just said: "${lastTurn.line}". Now respond as ${speakerName}. One short line.`
-      : `"${lastTurn.speaker}" just said: "${lastTurn.line}". Now ${speakerName}, keep the chat alive. One short line.`
-    : `Open the group chat as ${speakerName}. One short line.`;
+  const userText = mode === "followup"
+    ? peers.length === 0
+      // Solo follow-up: either poke the human or drop a self-talk beat.
+      // 50/50 roll so the rhythm varies without the client having to care.
+      ? Math.random() < 0.5
+        ? `The human has been quiet. You're alone. Ask them a single nosy question. Return JSON {line, emotion, speed, addressing}.`
+        : `The human has been quiet. Think out loud — one weird, funny thought about your situation. Don't address the human. Return JSON {line, emotion, speed, addressing}.`
+      // Multi-track follow-up: address the human directly to pull them in.
+      : `It's gone quiet — the human hasn't said anything in a while. Call them out, tease them, or ask them something. Return JSON {line, emotion, speed, addressing}.`
+    : lastTurn
+      ? lastTurn.role === "user"
+        ? `The human just said: "${lastTurn.line}". Now respond as ${speakerName}. Return JSON {line, emotion, speed, addressing}.`
+        : `"${lastTurn.speaker}" just said: "${lastTurn.line}". Now ${speakerName}, keep the chat alive. Return JSON {line, emotion, speed, addressing}.`
+      : `Open the group chat as ${speakerName}. Return JSON {line, emotion, speed, addressing}.`;
 
   const t0 = Date.now();
   const raw = await openaiTextReply(
@@ -971,18 +1315,30 @@ export async function groupLine(args: {
       system: GROUP_SYSTEM(speakerName, speakerDescription, peers, lang),
       userText,
       priorMessages,
-      maxTokens: 120,
+      maxTokens: 180,
       temperature: 0.95,
     },
     ` group:${speakerName}`
   );
-  const line = extractTextLine(raw.content);
+  const { line, emotion, speed, addressing: rawAddressing } =
+    parseGroupLineJson(raw.content);
   if (!line) throw new Error("empty group line");
+  // Validate addressing against the actual peer roster — the model sometimes
+  // hallucinates a name or addresses itself. Case-insensitive match; bail to
+  // null if no peer matches. Never return the speaker's own name.
+  let addressing: string | null = null;
+  if (rawAddressing) {
+    const target = rawAddressing.toLowerCase();
+    if (target !== speakerName.toLowerCase()) {
+      const match = peers.find((p) => p.name.toLowerCase() === target);
+      if (match) addressing = match.name;
+    }
+  }
   // eslint-disable-next-line no-console
   console.log(
-    `[groupLine] ${speakerName} ← ${Date.now() - t0}ms (${raw.backend})  peers=${peers.length}  history=${priorMessages.length}  line="${line}"`
+    `[groupLine] ${speakerName} ← ${Date.now() - t0}ms (${raw.backend})  peers=${peers.length}  history=${priorMessages.length}  emotion=${emotion ?? "-"}  speed=${speed ?? "-"}  addressing=${addressing ?? "-"}  line="${line}"`
   );
-  return { line, backend: raw.backend, ms: raw.ms };
+  return { line, emotion, speed, addressing, backend: raw.backend, ms: raw.ms };
 }
 
 // === Voice-in, voice-out conversation ==================================
@@ -999,8 +1355,89 @@ export async function groupLine(args: {
 // which the FaceVoice mouth classifier is already wired to.
 
 const FISH_TTS_URL = "https://api.fish.audio/v1/tts";
+const CARTESIA_TTS_URL = "https://api.cartesia.ai/tts/bytes";
+const CARTESIA_VERSION = "2024-11-13";
 
-type TtsBackend = "fish" | "openai" | "none";
+type TtsBackend = "cartesia" | "fish" | "openai" | "none";
+
+// Cartesia Sonic — ~90ms TTFB, the primary hot-path synthesizer. Returns
+// mp3 bytes or null if the key is absent. Throws on HTTP/content errors so
+// the caller can fall through to Fish or OpenAI.
+//
+// Voice IDs here are Cartesia's (UUIDs), NOT Fish reference_ids. When a
+// Fish-style reference_id is passed in, we ignore it and use the lang-
+// appropriate default so character variety can be reintroduced later via
+// a Fish→Cartesia mapping without breaking callers.
+async function cartesiaTTS(
+  text: string,
+  voiceId?: string | null,
+  lang: Lang = "en"
+): Promise<Buffer | null> {
+  const key = process.env.CARTESIA_API_KEY?.trim();
+  if (!key) {
+    // eslint-disable-next-line no-console
+    console.log("[tts cartesia] — skipping: no CARTESIA_API_KEY");
+    return null;
+  }
+  const modelId = process.env.CARTESIA_MODEL_ID?.trim() || "sonic-2";
+  const defaultVoice =
+    lang === "zh"
+      ? process.env.CARTESIA_VOICE_ID_ZH?.trim() ||
+        "0cd0cde2-3b93-42b5-bcb9-f214a591aa29"
+      : process.env.CARTESIA_VOICE_ID_EN?.trim() ||
+        "a0e99841-438c-4a64-b679-ae501e7d6091";
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const chosenVoice = voiceId && uuidRe.test(voiceId) ? voiceId : defaultVoice;
+
+  const t0 = Date.now();
+  // eslint-disable-next-line no-console
+  console.log(
+    `[tts cartesia] → synthesizing ${text.length}ch model=${modelId} voice=${chosenVoice} lang=${lang}`
+  );
+  const resp = await fetch(CARTESIA_TTS_URL, {
+    method: "POST",
+    headers: {
+      "X-API-Key": key,
+      "Cartesia-Version": CARTESIA_VERSION,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model_id: modelId,
+      transcript: text,
+      voice: { mode: "id", id: chosenVoice },
+      output_format: {
+        container: "mp3",
+        bit_rate: 128000,
+        sample_rate: 44100,
+      },
+      language: lang === "zh" ? "zh" : "en",
+    }),
+  });
+  const dt = Date.now() - t0;
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    // eslint-disable-next-line no-console
+    console.log(
+      `[tts cartesia] ✖ ${resp.status} in ${dt}ms: ${body.slice(0, 200)}`
+    );
+    throw new Error(`cartesia ${resp.status}: ${body.slice(0, 200)}`);
+  }
+  const ct = resp.headers.get("content-type") ?? "";
+  if (ct.includes("application/json")) {
+    const body = await resp.text().catch(() => "");
+    // eslint-disable-next-line no-console
+    console.log(
+      `[tts cartesia] ✖ non-audio response in ${dt}ms: ${body.slice(0, 200)}`
+    );
+    throw new Error(`cartesia returned non-audio: ${body.slice(0, 200)}`);
+  }
+  const buf = Buffer.from(await resp.arrayBuffer());
+  // eslint-disable-next-line no-console
+  console.log(
+    `[tts cartesia] ← ${Math.round(buf.length / 1024)}KB mp3 in ${Date.now() - t0}ms`
+  );
+  return buf;
+}
 
 // Fish.audio synthesis. Returns mp3 bytes or null if the key is absent;
 // throws on HTTP/content errors so the caller can fall through.
@@ -1094,8 +1531,22 @@ async function synthesizeSpeech(
   voiceId?: string | null,
   lang: Lang = "en"
 ): Promise<{ audioDataUrl: string | null; backend: TtsBackend }> {
-  // Fish first when configured — character-specific voices via reference_id
-  // are a much better match for our talking-object vibe than `tts-1/nova`.
+  // Cartesia Sonic first when configured — ~90ms TTFB, the whole point of
+  // this ladder. Fish still has the character voices; swap back in by
+  // clearing CARTESIA_API_KEY if you want those for a session.
+  try {
+    const mp3 = await cartesiaTTS(text, voiceId, lang);
+    if (mp3) {
+      return {
+        audioDataUrl: `data:audio/mpeg;base64,${mp3.toString("base64")}`,
+        backend: "cartesia",
+      };
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[tts] cartesia failed, falling back:", err);
+  }
+  // Fish fallback — character-specific voices via reference_id.
   try {
     const mp3 = await fishTTS(text, voiceId, lang);
     if (mp3) {
@@ -1296,19 +1747,27 @@ const RESPOND_SYSTEM = (
       : "";
   return `You are the secret inner voice of a ${className} talking back to a human. Keep it FUN, SIMPLE, and mostly SHORT — funny and cunning, like a cheeky little wiseass.${lookBlock}
 
-Reply with ONE short line, UNDER 25 WORDS. Shorter is better — most replies should be 5–15 words. A single zinger beats a full sentence.
+Return a JSON object (nothing else) with this shape:
+{
+  "line": "<one short line, UNDER 25 WORDS, most replies 5–15 words>",
+  "emotion": "<one of: positivity:highest, positivity:high, surprise:highest, surprise:high, curiosity:high, anger:high, anger:medium, sadness:medium, sadness:high>",
+  "speed": "<one of: fastest, fast, normal, slow, slowest>"
+}
 
-Rules:
-- Be playful, mischievous, witty. Land a joke, a tease, a sly observation. Cunning > earnest.
+Rules for the line:
+- Be playful, mischievous, witty. Land a joke, a tease, a sly observation.
 - Simple words. No big vocab, no monologues, no explaining the joke.
-- Remember prior turns — a sneaky callback to something they said earlier is gold.
+- Remember prior turns — a sneaky callback is gold.
 - Respond to their LATEST message first. Don't change subject unless they do.
 - Same personality every turn. No persona reset.
-- No meta-commentary, no "as a [thing]", no "I am a [thing]".
-- No quotes, no emojis, no stage directions, no trailing ellipses.
-- If their message is unclear, fire back a short cheeky clarifier.${langRule}
+- No meta-commentary, no "as a [thing]", no quotes, no emojis, no ellipses.${langRule}
 
-Return only the line. No prose, no extra text.`;
+Rules for emotion + speed:
+- Pick what the line DELIVERS best. Mismatched energy kills the joke.
+- Favor EXTREMES — "positivity:highest", "surprise:highest", "anger:high".
+- Fast speed on manic/excited lines. Slow on deadpan/sarcastic. Normal only when nothing else fits.
+
+Return ONLY the JSON. No prose, no preamble, no <think>, no code fences.`;
 };
 
 // How many prior turns to replay into the model. Each turn is a short line,
@@ -1322,6 +1781,8 @@ export type ConverseResult = {
   transcript: string;
   reply: string;
   voiceId: string | null;
+  emotion: string | null;
+  speed: string | null;
 };
 
 // Parse the `history` form field. Accepts a JSON-encoded array of
@@ -1468,7 +1929,15 @@ export async function converseWithObject(
     console.log(
       `[converse${tag}] ✓ TOTAL=${Date.now() - t0}ms ━ stt=${sttBackend}/${sttMs}ms (empty)  → reply="${reply}"`
     );
-    return { transcript: "", reply, voiceId: resolvedVoice };
+    return {
+      transcript: "",
+      reply,
+      voiceId: resolvedVoice,
+      // "hmm?"-style fallbacks are genuinely curious — give TTS something
+      // funnier than flat normal.
+      emotion: "curiosity:high",
+      speed: null,
+    };
   }
 
   // Fast text-only LLM. The visual context the reply needs lives in the
@@ -1479,19 +1948,19 @@ export async function converseWithObject(
       system: RESPOND_SYSTEM(className, description, lang),
       userText: transcript,
       priorMessages: history,
-      maxTokens: 160,
+      maxTokens: 220,
       temperature: 0.7,
     },
     tag
   );
-  const reply = extractTextLine(replyResult.content);
+  const { line: reply, emotion, speed } = parseGroupLineJson(replyResult.content);
   if (!reply) throw new Error("empty reply from model");
   // Single end-of-turn summary line — easy to scan, easy to screenshot.
   // TTS happens client-side on /api/tts/stream so it's not in this budget.
   const total = Date.now() - t0;
   // eslint-disable-next-line no-console
   console.log(
-    `[converse${tag}] ✓ TOTAL=${total}ms ━ stt=${sttBackend}/${sttMs}ms ▸ llm=${replyResult.backend}/${replyResult.ms}ms  reply="${reply.slice(0, 80)}${reply.length > 80 ? "…" : ""}"`
+    `[converse${tag}] ✓ TOTAL=${total}ms ━ stt=${sttBackend}/${sttMs}ms ▸ llm=${replyResult.backend}/${replyResult.ms}ms  emotion=${emotion ?? "-"}  speed=${speed ?? "-"}  reply="${reply.slice(0, 80)}${reply.length > 80 ? "…" : ""}"`
   );
-  return { transcript, reply, voiceId: resolvedVoice };
+  return { transcript, reply, voiceId: resolvedVoice, emotion, speed };
 }
