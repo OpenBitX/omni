@@ -1,0 +1,39 @@
+[project]
+name = "omni-backend"
+version = "0.1.0"
+description = "Unified FastAPI backend: YOLO segmentation WS"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.17",
+    "python-dotenv>=1.0",
+    "pydantic-settings>=2.6",
+    "websockets>=13",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+    "pillow>=10",
+    "openai>=1.50",
+    "torch>=2.4",
+    "ultralytics>=8.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "httpx-ws>=0.7",
+    "anyio>=4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omni_backend"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
