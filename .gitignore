@@ -1,0 +1,29 @@
+node_modules
+.next
+.env*.local
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+
+# Backend Python environment and generated artifacts
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/models/
+backend/*.coords.json
+
+# Prevent re-committing model weights to repo root
+/*.pt
+/*.onnx
+/*.dat
+
+# onnxruntime-web runtime bundle — generated on postinstall (now removed)
+public/ort/
+
+# Uploaded / debug screenshots
+backend/assets/base_images/Screenshot_*.png
+
+# Build output
+dist/
+
