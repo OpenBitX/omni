@@ -27,3 +27,7 @@ backend/assets/base_images/Screenshot_*.png
 # Build output
 dist/
 
+
+# local dev TLS certs (generate your own with mkcert)
+certificates/
+*.pem

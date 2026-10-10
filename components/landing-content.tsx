@@ -5,7 +5,7 @@ import MermaidDiagram from "@/components/mermaid-diagram";
 import { DIAGRAM_CN, DIAGRAM_EN } from "@/i18n/diagrams";
 
 const GITHUB_URL = "https://github.com/OpenBitX/omni";
-const CDN = "https://assets.example.com/omni/landing";
+const CDN = (((import.meta as any).env?.VITE_ASSET_BASE_URL as string | undefined) ?? "/landing").replace(/\/+$/, "");
 
 export default function LandingContent() {
   const { t, i18n } = useTranslation();
