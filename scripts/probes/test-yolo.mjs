@@ -21,7 +21,7 @@ const COCO = [
   "scissors", "teddy bear", "hair drier", "toothbrush",
 ];
 
-const MODEL = "<repo>/public/models/yolo26n.onnx";
+const MODEL = new URL("../../public/models/", import.meta.url).pathname + "yolo26n.onnx";
 const IMG = process.argv[2] ?? "/tmp/bus.jpg";
 const SIZE = 640;
 const CONF = 0.15;

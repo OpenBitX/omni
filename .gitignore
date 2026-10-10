@@ -29,3 +29,7 @@ server-v2/checkpoints/
 public/models/rf-detr-nano.onnx
 public/models/yolov8n.onnx
 
+
+# local dev TLS certs (generate your own with mkcert)
+certificates/
+*.pem

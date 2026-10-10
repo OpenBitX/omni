@@ -2,7 +2,7 @@
 // Mirrors the request shape in app/actions.ts so any divergence is caught here.
 import { readFileSync, writeFileSync } from "node:fs";
 
-const env = readFileSync("<repo>/.env.local", "utf8");
+const env = readFileSync(new URL("../../.env.local", import.meta.url), "utf8");
 for (const line of env.split("\n")) {
   const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/);
   if (m) process.env[m[1]] = m[2].trim();
